@@ -3509,6 +3509,12 @@ end
 ---@type lvim-ui.HostProvider?
 local host_provider = nil
 
+-- Zone hooks registered by the host zone (msgarea) — the same inversion as the host provider, so a docked
+-- consumer can trigger zone-level behaviour WITHOUT requiring the zone. `handoff`: coalesce a reflow across a
+-- zone teardown+rebuild into one repaint. nil ⇒ no zone ⇒ the consumer's `fn` just runs.
+---@type { handoff?: fun(fn: fun()) }|nil
+local zone_hooks = nil
+
 --- Open a frame.
 ---@param cfg table  the frame config (see the module header)
 ---@return table state
@@ -3695,6 +3701,24 @@ end
 ---@param fn lvim-ui.HostProvider
 function M.set_host_provider(fn)
     host_provider = fn
+end
+
+--- Register the host zone's hooks (msgarea calls this once). See `M.zone_handoff`.
+---@param hooks { handoff?: fun(fn: fun()) }
+function M.set_zone_hooks(hooks)
+    zone_hooks = hooks
+end
+
+--- Run `fn` inside the host zone's reflow-coalescing handoff when a zone is registered (so a docked
+--- consumer's teardown+rebuild paints as ONE frame), else just run `fn`. Lets a consumer (a docked picker)
+--- coalesce a zone swap without requiring msgarea — the dependency stays inverted.
+---@param fn fun()
+function M.zone_handoff(fn)
+    if zone_hooks and zone_hooks.handoff then
+        zone_hooks.handoff(fn)
+    else
+        fn()
+    end
 end
 
 return M
