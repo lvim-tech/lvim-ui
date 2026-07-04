@@ -1,0 +1,526 @@
+-- lvim-ui.form: a `frame` center provider for typed, EDITABLE rows — bool (toggle), select /
+-- segmented (cycle), int / number / string / text (edit via vim.ui.input), action (run), and
+-- expandable tree rows. Reuses the rows.lua row model (row_display / navigation). Non-selectable rows
+-- (spacers) are skipped by j/k; the focused row is shown via the panel's cursorline.
+--
+-- A `form` is the center of the `tabs` / popup-style frames; switching a tab swaps the row set in place
+-- (`set_rows`), and because the row tables are mutated IN PLACE, a consumer's captured rows (e.g. the
+-- Quit dialog's action closures) always see the current values.
+--
+---@module "lvim-ui.form"
+
+local rows = require("lvim-ui.rows")
+local util = require("lvim-ui.util")
+local bar = require("lvim-ui.bar")
+
+local api = vim.api
+
+local M = {}
+
+--- Create a form provider.
+---@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string }
+---       cursorline_hl: name a cursorline highlight group (e.g. a bg-only one) so the hover changes only the
+---       background and a row's own fg highlights survive; default = the frame's yellow "list hover".
+---@return table provider
+function M.new(opts)
+    local model = opts.rows or {}
+    local ico = opts.ico or rows.icons()
+    local on_change = opts.on_change
+    local pan
+
+    -- The visible rows (tree flattened, collapsed children hidden). The window line N maps to flat[N].
+    local function flat()
+        return rows.flatten(model, false)
+    end
+    local function refresh()
+        if pan and pan.refresh then
+            pan.refresh()
+        end
+    end
+    local function cur_line()
+        if pan and pan.win and api.nvim_win_is_valid(pan.win) then
+            return api.nvim_win_get_cursor(pan.win)[1]
+        end
+        return 1
+    end
+    local function move(delta)
+        if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
+            return
+        end
+        local nxt = rows.next_selectable(flat(), cur_line(), delta)
+        if nxt then
+            pcall(api.nvim_win_set_cursor, pan.win, { nxt, 0 })
+        end
+    end
+
+    --- If the cursor sits on a `bar` row, move its focused button by `delta` (wrapping, skipping separators)
+    --- and refresh; return true (handled). Else return false so the caller can act (e.g. switch tabs on h/l).
+    ---@param delta integer
+    ---@return boolean
+    local function bar_nav(delta)
+        local row = flat()[cur_line()]
+        if not (row and row.type == "bar") then
+            return false
+        end
+        local items = row.items or {}
+        local n = #items
+        if n == 0 then
+            return true
+        end
+        -- Start from the keyboard cursor, or (first move) from the currently-active button.
+        local i = row._sel
+        if i == nil then
+            i = 1
+            for j, it in ipairs(items) do
+                if it.active then
+                    i = j
+                end
+            end
+        end
+        for _ = 1, n do
+            i = (i + delta - 1) % n + 1
+            if (items[i].type or "button") ~= "separator" then
+                break
+            end
+        end
+        row._sel = i
+        refresh()
+        return true
+    end
+
+    --- Cycle a SELECT / SEGMENTED row's value by `delta` options (wrapping both ways). Returns true if it
+    --- acted on such a row. The ONE engine for forward (<CR>) and backward (<BS>) value cycling.
+    ---@param delta integer
+    ---@return boolean
+    local function cycle_value(delta)
+        local row = flat()[cur_line()]
+        if not (row and (row.type == "select" or row.type == "segmented")) then
+            return false
+        end
+        local list = row.options or {}
+        if #list == 0 then
+            return false
+        end
+        local cur = 1
+        for i, o in ipairs(list) do
+            if o == row.value then
+                cur = i
+                break
+            end
+        end
+        row.value = list[((cur - 1 + delta) % #list) + 1]
+        if row.run then
+            row.run(row.value)
+        end
+        if on_change then
+            on_change(row)
+        end
+        refresh()
+        return true
+    end
+
+    --- Context hints for the focused row: `{ { key, label }, … }` describing what the keys do on THIS row
+    --- (the dynamic RIGHT half of a footer legend). Empty for a spacer / nil row.
+    ---@param row Row|nil
+    ---@return { key: string, label: string, act: string }[]  `act`: "next" | "prev" | "activate" (for clicks)
+    local function row_hints(row)
+        if not row then
+            return {}
+        end
+        if row.children then
+            return { { key = "↵", label = row.expanded and "Collapse" or "Expand", act = "activate" } }
+        end
+        local t = row.type
+        if t == "select" or t == "segmented" then
+            return {
+                { key = "↵/→", label = "Next", act = "next" },
+                { key = "⌫/←", label = "Prev", act = "prev" },
+            }
+        elseif t == "bool" or t == "boolean" then
+            return { { key = "↵", label = "Toggle", act = "activate" } }
+        elseif t == "action" then
+            -- only a RUNNABLE action advertises ↵ Run; display-only action rows (e.g. a package's State /
+            -- Status / Version detail fields carry `type = "action"` for styling but no `run`) advertise nothing.
+            return row.run and { { key = "↵", label = "Run", act = "activate" } } or {}
+        elseif t == "int" or t == "integer" or t == "float" or t == "number" or t == "string" or t == "text" then
+            return { { key = "↵", label = "Edit", act = "activate" } }
+        end
+        return {}
+    end
+
+    --- Act on the focused row by type. `st` is the frame state (for action rows that close).
+    ---@param st table
+    local function activate(st)
+        local row = flat()[cur_line()]
+        if not row then
+            return
+        end
+        if row.type == "bar" then
+            -- Run the keyboard-focused button (h/l / ←/→), or the active one if not navigated yet.
+            local sel = row._sel
+            if sel == nil then
+                sel = 1
+                for j, it in ipairs(row.items or {}) do
+                    if it.active then
+                        sel = j
+                    end
+                end
+            end
+            local btn = (row.items or {})[sel]
+            if btn and btn.run then
+                btn.run()
+            end
+            return
+        end
+        local t = row.type
+        if row.children then
+            row.expanded = not row.expanded
+            refresh()
+        elseif t == "bool" or t == "boolean" then
+            row.value = not row.value
+            if row.run then
+                row.run(row.value) -- the row's own setter (e.g. writes into the pending settings)
+            end
+            if on_change then
+                on_change(row)
+            end
+            refresh()
+        elseif t == "select" or t == "segmented" then
+            cycle_value(1) -- forward; <BS> calls cycle_value(-1) for backward
+        elseif t == "int" or t == "integer" or t == "float" or t == "number" or t == "string" or t == "text" then
+            local numeric = t ~= "string" and t ~= "text"
+            vim.ui.input({
+                prompt = (row.label or row.name or "") .. ": ",
+                default = tostring(row.value ~= nil and row.value or row.default or ""),
+            }, function(input)
+                if input ~= nil then
+                    row.value = numeric and (tonumber(input) or row.value) or input
+                    if row.run then
+                        row.run(row.value)
+                    end
+                    if on_change then
+                        on_change(row)
+                    end
+                    refresh()
+                end
+            end)
+        elseif t == "action" and row.run then
+            row.run(row.value, function()
+                st.close()
+            end)
+        end
+    end
+
+    return {
+        hide_cursor = true,
+        cursorline = opts.cursorline_hl or true,
+        --- Exposed for an external footer legend: the focused row's context hints, plus the actions a hint click
+        --- runs (cycle a value by ±1; activate = run/toggle/edit the focused row).
+        ---@return { key: string, label: string, act: string }[]
+        hints = function()
+            return row_hints(flat()[cur_line()])
+        end,
+        --- Cycle the focused select/segmented row's value by a delta (±1). Returns false when the row is not
+        --- cyclable (so a caller can fall back to e.g. moving a toolbar button). See `cycle_value`.
+        cycle = cycle_value,
+        --- Activate the focused row (toggle / edit / run), per its type; takes the frame state. See `activate`.
+        act = activate,
+        --- Content size the frame should allocate: the widest rendered row (+4 padding) and the row count.
+        ---@return integer width, integer height
+        size = function()
+            local fr = flat()
+            local w = 1
+            for _, r in ipairs(fr) do
+                w = math.max(w, util.dw(rows.row_display(r, ico)) + 4)
+            end
+            return w, math.max(1, #fr)
+        end,
+        --- Render the current rows to `width` columns: returns the line strings plus the highlight spans
+        --- (`{ row, col_start, col_end, group, priority? }`) the panel applies.
+        ---@param width integer
+        ---@return string[] lines, table[] hls
+        render = function(width)
+            local fr = flat()
+            local lines, hls = {}, {}
+            for i, r in ipairs(fr) do
+                local disp = rows.row_display(r, ico)
+                if r.type == "bar" then
+                    -- A toolbar row rendered through the SHARED ui.bar: centered button boxes that own their
+                    -- overflow chevrons (so a wide bar scrolls instead of clipping). Three button states:
+                    -- NORMAL, ACTIVE (the applied button — `active=true`), and HOVER (the keyboard cursor
+                    -- `_sel`, shown ONLY while the cursor is on THIS row, so off the bar only `active` shows).
+                    -- `_cells` (per-button byte ranges) is stashed for the click handler.
+                    local items = r.items or {}
+                    local active_idx
+                    for j, it in ipairs(items) do
+                        if it.active then
+                            active_idx = j
+                        end
+                    end
+                    -- While the cursor is on this row, the HOVER follows `_sel` (the navigated button), or — if
+                    -- it hasn't been navigated yet (e.g. just after activating: the rebuild resets `_sel`) —
+                    -- the ACTIVE button, so the just-applied button reads as hover_active (cursor on active).
+                    local focused = cur_line() == i
+                    local res = bar.render({
+                        items = items,
+                        width = width,
+                        align = r.align or "center",
+                        sel = r._sel or active_idx, -- scroll-anchor (keep the cursor / active button in view)
+                        hover = focused and (r._sel or active_idx) or nil,
+                        off = r._off,
+                    })
+                    r._off = res.off
+                    r._cells = res.items
+                    lines[i] = res.line
+                    -- A continuous full-width bg strip under the bar — what the surface paints under header
+                    -- bands (LvimUiBarFill) but which ui.bar itself does NOT emit; at a lower priority so the
+                    -- button spans (incl. a hover_active bg) read on top.
+                    hls[#hls + 1] = { i - 1, 0, -1, "LvimUiBarFill", 150 }
+                    for _, s in ipairs(res.spans) do
+                        hls[#hls + 1] = { i - 1, s[1], s[2], s[3] }
+                    end
+                elseif not rows.is_selectable(r) then
+                    lines[i] = r.center and util.center(disp, width) or util.lpad(disp, width, opts.pad or 2)
+                    -- A spacer / divider row (the `──────` between groups) takes the separator colour — UNLESS it
+                    -- carries an explicit `hl` (e.g. a wrapped value's continuation SPACER), in which case honour
+                    -- hl.inactive so the wrap matches its field's value instead of taking the separator colour.
+                    if r.type == "spacer" or r.type == "spacer_line" then
+                        local sep = (r.hl and type(r.hl.inactive) == "string") and r.hl.inactive or "LvimUiSeparator"
+                        hls[#hls + 1] = { i - 1, 0, #lines[i], sep }
+                    end
+                else
+                    lines[i] = util.lpad(disp, width, opts.pad or 2)
+                    -- Colour the leading type icon; the rest reads on the panel background.
+                    local icon_str = rows.row_icon_info(r, ico)
+                    if icon_str and #icon_str > 0 then
+                        hls[#hls + 1] = { i - 1, 2, 2 + #icon_str, "LvimUiRowIconInactive" }
+                    end
+                    -- Per-part colours an action / accordion row can request: `icon_hl` on its `icon` column,
+                    -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix — at their byte offsets in
+                    -- `disp`, which lays out as: lead-icon + "  " + icon + " " + label [+ " " + suffix].
+                    if (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl) then
+                        local base = 2 + #(icon_str or "") + 2 -- past the lead icon + its 2-space separator
+                        local ricon = (r.icon and r.icon ~= "") and r.icon or nil
+                        if ricon and r.icon_hl then
+                            hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
+                        end
+                        local label = r.label or r.name or ""
+                        if r.text_hl and label ~= "" then
+                            local ls = base + (ricon and (#ricon + 1) or 0)
+                            hls[#hls + 1] = { i - 1, ls, ls + #label, r.text_hl }
+                        end
+                        if r.suffix and r.suffix ~= "" and r.suffix_hl then
+                            hls[#hls + 1] = { i - 1, 2 + #disp - #r.suffix, 2 + #disp, r.suffix_hl }
+                        end
+                    end
+                    -- A file row's label = "<dimmed path>/<bright name>". `r.dim_to` is a byte count into the
+                    -- LABEL (the SUFFIX of `disp`) up to the name; offset by the lpad indent (2), clamped to
+                    -- the rendered line. Dim the path, brighten the name, so the name stands out.
+                    if r.dim_to and r.dim_to > 0 and type(r.label) == "string" then
+                        local lstart = 2 + (#disp - #r.label)
+                        local dim_end = math.min(lstart + r.dim_to, #lines[i])
+                        if dim_end > lstart then
+                            hls[#hls + 1] = { i - 1, lstart, dim_end, "LvimUiPathDim" }
+                        end
+                        local name_start, name_end = lstart + r.dim_to, math.min(lstart + #r.label, #lines[i])
+                        if name_end > name_start then
+                            hls[#hls + 1] = { i - 1, name_start, name_end, "LvimUiPathName" }
+                        end
+                    end
+                end
+            end
+            return lines, hls
+        end,
+        --- Install the panel's keymaps and cursor autocmds: j/k navigation, ↵ activate, ←/→ cycle-or-bar-nav,
+        --- ⌫ cycle-back, and toolbar click hit-testing. `map(lhs, fn)` binds keys on the panel; `p` is the
+        --- panel handle (`.win` / `.buf`); `st` is the frame state passed through to activate.
+        ---@param map fun(lhs: string|string[], fn: fun())
+        ---@param p table
+        ---@param st table
+        keys = function(map, p, st)
+            pan = p
+            local fr = flat()
+            local first = rows.first_selectable(fr) or 1
+            vim.schedule(function()
+                if p.win and api.nvim_win_is_valid(p.win) then
+                    pcall(api.nvim_win_set_cursor, p.win, { first, 0 })
+                    local r0 = flat()[first]
+                    vim.wo[p.win].cursorline = not (r0 ~= nil and r0.type == "bar")
+                end
+            end)
+            map({ "j", "<Down>" }, function()
+                move(1)
+            end)
+            map({ "k", "<Up>" }, function()
+                move(-1)
+            end)
+            map({ "<CR>" }, function()
+                activate(st)
+            end)
+            -- ←/→ cycle a select/segmented value (← back, → forward); on a toolbar `bar` row they instead move
+            -- the focused button. ⌫ also cycles a value backward (the documented key).
+            map({ "<Left>" }, function()
+                if not cycle_value(-1) then
+                    bar_nav(-1)
+                end
+            end)
+            map({ "<Right>" }, function()
+                if not cycle_value(1) then
+                    bar_nav(1)
+                end
+            end)
+            map({ "<BS>" }, function()
+                cycle_value(-1)
+            end)
+            -- Click a toolbar (`type="bar"`) button: hit-test the click column against the row's rendered
+            -- button cells and run that button. Any other click falls back to plain cursor positioning.
+            map({ "<LeftMouse>" }, function()
+                local mp = vim.fn.getmousepos()
+                if mp.winid ~= p.win or mp.line < 1 then
+                    return
+                end
+                local r = flat()[mp.line]
+                if r and r.type == "bar" and r._cells then
+                    local col0 = mp.column - 1
+                    for _, cell in ipairs(r._cells) do
+                        if cell.c0 and cell.c1 and col0 >= cell.c0 and col0 < cell.c1 then
+                            if cell.spec and cell.spec.run then
+                                cell.spec.run()
+                            end
+                            return
+                        end
+                    end
+                    return
+                end
+                if r and rows.is_selectable(r) and p.win and api.nvim_win_is_valid(p.win) then
+                    pcall(api.nvim_win_set_cursor, p.win, { mp.line, math.max(0, mp.column - 1) })
+                end
+            end)
+            -- On a `bar` row, suppress the full-row cursorline (only the button HOVER should read) and
+            -- re-render so the hover follows the cursor; off a bar row, restore cursorline. Refresh only on a
+            -- boundary cross, so plain list navigation stays cheap.
+            local was_bar = false
+            local last_hint_sig -- the footer legend's last hint SIGNATURE — re-notify only when the hints change
+            api.nvim_create_autocmd("CursorMoved", {
+                buffer = p.buf,
+                callback = function()
+                    if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
+                        return
+                    end
+                    local r = flat()[cur_line()]
+                    if opts.on_move then
+                        opts.on_move(r) -- raw, every move (no dedup) — drives an item-list picker's live preview
+                    end
+                    local is_bar = r ~= nil and r.type == "bar"
+                    vim.wo[pan.win].cursorline = not is_bar
+                    if is_bar or was_bar then
+                        was_bar = is_bar
+                        refresh()
+                    end
+                    -- The footer legend's RIGHT half tracks the row's hints, which depend only on the row TYPE
+                    -- (+ an accordion's expand state) — so re-notify only when THAT changes, not on every row.
+                    if opts.on_cursor then
+                        -- Signature of the row's HINTS — re-notify the footer only when it changes. It is the row
+                        -- TYPE, plus an accordion's expand state, plus an action row's run-ness (a runnable action
+                        -- advertises ↵ Run, a display-only one advertises nothing — so they must differ here).
+                        local sig
+                        if not r then
+                            sig = ""
+                        elseif r.children then
+                            sig = "acc:" .. tostring(r.expanded)
+                        elseif r.type == "action" then
+                            sig = "act:" .. tostring(r.run ~= nil)
+                        else
+                            sig = r.type or ""
+                        end
+                        if sig ~= last_hint_sig then
+                            last_hint_sig = sig
+                            opts.on_cursor()
+                        end
+                    end
+                end,
+            })
+        end,
+        --- Swap the row set in place (tab switch) and re-render; land the cursor on the first selectable
+        --- row of the new set (else it lingers on a now-stale / non-selectable line).
+        ---@param new_rows Row[]
+        set_rows = function(new_rows)
+            model = new_rows
+            refresh()
+            if pan and pan.win and api.nvim_win_is_valid(pan.win) then
+                pcall(api.nvim_win_set_cursor, pan.win, { rows.first_selectable(flat()) or 1, 0 })
+            end
+        end,
+        --- The `name` of the row under the cursor (nil for an unnamed / empty row). A consumer handle uses
+        --- it to dispatch actions on the focused row.
+        ---@return string?
+        cursor_name = function()
+            local r = flat()[cur_line()]
+            return r and r.name or nil
+        end,
+        --- The 1-based window line of the cursor — a stable index to restore after a rebuild.
+        ---@return integer
+        cursor_index = function()
+            return cur_line()
+        end,
+        --- Move the cursor to the FIRST row whose `name` matches, expanding the target's collapsed ancestors
+        --- so a nested (e.g. detail / action) row becomes visible first.
+        ---@param name string
+        ---@return boolean
+        focus_name = function(name)
+            if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
+                return false
+            end
+            -- Expand the ancestor chain of the target (each parent on the path to a matching descendant).
+            local function expand_to(list)
+                for _, r in ipairs(list) do
+                    if r.name == name then
+                        return true
+                    end
+                    if r.children and expand_to(r.children) then
+                        r.expanded = true
+                        return true
+                    end
+                end
+                return false
+            end
+            if expand_to(model) then
+                refresh()
+            end
+            for i, r in ipairs(flat()) do
+                if r.name == name then
+                    pcall(api.nvim_win_set_cursor, pan.win, { i, 0 })
+                    return true
+                end
+            end
+            return false
+        end,
+        --- Move the cursor to (a clamped) window line `i`.
+        ---@param i integer
+        ---@return boolean
+        focus_index = function(i)
+            if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
+                return false
+            end
+            local n = #flat()
+            if n == 0 then
+                return false
+            end
+            pcall(api.nvim_win_set_cursor, pan.win, { math.max(1, math.min(i, n)), 0 })
+            return true
+        end,
+        --- Re-paint the current rows in place (after a consumer mutated row values, without changing the set).
+        rerender = function()
+            refresh()
+        end,
+        --- Move a focused toolbar's button when the cursor is on a `bar` row; return true if handled (so a
+        --- caller's own h/l — e.g. a tab switch — is suppressed while on a bar row).
+        ---@param delta integer
+        ---@return boolean
+        bar_nav = function(delta)
+            return bar_nav(delta)
+        end,
+    }
+end
+
+return M

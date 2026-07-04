@@ -1,0 +1,70 @@
+*lvim-ui.txt*                          The floating UI toolkit of the lvim-tech set
+
+==============================================================================
+CONTENTS                                                       *lvim-ui-contents*
+
+    1. Introduction ......................... |lvim-ui-introduction|
+    2. Requirements ......................... |lvim-ui-requirements|
+    3. Installation ......................... |lvim-ui-installation|
+    4. Usage ................................ |lvim-ui-usage|
+    5. Configuration ........................ |lvim-ui-configuration|
+
+==============================================================================
+1. INTRODUCTION                                            *lvim-ui-introduction*
+
+lvim-ui is the floating UI toolkit of the lvim-tech set: the surface / frame /
+button / bar chassis plus a thin presenter (select / multiselect / input /
+confirm / tabs / info). Every lvim-tech plugin that draws a window builds on it,
+so the whole set frames identically. It is a pure toolkit — it renders windows
+and owns no feature of its own.
+
+==============================================================================
+2. REQUIREMENTS                                            *lvim-ui-requirements*
+
+- Neovim >= 0.12.x
+- lvim-utils (palette / highlight / cursor / merge helpers)
+- lvim-hud (optional) — a surface title can publish to the statusline overlay.
+
+==============================================================================
+3. INSTALLATION                                            *lvim-ui-installation*
+
+lvim-installer (recommended) — open the Plugins tab and install it: >vim
+    :LvimInstaller plugins
+<
+Native (vim.pack): >lua
+    vim.pack.add({
+        { src = "https://github.com/lvim-tech/lvim-utils" },
+        { src = "https://github.com/lvim-tech/lvim-ui" },
+    })
+    require("lvim-ui").setup({})
+<
+==============================================================================
+4. USAGE                                                          *lvim-ui-usage*
+
+>lua
+    local ui = require("lvim-ui")
+    ui.select({ title = "Pick", items = { "one", "two" } }, function(ok, index) end)
+    ui.multiselect({ title = "Toggle", items = { "a", "b" } }, function(ok, sel) end)
+    ui.input({ title = "Name" }, function(ok, value) end)
+    ui.confirm({ title = "Delete?" }, function(yes) end)
+    ui.tabs({ title = "Settings", tabs = {} }, function(ok, result) end)
+    local win = ui.info({ "read-only" }, { title = "Info" })
+<
+The low-level chassis is `require("lvim-ui.surface")` (framed floating / docked
+windows) with `require("lvim-ui.button")` / `require("lvim-ui.bar")` for
+navigable button bars.
+
+==============================================================================
+5. CONFIGURATION                                          *lvim-ui-configuration*
+
+                                                               *lvim-ui.setup()*
+require("lvim-ui").setup({opts})
+
+Merges {opts} into the live config in place; every reader
+(`require("lvim-ui.config")`) sees the effective values. Optional — the defaults
+work as-is. See the README for the FULL default config; the option set is
+documented as `LvimUiConfig` in `lua/lvim-ui/config.lua` (border, content_border,
+separator, group_border, chevrons, size, backdrop, title_line, counter,
+title_pos, tint, icons, labels, keys, …).
+
+vim:tw=78:ts=8:ft=help:norl:

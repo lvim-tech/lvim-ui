@@ -1,0 +1,3700 @@
+-- lvim-ui.surface: the ONE windowed-UI chassis. A vertical stack of sectors —
+--
+--     header  (a STACK of bands: meta lines + ui.bar bars; PINNED, never scrolls)
+--     center  (a horizontal row of 1..N panels, each a content provider; the ONLY scroll region)
+--     footer  (a STACK of bands, usually one ui.bar of actions; PINNED, never scrolls)
+--
+-- Everything else in the UI is a `frame` config: a popup is 1 center panel, the peek is 2 (list +
+-- preview), a git client is 3 (status · diff · log); the header stack carries tabs / filters / submenus
+-- (Package Manager); the footer is the navigable action bar. The chrome (header bands, footer bands,
+-- the divider columns between panels) is rendered into a single non-focusable CONTAINER buffer so it
+-- stays pinned; the center panels are separate floating windows on top, so only they scroll.
+--
+-- The whole config is a nested tree:
+--   { title (box), border, size = { width/height = { auto, min, max, fixed } },
+--     header = { bars = { { items, align?, chevrons?, on_change? } | { text } } },
+--     content = { blocks = { { id, provider, size = { width }, border } } },   -- 1..N
+--     footer = { bars = { … } } }
+-- Each bar holds `items` (button / separator boxes) and owns its overflow chevrons; each block hosts a
+-- content provider, addressed by `id` (`st.focus_block`). Sizing is per axis — `auto` fits the content
+-- within `[min, max]`, else `fixed` (a screen fraction ≤1 or an absolute count). Only the center scrolls.
+--
+-- Modes: `mode = "float"` (centred modal) · `mode = "split"` (docked-modal, e.g. the bottom peek — panels
+-- still FLOAT over a container) · `mode = "split", native = true` (a single block as a REAL split window,
+-- NOT a float — for a persistent NAVIGABLE side panel like the lsp outline, so `<C-w>` nav and buffer
+-- redraw behave natively; title = winbar, no bars).
+--
+-- A `position = "cmdline"` float OWNS the command-line region (grows `cmdheight` so heirline / a global
+-- statusline stay above it, floats over those rows). Optionally HOSTED: pass `host = fn(height) -> rect` and
+-- the surface, instead of growing cmdheight itself, reserves `height` rows in that host zone (the msgarea,
+-- which owns cmdheight) and lays out over the returned rect — so the host composes other content (messages)
+-- BELOW it in the same region. Wire the host segment's reflow to `st.reposition(rect)` so the surface follows.
+--
+---@module "lvim-ui.surface"
+
+local uibar = require("lvim-ui.bar")
+local util = require("lvim-ui.util")
+local cursor = require("lvim-utils.cursor")
+local config = require("lvim-ui.config")
+
+local api = vim.api
+local NS = api.nvim_create_namespace("lvim_utils_ui_frame")
+
+local M = {}
+
+-- The ONE canonical popup border lives in a SINGLE place — `config.border` (config/ui.lua), a FULL " "
+-- ring on all four sides (top for the native border-title / brand, plus a " " gutter on the left, right AND
+-- bottom; the two top corners are filled by `resolve_border`; the " " edges draw no glyph, just a 1-cell
+-- breathing gutter so the content sits off the window edges and the border-title spans edge-to-edge).
+--
+-- `M.FRAME_BORDER` is the MARKER every chassis consumer passes (`border = surface.FRAME_BORDER`, re-exported
+-- by lvim-ui). It is bound to that single source, and — crucially — `M.open` RESOLVES it (and a nil
+-- border) to the LIVE `config.border` at open time (see below). So changing that one config key reflects
+-- on the next open of EVERY consumer without touching their code; the marker only has to keep the identity
+-- the consumers captured, which it does (it is never reassigned). Later phases delete the per-plugin copies.
+---@type string[]
+M.FRAME_BORDER = config.border
+
+-- A SECOND single-source ring — `config.content_border` — for the CONTENT PANELS ONLY: the DATA blocks
+-- INSIDE the container (the picker's list / preview, lvim-space's list, the tabs content block). `M.CONTENT_BORDER`
+-- is the MARKER a content BLOCK passes (`border = surface.CONTENT_BORDER`); `M.open` RESOLVES it to the LIVE
+-- `config.content_border` at open time (mirroring FRAME_BORDER), so changing that one key re-borders every
+-- content panel on the next open — independently of the container ring, without touching the consumers. The
+-- NAVIGATION bands (footer / filter / tab / input) are bars, not blocks, so they are never affected. A block's
+-- explicit "none" / custom border is honoured untouched.
+---@type string[]
+M.CONTENT_BORDER = config.content_border
+
+-- ─── cursor hiding ────────────────────────────────────────────────────────────
+-- Hiding the hardware cursor is delegated to lvim-utils.cursor (the ONE cursor system): the chrome
+-- container and every panel whose provider sets `hide_cursor` carry the `lvim-ui-frame` filetype,
+-- registered as a CURRENT-ONLY panel ft. So the module hides the cursor only while one of those is the
+-- focused window (a list panel, or the container while a bar sector is selected) and shows it in
+-- editable panels (the input field, the real preview buffer) and outside the frame. `cursor.update()`
+-- is called right after a programmatic focus change so it applies without a one-frame flash.
+local FRAME_FT = "lvim-ui-frame"
+local cursor_registered = false
+
+--- The currently-open cmdline / area-docked surface, if any. The msgarea/cmdline zone hosts ONE app at a time —
+--- opening a new area dock EVICTS the previous (a picker gives way to a shell, and back). Module-level (there is
+--- one zone). The picker ALSO self-replaces finder→finder via its own registry; this covers the cross-consumer
+--- case (picker ↔ shell) too. Declared HERE (above every consumer) so the close handler and M.open share the
+--- one upvalue — not a stray global.
+---@type table?
+local area_current = nil
+--- A just-CLOSED backdrop veil awaiting its deferred teardown — kept here so a surface reopening in the SAME tick
+--- (a screen switch: close then reopen) can ADOPT it instead of the veil blinking off + a new one fading in.
+--- `{ win, buf, hl, blend, adopted }`; the scheduled teardown closes it unless a reopen set `adopted`.
+---@type table?
+local pending_backdrop = nil
+
+-- FOCUS-AWARE veil: a DOCKED surface (control center, msgarea dock, …) lets you focus OUT to the editor while it
+-- STAYS open. Its full-editor backdrop must then stop covering the window you moved INTO — and a float left over
+-- the editor's cursor cell renders the cursor as a stray UNDERLINE in some terminals (kitty) EVEN at winblend=100
+-- (a transparent veil is not enough — the window must not EXIST over the editor). So we DROP (close) the veil
+-- whenever a non-surface window is current and REBUILD it when a surface window is focused again. `active_backdrop
+-- = { state, hl, blend, zindex }`; the live veil win/buf live on `state` (backdrop_win / backdrop_buf) so the
+-- surface teardown remains their single owner. One WinEnter drives it.
+---@type table?
+local active_backdrop = nil
+local backdrop_focus_registered = false
+
+--- (Re)open the full-editor veil window over `state` — sets `state.backdrop_win` / `state.backdrop_buf`.
+---@param state table
+---@param hl string
+---@param blend integer
+---@param zindex integer
+local function open_veil_win(state, hl, blend, zindex)
+    local ew, eh = math.max(1, vim.o.columns), math.max(1, vim.o.lines)
+    if not (state.backdrop_buf and api.nvim_buf_is_valid(state.backdrop_buf)) then
+        state.backdrop_buf = api.nvim_create_buf(false, true)
+        vim.bo[state.backdrop_buf].filetype = FRAME_FT -- managed UI (the cursor-hide list treats it as a frame)
+    end
+    state.backdrop_win = api.nvim_open_win(state.backdrop_buf, false, {
+        relative = "editor",
+        row = 0,
+        col = 0,
+        width = ew,
+        height = eh,
+        focusable = false,
+        style = "minimal",
+        zindex = zindex, -- behind the container (z) and its panels (z+1)
+        noautocmd = true, -- the veil never takes focus; skip the autocmd cascade so re-open on refocus is snappy
+    })
+    vim.w[state.backdrop_win].lvim_frame = true -- managed UI — "close every float" helpers skip it
+    -- EndOfBuffer too, so the blank rows below the (empty) buffer also paint the veil, not a hole.
+    vim.wo[state.backdrop_win].winhighlight = ("Normal:%s,NormalNC:%s,EndOfBuffer:%s"):format(hl, hl, hl)
+    vim.wo[state.backdrop_win].winblend = blend
+end
+
+--- Keep the veil in step with focus: PRESENT over the editor while a surface frame window is focused, GONE
+--- (closed, buffer deleted) while any non-surface window is current — so the editor you moved into is never
+--- dimmed and its cursor is never covered (a lingering transparent float still underlines the cursor in kitty).
+local function apply_backdrop_focus()
+    local ab = active_backdrop
+    if not (ab and ab.state) then
+        return
+    end
+    local st = ab.state
+    local cur = api.nvim_get_current_win()
+    -- A window belongs to the surface if it carries the `lvim_frame` WINDOW marker (set on the container AND
+    -- every panel) — test THAT, not the buffer filetype, because a consumer may REPLACE a panel buffer's
+    -- filetype: the fzf picker swaps a `lvim-picker-fzf` terminal into its panel, which read as "not a surface
+    -- window" under the old filetype check and wrongly dropped the veil (no backdrop behind any picker).
+    local on_surface = api.nvim_win_is_valid(cur)
+        and (vim.w[cur].lvim_frame == true or vim.bo[api.nvim_win_get_buf(cur)].filetype == FRAME_FT)
+    if on_surface then
+        if not (st.backdrop_win and api.nvim_win_is_valid(st.backdrop_win)) then
+            open_veil_win(st, ab.hl, ab.blend, ab.zindex)
+        end
+    else
+        if st.backdrop_win and api.nvim_win_is_valid(st.backdrop_win) then
+            pcall(api.nvim_win_close, st.backdrop_win, true)
+        end
+        st.backdrop_win = nil
+        -- KEEP st.backdrop_buf alive (hidden, no window) for a fast rebuild when a surface window is focused
+        -- again — a bufferless veil is invisible to the cursor-hide list; the surface teardown frees it.
+    end
+end
+--- One session-wide WinEnter that keeps the live veil (`active_backdrop`) in step with focus.
+local function register_backdrop_focus()
+    if backdrop_focus_registered then
+        return
+    end
+    backdrop_focus_registered = true
+    api.nvim_create_autocmd("WinEnter", {
+        group = api.nvim_create_augroup("LvimUiBackdropFocus", { clear = true }),
+        callback = apply_backdrop_focus,
+    })
+end
+--- Register the frame filetype as a CURRENT-ONLY cursor-hide panel ft with the lvim-utils cursor module,
+--- once per session (idempotent via `cursor_registered`).
+local function register_frame_ft()
+    if not cursor_registered then
+        cursor_registered = true
+        pcall(cursor.setup, { panel_ft = { FRAME_FT } })
+    end
+end
+
+-- A frame spans zindex [base, base+2] (container, panels, bands). A float opened FROM another surface (e.g. the
+-- installer browser's Delete menu, or any modal over an open panel) must clear the opener's WHOLE span, else its
+-- title/footer bands hide BEHIND the opener's higher panels (which sit at base+1) even though its content shows.
+local FRAME_Z_SPAN = 3
+--- Base zindex for a NON-DOCKED float that declares no explicit `zindex`: sit ABOVE every frame currently on
+--- screen so a modal is never covered by its opener. Stateless — a scan of the LIVE frame windows, so CLOSED
+--- popups never inflate it (a lone float over the editor stays at the 50 baseline). Docked surfaces pass an
+--- explicit `cfg.zindex` (200/210) and never reach here.
+---@return integer
+local function auto_float_base()
+    local base = 50
+    for _, w in ipairs(api.nvim_list_wins()) do
+        local ok, c = pcall(api.nvim_win_get_config, w)
+        if ok and c.relative and c.relative ~= "" and c.zindex then
+            local buf = api.nvim_win_get_buf(w)
+            if api.nvim_buf_is_valid(buf) and vim.bo[buf].filetype == FRAME_FT and c.zindex + FRAME_Z_SPAN > base then
+                base = c.zindex + FRAME_Z_SPAN
+            end
+        end
+    end
+    return base
+end
+
+-- Default keymaps for the chassis; the consumer may override via `cfg.keys`.
+local DEFAULT_KEYS = {
+    sector_next = "<C-j>", -- header · center · footer (down), from anywhere (the PREVIEW is skipped)
+    sector_prev = "<C-k>", -- (up)
+    panel_toggle = "<Tab>", -- toggle the center panel (list ⇄ preview) — the ONLY way onto the preview
+    panel_next = "<C-l>", -- next center panel (right) — only while a center panel is focused
+    panel_prev = "<C-h>", -- previous center panel (left)
+    menu_prev = { "h", "<Left>" },
+    menu_next = { "l", "<Right>" },
+    menu_confirm = { "<CR>", "<Space>" },
+    -- OPEN keys (open / open_split / open_vsplit / open_tab) are DELIBERATELY absent: opening a selection is a
+    -- CONSUMER concern (each finder/panel owns which keys open, in which split, and where focus lands), so every
+    -- consumer PASSES them via `cfg.keys` (nil here → the binding below no-ops). The chassis still owns the
+    -- open(mode) MECHANISM (default_open → provider `selection()` by path/lnum/col, or `cfg.on_open(mode,item)`).
+    -- ROTATE the preview through five positions (right → below → left → above → dynamic → …), live:
+    preview_next = "<C-n>",
+    preview_prev = "<C-p>",
+    toggle_preview = "<C-e>", -- HIDE ↔ show the preview (no-op while the preview is `dynamic`)
+}
+
+--- The RESOLVED value of a chassis key `id` — DEFAULT_KEYS overlaid by the GLOBAL `config.keys`. For a hosted
+--- consumer (picker / shell) that must reference a chassis key (bind it on its own buffer, or label it in a
+--- footer) at a point where the surface `state` (with per-instance `cfg.keys`) does not yet exist. When the
+--- instance IS live, read `state.keys` instead (it includes the per-instance overrides).
+---@param id string
+---@return string|string[]|nil
+function M.key(id)
+    local ok, cfg = pcall(require, "lvim-ui.config")
+    local global = (ok and cfg and cfg.keys) or {}
+    local v = global[id]
+    if v == nil then
+        v = DEFAULT_KEYS[id]
+    end
+    return v
+end
+
+-- The chassis' OWN footer entries: `id → { fields, name, action }`. A consumer opts a core key INTO its footer
+-- by this `id` (the key stays bound regardless — listing it only DISPLAYS it). `fields` are the DEFAULT_KEYS
+-- ids whose RESOLVED keys form the shown label (a pair → "C-k/C-j"); `action` names the chassis behaviour the
+-- key triggers (the single {key, name, action} record — the keymap itself is bound by `set_keys`).
+M.CORE_FOOTER = {
+    sectors = { fields = { "sector_prev", "sector_next" }, name = "sectors", action = "sector_cycle" },
+    panel = { fields = { "panel_toggle" }, name = "panel", action = "panel_toggle" },
+    preview = { fields = { "preview_prev", "preview_next" }, name = "preview", action = "rotate_preview" },
+    select = { fields = { "menu_confirm" }, name = "select", action = "open" },
+}
+
+--- A footer button spec `{ key, name }` for a CORE key `id` (see `M.CORE_FOOTER`) — its resolved key label +
+--- name — or nil for an unknown id. Consumers include core keys in a footer by id; this supplies the display.
+---@param id string
+---@return { key: string, name: string }|nil
+function M.core_footer_item(id)
+    local meta = M.CORE_FOOTER[id]
+    if not meta then
+        return nil
+    end
+    local parts = {}
+    for _, f in ipairs(meta.fields) do
+        local v = M.key(f)
+        local k = type(v) == "table" and v[1] or v
+        if type(k) == "string" and k ~= "" then
+            parts[#parts + 1] = (k:gsub("[<>]", ""))
+        end
+    end
+    return { key = table.concat(parts, "/"), name = meta.name }
+end
+
+-- ─── config normalisation ─────────────────────────────────────────────────────
+
+--- Default box style for a key-BADGE footer button: a blue key badge + a yellow name, padded 1 each side.
+local FOOTER_STYLE = {
+    icon = {
+        padding = { 1, 1 },
+        normal = "LvimUiFooterKey",
+        active = "LvimUiFooterKey",
+        hover = "LvimUiFooterKeyHover",
+    },
+    text = {
+        padding = { 1, 1 },
+        normal = "LvimUiFooterLabel",
+        active = "LvimUiFooterLabel",
+        hover = "LvimUiFooterLabelHover",
+    },
+}
+
+--- Predefined BUTTON KINDS (extensible) — each a structural button TYPE: its ui.button render FLAGS
+--- (`key_badge` / `key_brackets` / `icon`) PLUS its DEFAULT box `hl` (per-state colours). A bar record picks a
+--- kind by name (its `style` field, the 4th element); the record's own `hl` (a partial box style, the 5th
+--- element) OVERRIDES the kind's default colours per-button, falling back to the kind default when absent. The
+--- KIND is the SHAPE; `hl` is the COLOUR — kept separate. Add an entry to introduce a new button TYPE.
+---   action — the whole key as a lead BADGE (`<CR> open`; footer action bars)
+---   hotkey — the accelerator letter bracketed WITHIN the name (`W[o]rkspace`; scope / severity filters)
+---   tab    — an icon + label TAB button (ui.tabs / project tabs)
+---   plain  — name only, no key
+M.STYLES = {
+    action = { key_badge = true, hl = FOOTER_STYLE },
+    hotkey = {
+        key_badge = false,
+        key_brackets = true,
+        hl = {
+            icon = {
+                padding = { 0, 0 },
+                normal = "LvimUiPeekFilterActive",
+                active = "LvimUiPeekFilterActive",
+                hover = "LvimUiPeekFilterActive",
+            },
+            text = {
+                padding = { 1, 1 },
+                normal = "LvimUiPeekFilterInactive",
+                active = "LvimUiPeekFilterActive",
+                hover = "LvimUiPeekFilterActive",
+            },
+        },
+    },
+    tab = {
+        key_badge = false,
+        icon = true,
+        hl = {
+            icon = {
+                padding = { 2, 2 },
+                normal = "LvimUiTabIconInactive",
+                active = "LvimUiTabIconActive",
+                hover = "LvimUiTabIconHover",
+            },
+            text = {
+                padding = { 2, 2 },
+                normal = "LvimUiTabTextInactive",
+                active = "LvimUiTabTextActive",
+                hover = "LvimUiTabTextHover",
+            },
+        },
+    },
+    plain = {
+        key_badge = false,
+        hl = {
+            text = {
+                padding = { 1, 1 },
+                normal = "LvimUiFooterLabel",
+                active = "LvimUiFooterLabel",
+                hover = "LvimUiFooterLabelHover",
+            },
+        },
+    },
+}
+
+--- Turn ONE bar RECORD into a `ui.button` spec — the SINGLE place the shared button style is applied, so EVERY
+--- bar builder (`M.bar`, `bar_items`, `ui.filters`, `ui.tabs`, notify, lvim-space, lvim-installer, …) produces a
+--- byte-identical button and a change to the styling lands everywhere. A record:
+---   `{ name, key?, style?, hl?, active?, count?, icon?, key_pos?, run?, no_hotkey?, meta? }`
+--- `style` names an `M.STYLES` KIND (default `default_style` or "action") — its render FLAGS + default box colours;
+--- `hl` is a PARTIAL box style (`{ icon = {...}, text = {...} }`) merged OVER the kind default, so a consumer
+--- supplies its OWN colours per-button (severity tints, msg-level tints, installer accents); `meta` passes through
+--- UNTOUCHED for consumer state (e.g. ui.filters' `sync`). The style box is DEEP-COPIED, so every spec owns it —
+--- two bars in one place stay fully INDEPENDENT.
+---@param rec table
+---@param default_style? string
+---@return table  a ui.button spec
+function M.button(rec, default_style)
+    local s = M.STYLES[rec.style or default_style or "action"] or M.STYLES.action
+    local box = vim.deepcopy(s.hl or FOOTER_STYLE)
+    if rec.hl then
+        box = vim.tbl_deep_extend("force", box, rec.hl)
+    end
+    return {
+        type = "button",
+        key = rec.key,
+        key_badge = s.key_badge,
+        key_brackets = s.key_brackets,
+        key_pos = rec.key_pos,
+        icon = rec.icon, -- lead glyph for the `tab` kind (icon + label)
+        text = rec.name,
+        run = rec.run,
+        active = rec.active,
+        count = rec.count,
+        no_hotkey = rec.no_hotkey,
+        style = box,
+        _meta = rec.meta, -- opaque passthrough for consumer state (filters sync, tab index, …)
+    }
+end
+
+--- Build a `ui.bar` `chevrons` config from the SHARED glyphs (`config.chevrons`) paired with a consumer's own
+--- colour — so every overflowing bar (tab bar, action footer, tabs legend) marks its hidden items with the SAME
+--- ❮ ❯, each in its own accent. Pass the highlight group the chevrons should paint with.
+---@param hl string  highlight group for both chevrons
+---@return table  { left = { text, style = { hl } }, right = { text, style = { hl } } }
+function M.chevrons(hl)
+    local g = require("lvim-ui.config").chevrons or { left = "❮", right = "❯" }
+    return {
+        left = { text = g.left or "❮", style = { hl = hl } },
+        right = { text = g.right or "❯", style = { hl = hl } },
+    }
+end
+
+--- Build ONE bar band from a DECLARATIVE spec — a list of GROUPS, each a list of action IDs — for `opts.mode`.
+--- Each id resolves to a RECORD: first from `registry` (the consumer's OWN actions), else the chassis CORE
+--- (`M.core_footer_item`). A record is `{ name, key?|n?|i?, action?, style?, run?, active?, key_pos?, hl?,
+--- no_hotkey? }`: `key` = one label for both modes, `n`/`i` = per-mode; `style` names an `M.STYLES` entry
+--- (default `opts.style` or "action"); `hl` overrides the box colours; `key_pos` = which name char to bracket
+--- (hotkey style); `active` marks the live toggle. Records with no usable key/name in the mode are dropped; a
+--- `opts.separator` item (hl `LvimUiFooterSep`) divides non-empty groups. Returns a ui.bar band `{ items, align }`
+--- — PLACE it in a frame's `header`/`footer` (`{ bars = { surface.bar(...), … } }`). The button LIST lives in the
+--- CONSUMER's config; only the {key,name,action,style} records + the STYLES are shared. One bar concept, any
+--- position, any buttons/style.
+---@param groups string[][]
+---@param registry table<string, table>
+---@param opts { mode?: string, separator?: string, separator_hl?: string, separator_padding?: integer[], align?: string, style?: string, hl?: table, chevrons?: table }
+---@return table  a ui.bar band { items, align, chevrons }
+function M.bar(groups, registry, opts)
+    opts = opts or {}
+    local n = opts.mode == "n"
+    local sep = opts.separator or "●"
+    local sep_hl = opts.separator_hl or "LvimUiFooterSep" -- consumer overridable (e.g. lvim-space's own accent)
+    local sep_pad = opts.separator_padding or { 1, 1 }
+    local default_style = opts.style or "action"
+    registry = registry or {}
+    local items = {}
+    for _, group in ipairs(groups or {}) do
+        local resolved = {}
+        for _, id in ipairs(group) do
+            local rec = registry[id] or M.core_footer_item(id) -- consumer-own else chassis CORE
+            if rec then
+                local key = rec.key or (n and rec.n or rec.i) -- resolve the per-mode key, then delegate the spec
+                if (type(key) == "string" and key ~= "") or (rec.name and rec.name ~= "") then
+                    resolved[#resolved + 1] = M.button({
+                        name = rec.name,
+                        key = key,
+                        style = rec.style,
+                        hl = rec.hl or opts.hl, -- per-record colours, else the bar-level default (opts.hl)
+                        active = rec.active,
+                        count = rec.count,
+                        icon = rec.icon,
+                        key_pos = rec.key_pos,
+                        run = rec.run,
+                        no_hotkey = rec.no_hotkey,
+                        meta = rec.meta,
+                    }, default_style)
+                end
+            end
+        end
+        if #resolved > 0 then
+            if #items > 0 then
+                items[#items + 1] = { type = "separator", text = sep, style = { padding = sep_pad, hl = sep_hl } }
+            end
+            for _, it in ipairs(resolved) do
+                items[#items + 1] = it
+            end
+        end
+    end
+    return { items = items, align = opts.align, chevrons = opts.chevrons }
+end
+
+--- Normalise a bar's `items` into button/separator specs. A FOOTER action shorthand `{ key, name|text,
+--- run }` (no `type`) becomes a footer-styled key-badge button; everything else (full button / separator
+--- specs, e.g. header tab buttons that carry their own style) passes through unchanged.
+---@param items table[]|nil
+---@param footer boolean
+---@return LvimUiButtonSpec[]
+local function bar_items(items, footer)
+    local out = {}
+    for i, it in ipairs(items or {}) do
+        if it.type or not footer then
+            out[i] = it -- full button / separator spec (or a non-footer bar) — passes through
+        else
+            -- footer action shorthand `{ key, name|text, run }` → the shared `action` KIND (via `M.button`); a
+            -- caller-supplied `it.style` is a full BOX colour override, passed through as the button's `hl`.
+            out[i] = M.button({
+                name = it.name or it.text or "",
+                key = it.key,
+                run = it.run,
+                active = it.active,
+                no_hotkey = it.no_hotkey,
+                hl = it.style,
+            }, "action")
+        end
+    end
+    return out
+end
+
+--- Build a band stack from `cfg.header` / `cfg.footer`. Each `bar` is a ui.bar `{ items, align, chevrons,
+--- on_change, on_select }` OR a meta line `{ text = "...", hl }`. Internally a bar band keeps its element
+--- list in `band.buttons` (the field name the machinery uses — it already holds buttons + separators).
+--- The header leads with 1 blank "air" row (under the border-title); the footer gets 1 blank "air" row
+--- ABOVE its content (so the action bar breathes off the center) — per the UI canon.
+---@param spec table|nil
+---@param footer boolean
+---@return table[]
+local function build_bands(spec, footer, add_air)
+    spec = spec or {}
+    local bands = {}
+    for _, bar in ipairs(spec.bars or {}) do
+        if bar.title_counter then
+            -- A title + right-aligned counter CONTENT row (title left, count right) — a dynamic `count`
+            -- function is re-evaluated on every chrome render. Passed through with its fields intact.
+            bands[#bands + 1] = bar
+        elseif bar.text ~= nil then
+            bands[#bands + 1] = { meta = bar.text, hl = bar.hl or (footer and "LvimUiSubtitle" or "LvimUiPeekTitle") }
+        elseif bar.input then
+            -- An editable INPUT band — a focusable 1-row editable window the frame creates over this row
+            -- (see open_windows). It reserves a row like a meta line; the consumer drives it via
+            -- `on_change(query)` (fired live on type) and the band's own insert-mode `keys(buf, st)`.
+            bands[#bands + 1] = {
+                input = true,
+                prompt = bar.prompt,
+                prompt_hl = bar.prompt_hl, -- the prompt badge highlight (else a neutral default)
+                input_hl = bar.input_hl, -- the typed-area Normal highlight (else the peek normal)
+                on_change = bar.on_change,
+                keys = bar.keys,
+                filetype = bar.filetype,
+                scope_panel = bar.scope_panel, -- narrow the prompt to a single panel's columns (else full width)
+                scope_id = bar.scope_id, -- … or to the panel with this id (rotation-safe — tracks it as it moves)
+            }
+        else
+            -- Mutate the bar spec INTO its band (the machinery reads the element list as `band.buttons`),
+            -- so a consumer that keeps a reference to the bar can drive its `_sel` / button `active` flags
+            -- live (e.g. the project panel switching tabs from the content body).
+            bar.buttons = bar_items(bar.items, footer)
+            bar.align = bar.align or "center"
+            bands[#bands + 1] = bar
+        end
+    end
+    if footer then
+        if #bands > 0 then
+            table.insert(bands, 1, { meta = "" }) -- 1 air row ABOVE the footer content (the only footer air)
+        end
+    elseif add_air ~= false then
+        table.insert(bands, 1, { meta = "" }) -- 1 air row under the (border-)title (skip when add_air=false)
+    end
+    return bands
+end
+
+--- Build the float border-title chunks (`{ { text, hl }, … }`) from the `title` box: an optional icon box
+--- + a text box, each with its own padding + colour (static — one hl per box). A plain string is accepted
+--- too (→ a single padded text chunk).
+---@param title table|string|nil
+---@return table[]|nil
+local function title_chunks(title)
+    local function box(content, bs, default_hl)
+        if not content or content == "" then
+            return nil
+        end
+        local f, b = 1, 1
+        local pad = bs.padding
+        if type(pad) == "number" then
+            f, b = pad, pad
+        elseif type(pad) == "table" then
+            f, b = pad[1] or 1, pad[2] or 1
+        end
+        return { string.rep(" ", f) .. content .. string.rep(" ", b), util.resolve_hl(bs.hl or default_hl) }
+    end
+    -- titles render UPPERCASE everywhere (the canon — matches the ui.bar title bars); the icon glyph is left
+    if type(title) == "string" then
+        return title ~= "" and { box(title:upper(), {}, "LvimUiPeekTitle") } or nil
+    end
+    if type(title) ~= "table" then
+        return nil
+    end
+    local st = title.style or {}
+    local chunks = {}
+    local ic = box(title.icon, st.icon or {}, "LvimUiPeekTitleIcon")
+    local tc = box(title.text and tostring(title.text):upper() or nil, st.text or {}, "LvimUiPeekTitle")
+    if ic then
+        chunks[#chunks + 1] = ic
+    end
+    if tc then
+        chunks[#chunks + 1] = tc
+    end
+    return #chunks > 0 and chunks or nil
+end
+
+--- Flatten a `title` box (or string) to a plain string (icon + text) — for a winbar / split content row.
+---@param title table|string|nil
+---@return string
+local function title_text(title)
+    if type(title) == "string" then
+        return title
+    end
+    if type(title) ~= "table" then
+        return ""
+    end
+    return ((title.icon and title.icon .. " ") or "") .. (title.text or "")
+end
+
+-- ─── title / counter placement (the single title path) ────────────────────────
+-- The chassis owns WHERE a frame's title and item-count render, driven by two shared cfg keys (resolved in
+-- M.open from the surface opts → `config` default): `title_line` ("row" | "statusline" | "border") and `counter`
+-- ("title" | "footer"). These helpers are the ONE place the native border-title, the native border-FOOTER
+-- counter, and the chrome-overlay title are built — consumers only supply `title` + an optional `count`.
+
+--- Whether this frame is DOCKED in the cmdline / area host zone — the only place `title_line="statusline"`
+--- moves the title onto the chrome overlay. (A `position="cmdline"` float, hosted or growing cmdheight.)
+---@param cfg table
+---@return boolean
+local function is_area_dock(cfg)
+    return cfg.position == "cmdline"
+end
+
+--- Resolve the consumer-supplied count for the title / footer counter. `cfg.count` is an integer, a
+--- `{ current, total }` pair, or a function returning either; re-evaluated on every read so a live counter
+--- (filter / tab change) tracks the content.
+---@param cfg table
+---@return integer current, integer total
+local function resolve_count(cfg)
+    local c = cfg.count
+    if type(c) == "function" then
+        local ok, r = pcall(c)
+        c = ok and r or nil
+    end
+    local cur, tot = 0, 0
+    if type(c) == "number" then
+        tot = c
+    elseif type(c) == "table" then
+        cur, tot = c.current or 0, c.total or 0
+    end
+    -- `count_follows_cursor`: the FIRST content panel's cursor row IS the counter's `current`, so the counter
+    -- reads "<row>/<total>" (a live "item N of M" indicator). `cfg._cursor_row` is kept up to date by the
+    -- CursorMoved autocmd wired in open_windows; clamp it to the total so a stale row after a delete can't exceed.
+    if cfg.count_follows_cursor and tot > 0 then
+        cur = math.min(math.max(cfg._cursor_row or 1, 1), tot)
+    end
+    return cur, tot
+end
+
+--- The counter text ("8" or "3/8") from the resolved count, or nil when there is nothing to show (total 0).
+---@param cfg table
+---@return string|nil
+local function counter_text(cfg)
+    local cur, tot = resolve_count(cfg)
+    if tot <= 0 then
+        return nil
+    end
+    return cur > 0 and ("%d/%d"):format(cur, tot) or tostring(tot)
+end
+
+--- The row-title prefix bands for a `title_line = "row"` float: the `title_counter` title row + 1 blank air row
+--- under it, to prepend as the FIRST header bands. Built HERE (not inline at open) so a later `set_header` — a
+--- tab switch rebuilds the header from its spec — re-prepends the SAME title; otherwise the row title vanished
+--- on the first tab change. Defined before `open_windows` (where set_header lives) so it is in scope there.
+--- Returns nil when this frame has no row title.
+---@param cfg table
+---@return table[]?
+local function row_title_bands(cfg)
+    local row_title = cfg.mode ~= "split" and cfg.title_line == "row" and cfg.title and cfg.title ~= ""
+    if not row_title then
+        return nil
+    end
+    local t = cfg.title
+    local text, thl
+    if type(t) == "table" then
+        text = (t.icon and t.icon .. " " or "") .. (t.text and tostring(t.text) or "")
+        thl = (t.style and t.style.text and t.style.text.hl) or "LvimUiPeekTitle"
+    else
+        text = tostring(t)
+        thl = "LvimUiPeekTitle"
+    end
+    return {
+        {
+            title_counter = true,
+            text = text,
+            -- the count formats to the canon "cur/tot" string; the band handler tostring()s whatever it gets
+            count = function()
+                return counter_text(cfg) or ""
+            end,
+            hl = thl,
+            count_hl = "LvimUiPeekCounter",
+            title_pos = cfg.title_pos, -- "left" (default) | "center" | "right"
+        },
+        { meta = "" }, -- 1 air row UNDER the title bar
+    }
+end
+
+--- Build the native border-title chunks for this frame: the TITLE hugs the LEFT (`title_pos="left"`), and —
+--- when `counter="title"` — the COUNTER is pushed to the RIGHT edge of the same top-border line by a fill
+--- spacer (so the line reads `TITLE …………… 8/62`). The fill needs the title-line width (`width`, the container
+--- content width); without it the counter just trails the title. Returns nil when the title must NOT render
+--- in the border: no title, or an area dock with `title_line="statusline"` (it goes to the chrome overlay via
+--- `publish_overlay_title`). The SINGLE place the border-title is built.
+---@param state table
+---@param width? integer  the title-line width (defaults to the live geom width)
+---@return table[]|nil
+local function build_brand(state, width)
+    local cfg = state.cfg
+    if is_area_dock(cfg) and cfg.title_line == "statusline" then
+        return nil -- the title lives on the chrome overlay (suppress the border-title)
+    end
+    if cfg.title_line == "row" then
+        return nil -- the title lives in a CONTENT row (a title_counter band), not the native border-title
+    end
+    local chunks = title_chunks(cfg.title) or {}
+    if cfg.counter == "title" then
+        local ct = counter_text(cfg)
+        if ct then
+            local count_chunk = { " " .. ct .. " ", util.resolve_hl("LvimUiPeekCounter") }
+            width = width or (state._geom and state._geom.W)
+            if width then
+                -- Right-align the counter: pad between the title and the count so the count lands on the right
+                -- edge. `used` is the display width of the title chunks + the count box; the spacer fills the gap.
+                local used = util.dw(count_chunk[1])
+                for _, c in ipairs(chunks) do
+                    used = used + util.dw(c[1])
+                end
+                local fill = width - used
+                if fill > 0 then
+                    -- Fill with the TOP-border glyph (tinted like the border), NOT spaces: the brand is OVERLAID
+                    -- on the native border, so a blank spacer would punch a gap in the top rule between the title
+                    -- and the right-aligned count (the "top border vanishes when the count shows" bug).
+                    local rb = util.resolve_border(cfg.border)
+                    local top = (type(rb) == "table" and rb[2] ~= "" and rb[2]) or " "
+                    chunks[#chunks + 1] = { string.rep(top, fill), util.resolve_hl("LvimUiPeekBorder") }
+                end
+            end
+            chunks[#chunks + 1] = count_chunk
+        end
+    end
+    return (#chunks > 0) and chunks or nil
+end
+
+--- Build the native border-FOOTER chunks (the right-aligned counter) when `counter="footer"` and a count
+--- is present; else nil. This is the ONLY use of the native border-footer — a NAVIGABLE action bar is a
+--- separate CONTENT band (`cfg.footer`), never conflated with this.
+---@param state table
+---@return table[]|nil
+local function build_border_footer(state)
+    if state.cfg.counter ~= "footer" then
+        return nil
+    end
+    local ct = counter_text(state.cfg)
+    if not ct then
+        return nil
+    end
+    return { { " " .. ct .. " ", util.resolve_hl("LvimUiPeekCounter") } }
+end
+
+--- Publish the title (+ counter) to the chrome overlay for an area dock with `title_line="statusline"`;
+--- a no-op otherwise. The SINGLE centralized overlay-TITLE path (consumers stop doing their own in later
+--- phases). Cleared on close by the consumer / `chrome.overlay.clear()`.
+---@param state table
+local function publish_overlay_title(state)
+    local cfg = state.cfg
+    if not (is_area_dock(cfg) and cfg.title_line == "statusline") then
+        return
+    end
+    local title = cfg.title
+    if not (title and title ~= "") then
+        return
+    end
+    local icon, text
+    if type(title) == "table" then
+        icon = title.icon
+        text = title.text and tostring(title.text) or nil
+    else
+        text = tostring(title)
+    end
+    local cur, tot = resolve_count(cfg)
+    pcall(function()
+        require("lvim-hud.overlay").set({ title = text, icon = icon, current = cur, total = tot })
+    end)
+end
+
+-- ─── inter-panel divider ──────────────────────────────────────────────────────
+-- The rule the chassis draws BETWEEN adjacent content panels (a picker's list ↔ preview). Resolution, in
+-- order: a per-surface `cfg.separator` overrides the configurable default `config.separator`; each is one
+-- of `false`/"" (off), a plain string (verbatim, both axes), or a `{ h, v, hl }` table (per-axis glyph). The
+-- glyph is AUTO-ORIENTED — `h`/"│" between side-by-side panels, `v`/"─" between stacked ones — so a runtime
+-- preview rotation flips it. Returns nil when disabled (the caller then reserves no gap / draws nothing).
+
+--- The divider glyph for `cfg` on the given axis, or nil when the divider is disabled.
+---@param sep any      a per-surface override, or nil to fall back to `config.separator`
+---@param vertical boolean  true → the glyph BETWEEN stacked panels ("─"); false → between side-by-side ("│")
+---@return string|nil
+local function resolve_divider(sep, vertical)
+    if sep == nil then
+        sep = config.separator
+    end
+    if sep == false or sep == "" then
+        return nil
+    end
+    if type(sep) == "string" then
+        return sep
+    end
+    if type(sep) == "table" then
+        return (vertical and (sep.v or sep.vertical)) or (not vertical and (sep.h or sep.horizontal)) or nil
+    end
+    return vertical and "─" or "│"
+end
+
+--- The divider's highlight group — a per-surface `separator_hl`, else `config.separator.hl`, else the
+--- canon border tint (so the rule matches the rings).
+---@param cfg table
+---@return string
+local function divider_hl(cfg)
+    local d = config.separator
+    return cfg.separator_hl or (type(d) == "table" and d.hl) or "LvimUiPeekBorder"
+end
+
+-- ─── group frame (the "unifying ring" around the content-panel group) ──────────
+-- A COMMON ring drawn around the DATA panels as one group (a picker's list + preview), INSIDE the container
+-- but OUTSIDE the header / footer nav bands. Third ring level: container (outer) › group › each panel's own
+-- content_border. Only when there are ≥2 content panels (one panel needs no grouping). Resolution: a per-surface
+-- `cfg.group_border` overrides the configurable default `config.group_border` (false to disable, or an
+-- 8-element border table `{ …, hl }`). The layout reserves a 1-col gutter on each side between the container and
+-- the group, and between the group and the panels, so no edge doubles.
+
+--- The resolved group-frame border (8-element) + its hl, or nil when disabled / fewer than 2 panels.
+---@param cfg table
+---@param n integer  the content-panel count
+---@return string[]|nil border, string? hl
+local function group_frame(cfg, n)
+    if n < 2 then
+        return nil
+    end
+    local g = cfg.group_border
+    if g == nil then
+        g = config.group_border
+    end
+    if g == false or g == "none" then
+        return nil
+    end
+    local b = util.resolve_border(g)
+    -- A border whose every edge is "" has ZERO insets — it draws nothing and must add NO geometry overhead
+    -- (no gutters), else the content would sit inset from the edges for an invisible frame. Treat it as OFF so
+    -- the panels lay out flush. (resolve_border keeps "" as 0-inset; " " is a real 1-inset blank edge.)
+    local t, r, bo, l = util.insets(b)
+    if (t + r + bo + l) == 0 then
+        return nil
+    end
+    local hl = (type(g) == "table" and g.hl) or "LvimUiPeekBorder"
+    return b, hl
+end
+
+-- ─── geometry ─────────────────────────────────────────────────────────────────
+
+--- The largest `cmdheight` the current window layout can give up without "E36: Not enough room": the
+--- non-floating windows must keep their minimum rows. Walks `winlayout()` — a "col" stacks rows (heights
+--- ADD), a "row" sits side by side (heights are the MAX); each leaf needs `winminheight` + its statusline
+--- (per-window when `laststatus` 1/2) + its winbar. Plus the global chrome (tabline, the `laststatus=3`
+--- global statusline). The cmdline region can take everything left over.
+---@return integer
+local function max_cmdheight()
+    local ls = vim.o.laststatus
+    local per_win_status = (ls == 1 or ls == 2) and 1 or 0 -- a statusline on each window
+    local wmh = math.max(1, vim.o.winminheight)
+    local function need(node)
+        if not node then
+            return wmh + per_win_status
+        end
+        local kind, items = node[1], node[2]
+        if kind == "leaf" then
+            local win = items
+            local wb = (api.nvim_win_is_valid(win) and vim.wo[win].winbar ~= "") and 1 or 0
+            return wmh + per_win_status + wb
+        end
+        local n = 0
+        for _, child in ipairs(items or {}) do
+            local c = need(child)
+            n = (kind == "col") and (n + c) or math.max(n, c)
+        end
+        return n
+    end
+    local tabs = vim.api.nvim_list_tabpages()
+    local tabline = (vim.o.showtabline == 2 or (vim.o.showtabline == 1 and #tabs > 1)) and 1 or 0
+    local global_status = (ls == 3) and 1 or 0
+    local reserve = need(vim.fn.winlayout()) + tabline + global_status
+    return math.max(1, vim.o.lines - reserve)
+end
+
+--- Set `cmdheight` to `h`, clamped to what the layout allows (`max_cmdheight`), then DECREMENT on the rare
+--- "E36: Not enough room" (the estimate is conservative but window minima can be quirky) until it sticks.
+--- Returns the value actually applied — the geometry uses THAT so the container float matches the region.
+---@param h integer
+---@return integer
+local function set_cmdheight(h)
+    h = math.max(1, math.min(h, max_cmdheight()))
+    vim.o.cmdheight = h
+    return vim.o.cmdheight
+end
+
+--- Pure geometry: the container frame, the header/footer band rows, and every center-panel rect + the
+--- divider columns. No window/buffer side effects. `place` overrides position/size for a SPLIT (docked)
+--- frame whose container window already exists: `{ row, col, H }` (screen position + the split height).
+---@param state table
+---@param place? table
+---@return table layout
+local function compute_geom(state, place)
+    local cfg = state.cfg
+    -- A REAL native split container draws no border (its edge IS the split divider). A FLOAT keeps `cfg.border`
+    -- even when `place` fixes its rect — a hosted cmdline/area zone (or a bottom dock, or a host reflow) still
+    -- carries its (e.g. left/right inset) border WITHIN the reserved rect. So only force "none" for the split.
+    local cbord = (place and cfg.mode == "split") and util.resolve_border("none") or util.resolve_border(cfg.border)
+    local ct, cr, cb, cl = util.insets(cbord)
+
+    local panels = state.panels
+    local n = #panels
+    -- Panels stack VERTICALLY (top→bottom, full width, height grows) when direction == "vertical"; else
+    -- they sit side-by-side (the default). Used for the navigator's above/below preview.
+    local vertical = cfg.direction == "vertical"
+    -- 1 col/row reserved between panels for the divider when one is enabled on THIS axis (config-driven,
+    -- per-surface overridable); 0 otherwise. Only consumed as `sep_w * (n - 1)`, so a single panel reserves none.
+    local sep_w = resolve_divider(cfg.separator, vertical) and 1 or 0
+
+    -- GROUP frame overhead (the common ring around the panel group). HORIZONTAL per side = outer gutter (1,
+    -- container ↔ group) + the group border (its left/right inset) + inner gutter (1, group ↔ panels). VERTICAL
+    -- = the group border's top + bottom inset, with NO row gutters (rows are sequential, so no doubling — this
+    -- keeps the area short). `gh` is the per-SIDE horizontal overhead, `gv_t` / `gv_b` the top / bottom.
+    local gbord, ghl = group_frame(cfg, n)
+    local g_on = gbord ~= nil
+    local git_t, git_r, git_b, git_l = util.insets(gbord or util.resolve_border("none"))
+    local g_og = g_on and 1 or 0 -- outer gutter (container ↔ group)
+    local g_ig = g_on and 1 or 0 -- inner gutter (group ↔ panels)
+    local gh_l = g_og + git_l + g_ig -- left horizontal overhead
+    local gh_r = g_ig + git_r + g_og -- right horizontal overhead
+    local gh = gh_l + gh_r -- total horizontal overhead
+    local gv_t, gv_b = git_t, git_b -- top / bottom overhead (group border only)
+    local gv = gv_t + gv_b -- total vertical overhead
+
+    -- Per-panel border insets + natural content size (provider.size()). Track BOTH axes so either layout
+    -- direction can auto-size: sum along the stacking axis, max across it.
+    local pin = {}
+    local nat_w_sum, nat_w_max, nat_h_sum, nat_h_max = 0, 1, 0, 1
+    local border_cols, border_rows, max_vborder, max_hborder = 0, 0, 0, 0
+    for i, pan in ipairs(panels) do
+        local b = util.resolve_border(pan.border or cfg.panel_border)
+        local pt, pr, pbm, pl = util.insets(b)
+        local sw, sh = 20, 1
+        if pan.provider and pan.provider.size then
+            local ok, w, h = pcall(pan.provider.size)
+            if ok then
+                sw, sh = w or sw, h or sh
+            end
+        end
+        pin[i] = { b = b, t = pt, r = pr, bo = pbm, l = pl, nat_w = sw, nat_h = sh }
+        nat_w_sum = nat_w_sum + pl + sw + pr
+        nat_w_max = math.max(nat_w_max, pl + sw + pr)
+        nat_h_sum = nat_h_sum + pt + sh + pbm
+        -- Include the panel's OWN border rows (pt + pbm) in the cross-axis max, like nat_h_sum does on the
+        -- stacking axis: for side-by-side (horizontal) panels the container content height is the tallest
+        -- panel FOOTPRINT (content + its border), so a content-bordered panel reserves its +2 rows. Without
+        -- this the container sizes to bare content and the per-panel `center_h - border` step squeezes the
+        -- panel to 1 row. (Borderless panels keep pt = pbm = 0, so this is a no-op for them.)
+        nat_h_max = math.max(nat_h_max, pt + sh + pbm)
+        border_cols = border_cols + pl + pr
+        border_rows = border_rows + pt + pbm
+        max_vborder = math.max(max_vborder, pt + pbm) -- so min_content counts VISIBLE rows, not the border
+        max_hborder = math.max(max_hborder, pl + pr)
+    end
+
+    -- Widest content drives auto_width: the widest bar band vs the panels' natural footprints.
+    local bars_w = 0
+    for _, band in ipairs(state.header_bands) do
+        bars_w = math.max(bars_w, band.buttons and uibar.width(band.buttons) or util.dw(band.meta or ""))
+    end
+    local footer_w = 0
+    for _, band in ipairs(state.footer_bands) do
+        local bw = band.buttons and uibar.width(band.buttons) or 0
+        bars_w = math.max(bars_w, bw)
+        footer_w = math.max(footer_w, bw) -- the action footer must FIT (never scroll under the auto-width cap)
+    end
+    -- Stacking axis sums; cross axis is the max. Horizontal: width sums (+ column separators), height = the
+    -- tallest panel. Vertical: width = the widest panel, height sums (+ row separators).
+    -- The panel footprints carry the GROUP frame overhead too (gh), so auto-width reserves room for the ring.
+    local content_w = vertical and math.max(bars_w, nat_w_max + gh)
+        or math.max(bars_w, nat_w_sum + sep_w * (n - 1) + gh)
+
+    -- Container CONTENT width/height (W excludes the container's own border columns). With `place` the rect is
+    -- the OUTER footprint the host reserved (or the split window's actual size), so the container's own border
+    -- insets come OUT of it — content + border fits the rect exactly. A split forces "none" (cl..cb all 0, so
+    -- W == place.W unchanged); a hosted float with a left/right inset takes `place.W - cl - cr`.
+    local W = place and (place.W - cl - cr)
+        or util.axis_size(cfg.auto_width, cfg.width, cfg.max_width, content_w, vim.o.columns)
+    if not place and cfg.min_width then
+        local mw = cfg.min_width <= 1 and math.floor(vim.o.columns * cfg.min_width) or cfg.min_width
+        W = math.max(W, math.floor(mw))
+    end
+    -- The footer action bar must fit: its buttons should never scroll just because the auto-width cap is
+    -- tighter than them. Widen to the footer, up to the screen.
+    if not place and footer_w > 0 then
+        W = math.max(W, math.min(footer_w, vim.o.columns - 4))
+    end
+    -- A `scope_panel` / `scope_id` input band does NOT take its own header row — it overlays its panel's top
+    -- (winbar) row instead, so it doesn't count toward the header height.
+    local header_h = 0
+    for _, b in ipairs(state.header_bands) do
+        if not b.scope_panel and not b.scope_id then
+            header_h = header_h + 1
+        end
+    end
+    local footer_h = #state.footer_bands
+    -- The center's natural height — 0 when there are NO content panels (a header-only surface like the input
+    -- prompt: header bands + footer, no center), else the panel stack. Guarding `n == 0` avoids a phantom empty
+    -- center row under the input (nat_h_max seeds to 1).
+    local center_nat = (n == 0) and 0 or (vertical and (nat_h_sum + sep_w * (n - 1)) or nat_h_max)
+    local content_h = header_h + footer_h + gv + center_nat
+    -- A split takes the full height nvim gives it (place.H); a float sizes per auto/explicit height. The
+    -- center never shrinks below `min_content_height` VISIBLE rows — counted on the panel content, so the
+    -- panel borders are added on top (the header/footer bands are fixed-height). Stacked panels need room
+    -- for ALL of them. `min_h` is the resulting minimum container height, exported for the resize clamp.
+    -- No content panels → no center minimum (so a header-only input surface adds no blank row).
+    local min_center = (n == 0) and 0
+        or (
+            gv
+            + (
+                vertical and (n * math.max(1, cfg.min_content_height or 1) + border_rows + sep_w * (n - 1))
+                or (math.max(1, cfg.min_content_height or 1) + max_vborder)
+            )
+        )
+    local min_h = header_h + footer_h + min_center
+    local H = place and (place.H - ct - cb)
+        or util.axis_size(cfg.auto_height, cfg.height, cfg.max_height, content_h, vim.o.lines)
+    H = math.max(H, min_h)
+
+    -- Float placement. Split: the container's actual screen position (passed in `place`). Otherwise by
+    -- `cfg.position`: "cursor"/"win" via util.calc_pos (cursor = below the cursor when it fits, else above;
+    -- win = centred in the current window), "bottom"/"top" docked to that edge (full width), else centred
+    -- on the whole editor. calc_pos takes the TOTAL footprint (content + the container's border insets).
+    local row, col
+    if place then
+        row, col = place.row, place.col
+    elseif cfg.position == "cursor" or cfg.position == "win" then
+        row, col = util.calc_pos(H + ct + cb, W + cl + cr, cfg.position)
+    elseif cfg.position == "bottom" or cfg.position == "top" then
+        W = vim.o.columns - cl - cr
+        col = 0
+        row = cfg.position == "bottom" and math.max(0, vim.o.lines - H - ct - cb - 1) or 0
+    elseif cfg.position == "left" or cfg.position == "right" then
+        -- Dock to a side: full editor height (minus the cmdline row), fixed width (`size.width`) on that edge.
+        H = math.max(min_h, vim.o.lines - ct - cb - 1)
+        row = 0
+        col = cfg.position == "right" and math.max(0, vim.o.columns - W - cl - cr) or 0
+    elseif cfg.position == "cmdline" then
+        -- The CMDHEIGHT region: full width, docked over the bottom `cmdheight` rows (grown to H in
+        -- open_windows). Unlike "bottom" (which leaves the cmdline row free), the surface IS the cmdline
+        -- area, so a global statusline / heirline stays above it — hence no `- 1`.
+        W = vim.o.columns - cl - cr
+        col = 0
+        -- Clamp to the largest cmdheight the window layout can give up without "E36: Not enough room": the
+        -- non-floating windows must keep their minimum rows. (A tall preview must not grow the area past the
+        -- room available between the splits above it.)
+        H = math.min(H, max_cmdheight())
+        H = math.max(H, min_h)
+        row = math.max(0, vim.o.lines - H - ct - cb)
+    else
+        row = math.max(1, math.floor((vim.o.lines - H) / 2 - 1))
+        col = math.max(1, math.floor((vim.o.columns - W) / 2))
+    end
+    local cc_row, cc_col = row + ct, col + cl
+    local center_top = cc_row + header_h
+    local center_h = math.max(min_center, H - header_h - footer_h)
+
+    -- Distribute the center across panels along the STACKING axis (width when horizontal, height when
+    -- vertical): weighted panels take their share, weightless ones split the remainder (auto ⇒ each takes
+    -- its natural size); the cross axis is the full center extent. `dividers` are column offsets when
+    -- horizontal, row offsets when vertical (render_chrome draws them per `L.vertical`).
+    local out, dividers = {}, {}
+    --- Share `avail` across the panels by weight / auto-natural / flex (the common allocation for both axes).
+    ---@param avail integer
+    ---@param natural fun(i: integer): integer
+    ---@param auto boolean
+    ---@return integer[]
+    local function allocate(avail, natural, auto)
+        local sizes, fixed, flex, auto_idx = {}, 0, {}, {}
+        for i, pan in ipairs(panels) do
+            local wgt = pan.weight
+            if auto and not wgt then
+                sizes[i] = natural(i)
+                fixed = fixed + sizes[i]
+                auto_idx[#auto_idx + 1] = i
+            elseif wgt then
+                sizes[i] = math.max(1, wgt <= 1 and math.floor(avail * wgt) or math.floor(wgt))
+                fixed = fixed + sizes[i]
+            else
+                flex[#flex + 1] = i
+            end
+        end
+        -- OVERFLOW: the natural (auto) panels together exceed `avail` — the area hit its height cap (e.g. a long
+        -- list + a preview both wanting `max_rows`). Shrink the auto panels PROPORTIONALLY so the stack fits
+        -- exactly, instead of spilling past the container (which pushed the divider + the scoped input band down
+        -- into the list, and the last panel off-screen).
+        if fixed > avail and #flex == 0 and #auto_idx > 0 then
+            -- The auto panels together exceed `avail` (the stack hit the area cap / the room left between the
+            -- splits). Shrink them to fit EXACTLY. `shrink_first` panels (e.g. a picker's list) give up rows BEFORE
+            -- the rest, so a PROTECTED panel (the list) keeps its own content and its height never jumps as you
+            -- navigate files of different lengths; within a group the shrink is proportional. Every panel keeps
+            -- at least 1 row. (No marks ⇒ one proportional shrink over all of them, the old behaviour.)
+            local first, rest = {}, {}
+            for _, i in ipairs(auto_idx) do
+                local g = panels[i].shrink_first and first or rest
+                g[#g + 1] = i
+            end
+            -- Remove `amount` rows from `group`, proportional to each panel's room above 1; return the remainder.
+            local function shrink(group, amount)
+                local pool = 0
+                for _, i in ipairs(group) do
+                    pool = pool + (sizes[i] - 1)
+                end
+                local take = math.min(amount, math.max(0, pool))
+                local acc = 0
+                for k, i in ipairs(group) do
+                    local share = (k < #group) and math.floor(take * (sizes[i] - 1) / math.max(1, pool)) or (take - acc) -- the last panel takes the remainder (no rounding gap)
+                    sizes[i] = math.max(1, sizes[i] - share)
+                    acc = acc + share
+                end
+                return amount - take
+            end
+            local over = shrink(first, fixed - avail)
+            over = shrink(rest, over)
+            fixed = avail + math.max(0, over)
+        end
+        local rest = math.max(0, avail - fixed)
+        if #flex > 0 then
+            local each = math.max(1, math.floor(rest / #flex))
+            for _, i in ipairs(flex) do
+                sizes[i] = each
+            end
+            sizes[flex[#flex]] = sizes[flex[#flex]] + (rest - each * #flex)
+        elseif n > 0 then
+            sizes[n] = sizes[n] + rest
+        end
+        return sizes
+    end
+
+    -- The panels lay out INSIDE the group frame: the available extent shrinks by the group overhead (gh / gv)
+    -- and the origin shifts in by the LEFT / TOP overhead (gh_l / gv_t). With no group (g_on=false) every g* is
+    -- 0, so this is identical to the un-grouped layout.
+    if vertical then
+        local heights = allocate(math.max(n, center_h - gv - border_rows - sep_w * (n - 1)), function(i)
+            return pin[i].nat_h
+        end, cfg.auto_height)
+        -- Lay footprints top→bottom; each panel is full (grouped) center width; dividers sit in the row gaps.
+        local y = center_top + gv_t
+        for i = 1, n do
+            local pi = pin[i]
+            out[i] = {
+                width = math.max(1, W - gh - pi.l - pi.r),
+                height = heights[i],
+                row = y,
+                col = cc_col + gh_l,
+                border = pi.b,
+            }
+            y = y + pi.t + heights[i] + pi.bo
+            if i < n and sep_w > 0 then
+                dividers[#dividers + 1] = y - center_top
+                y = y + sep_w
+            end
+        end
+    else
+        local widths = allocate(math.max(n, W - gh - border_cols - sep_w * (n - 1)), function(i)
+            return pin[i].nat_w
+        end, cfg.auto_width)
+        -- Lay footprints left→right; each panel's col is its LEFT-BORDER position; dividers sit in the gaps.
+        local x = cc_col + gh_l
+        for i = 1, n do
+            local pi = pin[i]
+            out[i] = {
+                width = widths[i],
+                height = math.max(1, center_h - gv - pi.t - pi.bo),
+                row = center_top + gv_t,
+                col = x,
+                border = pi.b,
+            }
+            x = x + pi.l + widths[i] + pi.r
+            if i < n and sep_w > 0 then
+                dividers[#dividers + 1] = x - cc_col
+                x = x + sep_w
+            end
+        end
+    end
+
+    return {
+        W = W,
+        H = H,
+        min_h = min_h,
+        row = row,
+        col = col,
+        cbord = cbord,
+        ct = ct,
+        cb = cb,
+        header_h = header_h,
+        footer_h = footer_h,
+        center_h = center_h,
+        panels = out,
+        dividers = dividers,
+        vertical = vertical, -- dividers are ROW offsets (a horizontal rule) when true, else column offsets
+        -- The common GROUP ring around the panels (drawn by render_chrome), or nil when ungrouped. Coords are
+        -- 0-based within the container buffer: `line0`..`line0+lines-1` rows, `col0`..`col0+cols-1` cols. `ptop`
+        -- / `pbot` are the panel insets within it (so the divider rule spans only the panel rows, not the ring).
+        group = g_on and {
+            line0 = header_h,
+            lines = center_h,
+            col0 = g_og,
+            cols = W - 2 * g_og,
+            border = gbord,
+            hl = ghl,
+            ptop = gv_t,
+            pbot = gv_b,
+            pcol0 = gh_l, -- 0-based buffer col where the PANELS (and so the divider) start, inside the ring
+            pcols = W - gh, -- the panel-area width inside the ring
+        } or nil,
+    }
+end
+
+-- ─── chrome render ────────────────────────────────────────────────────────────
+
+--- Render the container buffer: the header band rows at the top, the footer band rows at the bottom,
+--- blank center rows carrying the divider columns in between, plus all bar/meta highlights.
+---@param state table
+---@param L table
+local function render_chrome(state, L)
+    local W, H = L.W, L.H
+    -- The inter-panel divider glyph for the current axis (config-driven via `config.separator`, per-surface
+    -- overridable, auto-oriented "│" side-by-side / "─" stacked — so a runtime preview rotation flips it), or
+    -- nil when the divider is disabled. See `resolve_divider`.
+    local sep_char = resolve_divider(state.cfg.separator, L.vertical)
+    local divider_set = {}
+    for _, d in ipairs(L.dividers) do
+        divider_set[d] = true
+    end
+
+    -- A center row (`i` 1-based buffer line). It carries, in this order, on a blank W-wide row:
+    --  • the inter-panel DIVIDER — a vertical glyph at the divider COLUMNS (horizontal layout), drawn only on
+    --    the PANEL rows; or a full panel-width rule on a divider ROW (vertical/stacked layout);
+    --  • the common GROUP ring box (when `L.group`) — its corners / top-bottom rules / left-right verticals,
+    --    drawn ON TOP so the ring edges always read cleanly around the panels.
+    local grp = L.group
+    local sep_hl = sep_char and util.resolve_hl(divider_hl(state.cfg)) or nil
+    local grp_hl = grp and util.resolve_hl(grp.hl or "LvimUiPeekBorder") or nil
+    -- Highlights for the center rows, keyed by 0-based buffer line → { { byte0, byte1, hl }, … }. We compute
+    -- BYTE columns (not cell columns) because the group ring + divider glyphs are multi-byte, so a cell index is
+    -- NOT its byte offset — emitting extmarks at cell indices would mis-place the tint.
+    local center_hls = {}
+    local function center_line(i)
+        local i0 = i - 1 -- 0-based buffer line
+        local center_off = i - L.header_h - 1 -- 0-based offset within the center (matches vertical dividers)
+        local cells, chl = {}, {}
+        for c = 1, W do
+            cells[c] = " "
+        end
+        local pcol0 = grp and grp.pcol0 or 0 -- the panel-area column range (where the divider lives)
+        local pcols = grp and grp.pcols or W
+        if sep_char then
+            if L.vertical then
+                if divider_set[center_off] then
+                    for c = pcol0, pcol0 + pcols - 1 do
+                        cells[c + 1], chl[c + 1] = sep_char, sep_hl
+                    end
+                end
+            else
+                -- only on the PANEL rows (a grouped ring's top/bottom rows are NOT panel rows)
+                local in_panel = not grp or (i0 >= grp.line0 + grp.ptop and i0 <= grp.line0 + grp.lines - 1 - grp.pbot)
+                if in_panel then
+                    for c = 0, W - 1 do
+                        if divider_set[c] then
+                            cells[c + 1], chl[c + 1] = sep_char, sep_hl
+                        end
+                    end
+                end
+            end
+        end
+        if grp then
+            local gtop, gbot = grp.line0, grp.line0 + grp.lines - 1
+            local gl, gr = grp.col0, grp.col0 + grp.cols - 1
+            local b = grp.border -- { tl, t, tr, r, br, bo, bl, l }
+            local function put(c, ch)
+                if ch and ch ~= "" then
+                    cells[c + 1], chl[c + 1] = ch, grp_hl
+                end
+            end
+            if i0 == gtop then
+                put(gl, b[1])
+                put(gr, b[3])
+                for c = gl + 1, gr - 1 do
+                    put(c, b[2])
+                end
+            elseif i0 == gbot then
+                put(gl, b[7])
+                put(gr, b[5])
+                for c = gl + 1, gr - 1 do
+                    put(c, b[6])
+                end
+            elseif i0 > gtop and i0 < gbot then
+                put(gl, b[8])
+                put(gr, b[4])
+            end
+        end
+        -- Convert the per-cell highlights to BYTE-accurate spans for this row.
+        local hls, byte = {}, 0
+        for c = 1, W do
+            local w = #cells[c]
+            if chl[c] then
+                hls[#hls + 1] = { byte, byte + w, chl[c] }
+            end
+            byte = byte + w
+        end
+        if #hls > 0 then
+            center_hls[i0] = hls
+        end
+        return table.concat(cells)
+    end
+
+    local lines = {}
+    for i = 1, H do
+        lines[i] = (i > L.header_h and i <= H - L.footer_h) and center_line(i) or string.rep(" ", W)
+    end
+
+    -- Place each header/footer band, recording where its bar buttons land (for the next layer's
+    -- selection + hit-testing). `placements` holds post-write highlight ops { row0, c0, c1, hl, prio }.
+    state.bands = {} -- flat sector list of the bar bands
+    local placements = {}
+
+    local function lay_band(ln, band, where)
+        if band.input then -- an editable input band — its overlay window draws the row; leave it blank
+            return
+        end
+        if band.title_counter then
+            -- A title + a re-evaluated COUNTER. `title_pos` places the title: LEFT (default) renders THROUGH
+            -- ui.bar (title = its left prefix, counter a right-aligned item) so it matches the message bar exactly;
+            -- CENTER / RIGHT place the title by hand (ui.bar's title is prefix-only), with the counter still
+            -- flush-right. UPPERCASE in every case (the title-bar canon).
+            local cnt = band.count and tostring((type(band.count) == "function" and band.count()) or band.count) or ""
+            local tpos = band.title_pos or "left"
+            if tpos == "left" then
+                local items = {}
+                if cnt ~= "" then
+                    items[1] = {
+                        type = "button",
+                        text = cnt,
+                        style = { text = { padding = { 1, 1 }, normal = band.count_hl or "LvimUiSubtitle" } },
+                    }
+                end
+                local res = uibar.render({
+                    items = items,
+                    width = W,
+                    align = "right",
+                    title = band.text,
+                    title_hl = band.hl or "LvimUiPeekTitle",
+                })
+                lines[ln] = res.line
+                placements[#placements + 1] = { ln - 1, 0, #res.line, "LvimUiBarFill", 150 } -- the continuous row strip
+                for _, sp in ipairs(res.spans) do
+                    placements[#placements + 1] = { ln - 1, sp[1], sp[2], sp[3], 200 }
+                end
+                return
+            end
+            -- CENTER / RIGHT: place the (uppercased) title manually. Leading run is spaces (1 byte = 1 cell), so
+            -- the title's byte offset == its display column; the counter is appended flush-right after it.
+            local title = tostring(band.text or ""):upper()
+            local tw = util.dw(title)
+            local cw = cnt ~= "" and util.dw(cnt) or 0
+            local tcol = (tpos == "center") and math.max(0, math.floor((W - tw) / 2))
+                or math.max(0, W - tw - (cw > 0 and cw + 1 or 0)) -- "right": sit before the counter
+            local body = string.rep(" ", tcol) .. title
+            local tstart, tend = tcol, tcol + #title
+            local cstart, cend
+            if cnt ~= "" then
+                local ccol = math.max(util.dw(body), W - cw - 1) -- flush right, 1-col margin, never over the title
+                body = body .. string.rep(" ", math.max(0, ccol - util.dw(body)))
+                cstart = #body
+                body = body .. cnt
+                cend = #body
+            end
+            body = body .. string.rep(" ", math.max(0, W - util.dw(body)))
+            lines[ln] = body
+            placements[#placements + 1] = { ln - 1, 0, #body, "LvimUiBarFill", 150 }
+            placements[#placements + 1] =
+                { ln - 1, math.max(0, tstart - 1), math.min(#body, tend + 1), band.hl or "LvimUiPeekTitle", 200 }
+            if cstart then
+                placements[#placements + 1] = { ln - 1, cstart, cend, band.count_hl or "LvimUiPeekCounter", 200 }
+            end
+            return
+        end
+        if band.meta ~= nil then
+            lines[ln] = util.center(band.meta, W)
+            if band.meta ~= "" and band.hl then
+                -- 1 space of padding on each side, so a title's bg chrome reads " LVIM LSP " not hugging.
+                local s = math.floor((W - util.dw(band.meta)) / 2)
+                placements[#placements + 1] =
+                    { ln - 1, math.max(0, s - 1), math.min(W, s + #band.meta + 1), band.hl, 200 }
+            end
+            return
+        end
+        -- When this bar is the focused sector, its `_sel` button drives BOTH the scroll-follow (`sel`,
+        -- keeps it visible on a narrow frame) and the visible selection (`hover`, the button's hover
+        -- styling). `_blurred` (focus left the whole frame) drops the selection so no button looks hovered
+        -- while the user is back in a normal buffer.
+        local focused = not state._blurred and state.focus and state.focus.kind == "bar" and state.focus.band == band
+        local sel = focused and band._sel or nil
+        -- A `_follow` band keeps its `_sel` in view even when UNFOCUSED — the TAB bar scrolls to the active tab
+        -- when it's switched from the body (h/l), so an off-screen tab doesn't go active-but-hidden. The hover
+        -- styling still only shows when focused (`hover = sel`); the active tab carries its own `active` styling.
+        local scroll = sel or (band._follow and band._sel) or nil
+        local res = uibar.render({
+            items = band.buttons or {},
+            width = W,
+            align = band.align or "center",
+            chevrons = band.chevrons or state.cfg.chevrons,
+            sel = scroll,
+            hover = sel,
+            off = band._off,
+        })
+        band._off = res.off
+        lines[ln] = res.line
+        -- A continuous full-width bg STRIP under the buttons, so the whole bar row reads as one tinted bar
+        -- (the buttons + chevrons sit ON it). Priority below the button/chevron spans (200) so they show through.
+        -- `band.fill = false` drops the strip (the buttons then float on the bare panel bg).
+        if band.fill ~= false then
+            placements[#placements + 1] = { ln - 1, 0, #res.line, "LvimUiBarFill", 150 }
+        end
+        local entry = { kind = where, row = ln, buttons = {}, band = band }
+        for i, b in ipairs(res.items) do
+            entry.buttons[i] = { c0 = b.c0, c1 = b.c1, spec = b.spec, sep = b.sep }
+        end
+        state.bands[#state.bands + 1] = entry
+        -- The visible selection is the button's OWN `hover` style (each box's bg, stronger) — NO extra
+        -- frame overlay (it bled a 1-col blue tint past the button on each side).
+        -- res.spans already carry the chevron boxes' OWN colours (the bar renders them as boxes), so the
+        -- frame no longer colourises chevron ranges separately.
+        for _, sp in ipairs(res.spans) do
+            placements[#placements + 1] = { ln - 1, sp[1], sp[2], sp[3], 200 }
+        end
+    end
+
+    for i, band in ipairs(state.header_bands) do
+        lay_band(i, band, "header")
+    end
+    for i, band in ipairs(state.footer_bands) do
+        lay_band(H - L.footer_h + i, band, "footer")
+    end
+
+    vim.bo[state.container_buf].modifiable = true
+    api.nvim_buf_set_lines(state.container_buf, 0, -1, false, lines)
+    vim.bo[state.container_buf].modifiable = false
+    api.nvim_buf_clear_namespace(state.container_buf, NS, 0, -1)
+
+    for _, p in ipairs(placements) do
+        pcall(api.nvim_buf_set_extmark, state.container_buf, NS, p[1], p[2], {
+            end_col = p[3],
+            hl_group = util.resolve_hl(p[4]),
+            priority = p[5],
+        })
+    end
+    -- The center-row tints (the GROUP ring + the divider), at BYTE-accurate columns computed in center_line.
+    for line0, hls in pairs(center_hls) do
+        for _, h in ipairs(hls) do
+            pcall(api.nvim_buf_set_extmark, state.container_buf, NS, line0, h[1], {
+                end_col = h[2],
+                hl_group = h[3],
+            })
+        end
+    end
+end
+
+--- Render a panel's provider content into its buffer.
+---@param state table
+---@param idx integer
+local function render_panel(state, idx)
+    local pan = state.panels[idx]
+    if not (pan.buf and api.nvim_buf_is_valid(pan.buf)) then
+        return
+    end
+    local L = state._geom.panels[idx]
+    -- An `update` provider OWNS its window — it may swap in an external buffer (e.g. the peek preview
+    -- showing the real file buffer with its own syntax). The frame does not write lines for it.
+    if pan.provider and pan.provider.update then
+        pcall(pan.provider.update, pan, L)
+        return
+    end
+    local lines, hls = {}, {}
+    if pan.provider and pan.provider.render then
+        local ok, rl, rh = pcall(pan.provider.render, L.width, L.height)
+        if ok then
+            lines, hls = rl or {}, rh or {}
+        end
+    end
+    vim.bo[pan.buf].modifiable = true
+    api.nvim_buf_set_lines(pan.buf, 0, -1, false, lines)
+    -- An `editable` provider (the input field) keeps its buffer writable; all others are read-only.
+    vim.bo[pan.buf].modifiable = (pan.provider and pan.provider.editable) or false
+    api.nvim_buf_clear_namespace(pan.buf, NS, 0, -1)
+    for _, h in ipairs(hls) do
+        if h[3] == -1 then -- a FULL-ROW span: the bg reaches the window edge (hl_eol), for row striping
+            pcall(api.nvim_buf_set_extmark, pan.buf, NS, h[1], 0, {
+                end_row = h[1] + 1,
+                hl_group = util.resolve_hl(h[4]),
+                hl_eol = true,
+                priority = h[5] or 200,
+            })
+        else
+            pcall(api.nvim_buf_set_extmark, pan.buf, NS, h[1], h[2], {
+                end_col = h[3],
+                hl_group = util.resolve_hl(h[4]),
+                priority = h[5] or 200,
+            })
+        end
+    end
+end
+
+-- ─── sectors / focus / navigation ─────────────────────────────────────────────
+
+--- The ordered sector list: each header bar band, then each center panel, then each footer bar band.
+--- Meta header bands (title/subtitle) are NOT sectors. `_sel`/`_off` live on the band tables so the
+--- selection + scroll persist across redraws.
+---@param state table
+---@return table[]
+local function build_sectors(state)
+    local s = {}
+    for _, band in ipairs(state.header_bands) do
+        if band.buttons then
+            s[#s + 1] = { kind = "bar", band = band, where = "header" }
+        end
+    end
+    -- The whole center (all N panels) is ONE vertical sector — `<C-j>`/`<C-k>` step header · center ·
+    -- footer; `<C-l>`/`<C-h>` move between the panels INSIDE the center.
+    if #state.panels > 0 then
+        s[#s + 1] = { kind = "center" }
+    end
+    for _, band in ipairs(state.footer_bands) do
+        if band.buttons then
+            s[#s + 1] = { kind = "bar", band = band, where = "footer" }
+        end
+    end
+    return s
+end
+
+--- Focus center panel `i`: pick the cursor mode, focus its window, start insert for an editable panel,
+--- fire on_focus. Records it as the current center panel.
+---@param state table
+---@param i integer
+local function focus_panel_win(state, i)
+    local pan = state.panels[i]
+    if not pan then
+        return
+    end
+    state.center_panel = i
+    if pan.win and api.nvim_win_is_valid(pan.win) then
+        api.nvim_set_current_win(pan.win)
+    end
+    -- The panel's filetype drives cursor visibility (hide-cursor panels carry FRAME_FT) — apply it now to
+    -- avoid a one-frame flash.
+    cursor.update()
+    -- An editable panel (the input field) enters insert at the end of its line.
+    if pan.provider and pan.provider.editable then
+        vim.schedule(function()
+            if pan.win and api.nvim_win_is_valid(pan.win) then
+                api.nvim_set_current_win(pan.win)
+                vim.cmd("startinsert!")
+            end
+        end)
+    end
+    if pan.provider and pan.provider.on_focus then
+        pcall(pan.provider.on_focus)
+    end
+end
+
+--- Focus sector `i`: the CENTER sector focuses its current panel (the panels are ONE vertical sector;
+--- `<C-l>`/`<C-h>` move between them); a BAR sector focuses the container, hides the cursor + selects.
+---@param state table
+---@param i integer
+local function focus_sector(state, i)
+    local sec = state.sectors[i]
+    if not sec then
+        return
+    end
+    state.focus_idx = i
+    if sec.kind == "center" then
+        state.focus = { kind = "center", panel = state.center_panel or 1 }
+        focus_panel_win(state, state.center_panel or 1)
+    else
+        sec.band._sel = sec.band._sel or 1
+        state.focus = { kind = "bar", band = sec.band, where = sec.where }
+        if state.container_win and api.nvim_win_is_valid(state.container_win) then
+            -- Mark this as a frame-driven focus so the container's WinEnter hook does NOT bounce us into
+            -- the center (that bounce is only for a NATIVE `<C-w>j` entry). WinEnter fires synchronously
+            -- inside nvim_set_current_win, so the flag is up while it runs.
+            state._focusing_bar = true
+            api.nvim_set_current_win(state.container_win)
+            state._focusing_bar = false
+        end
+        cursor.update() -- container is current (FRAME_FT) → cursor hidden in bar-menu mode
+    end
+    render_chrome(state, state._geom)
+end
+
+--- The sector index of the CURRENTLY focused window — a panel by its window, else the tracked bar.
+--- Reading the real window keeps `<C-j>`/`<C-k>` correct even if focus changed outside the frame.
+---@param state table
+---@return integer
+local function current_sector(state)
+    local w = api.nvim_get_current_win()
+    -- Any center panel window maps to the single center sector.
+    for _, pan in ipairs(state.panels) do
+        if pan.win == w then
+            for si, sec in ipairs(state.sectors) do
+                if sec.kind == "center" then
+                    return si
+                end
+            end
+        end
+    end
+    return state.focus_idx or 1
+end
+
+--- At a vertical EDGE of a docked split, hand focus OUT to the neighbouring real window instead of
+--- wrapping inside the frame: step OUT toward the editor in the given wincmd direction. The caller picks
+--- the direction to MATCH the dock — currently only the VERTICAL sector escape uses it (`<C-k>` from the
+--- top sector steps up to the editor above a bottom-docked peek). The function stays direction-generic, so
+--- a future float side-dock could pass `h`/`l`. The frame stays open — in split mode it is non-modal;
+--- float frames are modal, so they never escape (they keep wrapping). Returns true when focus moved out.
+---@param state table
+---@param nav string  "h"|"j"|"k"|"l" — the wincmd direction to the neighbouring editor window
+---@return boolean
+local function escape_to_neighbor(state, nav)
+    if state.cfg.mode ~= "split" then
+        return false
+    end
+    if not (state.container_win and api.nvim_win_is_valid(state.container_win)) then
+        return false
+    end
+    -- The panels are floats (off the window layout), so resolve the neighbour from the container split.
+    -- `winnr(nav)` returns the container's OWN number when there is no window in that direction.
+    local target = api.nvim_win_call(state.container_win, function()
+        return vim.fn.win_getid(vim.fn.winnr(nav))
+    end)
+    if target == 0 or target == state.container_win or not api.nvim_win_is_valid(target) then
+        return false
+    end
+    api.nvim_set_current_win(target)
+    cursor.update() -- the editor (normal ft) is current now → cursor visible again
+    return true
+end
+
+--- Move focus to the next/prev sector, starting from the actually-focused window. At the top/bottom edge
+--- of a docked split it steps OUT to the neighbouring editor window (see `escape_to_neighbor`); otherwise
+--- it wraps around the frame.
+---@param state table
+---@param dir integer
+local function sector_cycle(state, dir)
+    local n = #state.sectors
+    if n == 0 then
+        return
+    end
+    local cur = current_sector(state)
+    -- DYNAMIC peek: the float sits ABOVE everything, so `<C-k>` enters it only from the TOP sector — from the
+    -- list you first reach the header (the filter bar), then one more `<C-k>` steps up into the float to edit.
+    if
+        state.preview_side == "dynamic"
+        and dir < 0
+        and cur == 1
+        and state.dyn
+        and state.dyn.win
+        and api.nvim_win_is_valid(state.dyn.win)
+    then
+        api.nvim_set_current_win(state.dyn.win)
+        return
+    end
+    -- VERTICAL stack: the center panels are stacked top↔bottom, so `<C-j>`/`<C-k>` step THROUGH them (the
+    -- preview is reachable up/down, not only via panel-nav) before continuing to the next sector.
+    if state.cfg.direction == "vertical" and state.sectors[cur] and state.sectors[cur].kind == "center" then
+        local np = #state.panels
+        local cp = state.center_panel or 1
+        if (dir > 0 and cp < np) or (dir < 0 and cp > 1) then
+            state.center_panel = cp + dir
+            focus_sector(state, cur)
+            return
+        end
+    end
+    if (dir < 0 and cur == 1) or (dir > 0 and cur == n) then
+        -- Top/bottom edge of a docked split → step VERTICALLY out to the editor (matches a below/above dock).
+        if escape_to_neighbor(state, dir < 0 and "k" or "j") then
+            return
+        end
+        -- Bottom edge of a HOSTED float → hand focus DOWN to the host zone below it (the messages composed
+        -- under a finder). Remember THIS sector (the footer) so when focus returns, we land back on it (not on
+        -- the header, the WinEnter default) — symmetric up/down navigation.
+        if dir > 0 and state.cfg.on_escape_below then
+            state._return_sector = cur
+            if state.cfg.on_escape_below() then
+                return
+            end
+            state._return_sector = nil
+        end
+        -- Top edge → hand focus UP to the editor above (the mirror of on_escape_below): stop here instead of
+        -- WRAPPING down to the footer. Without a handler we still stop (no wrap) rather than jump to the bottom.
+        if dir < 0 and state.cfg.on_escape_above then
+            state.cfg.on_escape_above()
+            return
+        end
+        return -- at an edge with no escape handler → STOP (never WRAP around to the opposite end)
+    end
+    local target = ((cur - 1 + dir) % n) + 1
+    -- Entering the CENTER: horizontal lands on the PRIMARY panel (1; the preview is reached by panel-nav). A
+    -- VERTICAL stack lands on the panel at the edge we entered from — top (1) coming DOWN, bottom (last) coming
+    -- UP — so the next `<C-j>`/`<C-k>` keeps walking through the stack.
+    if state.sectors[target] and state.sectors[target].kind == "center" then
+        state.center_panel = (state.cfg.direction == "vertical" and dir < 0) and #state.panels or 1
+    end
+    focus_sector(state, target)
+end
+
+--- Toggle the focused CENTER panel (list ⇄ preview, cycling when there are more) — `panel_toggle` (Tab). The
+--- vertical sector nav always lands on panel 1, so this is the ONLY way onto the preview.
+---@param state table
+local function panel_toggle(state)
+    local np = #state.panels
+    if np <= 1 then
+        return
+    end
+    state.center_panel = ((state.center_panel or 1) % np) + 1
+    for si, sec in ipairs(state.sectors) do
+        if sec.kind == "center" then
+            focus_sector(state, si) -- focus_sector reads center_panel
+            return
+        end
+    end
+end
+
+--- Move the focused bar's selection by `dir`, skipping non-interactive separators; redraw (which
+--- scrolls the selection into view on a narrow frame).
+---@param state table
+---@param dir integer
+local function menu_move(state, dir)
+    if not (state.focus and state.focus.kind == "bar") then
+        return
+    end
+    local btns = state.focus.band.buttons or {}
+    local n = #btns
+    if n == 0 then
+        return
+    end
+    local i = state.focus.band._sel or 1
+    repeat
+        i = i + (dir > 0 and 1 or -1)
+    until i < 1 or i > n or btns[i].type ~= "separator"
+    if i >= 1 and i <= n then
+        state.focus.band._sel = i
+        render_chrome(state, state._geom)
+        -- A "live" bar (e.g. the tab bar) reacts to every selection move, not just <CR>.
+        if state.focus.band.on_change then
+            state.focus.band.on_change(btns[i], state)
+        end
+    end
+end
+
+--- Fire the focused bar's selected button: `spec.run(state)` if present, else `band.on_select(spec,
+--- state)`.
+---@param state table
+local function menu_confirm(state)
+    if not (state.focus and state.focus.kind == "bar") then
+        return
+    end
+    local band = state.focus.band
+    local spec = (band.buttons or {})[band._sel or 1]
+    if not spec or spec.type == "separator" then
+        return
+    end
+    if spec.run then
+        spec.run(state)
+    elseif band.on_select then
+        band.on_select(spec, state)
+    end
+end
+
+--- The item the focused selection points at — the first center panel whose provider exposes `selection()`
+--- (the list; the preview has none). Drives the default `open`.
+---@param state table
+---@return table? item
+local function focused_selection(state)
+    for _, pan in ipairs(state.panels) do
+        if pan.provider and pan.provider.selection then
+            local ok, it = pcall(pan.provider.selection)
+            if ok and it then
+                return it
+            end
+        end
+    end
+    return nil
+end
+
+--- Default OPEN action — open the focused selection in `mode` ("window"|"split"|"vsplit"|"tab"). A consumer
+--- overrides the whole behaviour with `cfg.on_open(mode, item)`; otherwise an item carrying `path` (+ optional
+--- `lnum`/`col`) is opened with `nvim_win_set_buf` (NOT `:edit`, so an unsaved editable preview can't block it
+--- with E37) in the origin window, or a fresh split/vsplit/tab. The frame closes first either way.
+---@param state table
+---@param mode string
+local function default_open(state, mode)
+    local item = focused_selection(state)
+    local origin = state.origin
+    if state.cfg.on_open then
+        state.close()
+        state.cfg.on_open(mode, item)
+        return
+    end
+    if not (item and item.path) then
+        return
+    end
+    state.close()
+    if origin and api.nvim_win_is_valid(origin) then
+        api.nvim_set_current_win(origin)
+    end
+    if mode == "split" then
+        vim.cmd("split")
+    elseif mode == "vsplit" then
+        vim.cmd("vsplit")
+    elseif mode == "tab" then
+        vim.cmd("tabnew")
+    end
+    local buf = vim.fn.bufadd(item.path)
+    vim.fn.bufload(buf)
+    api.nvim_win_set_buf(0, buf)
+    pcall(api.nvim_win_set_cursor, 0, { item.lnum or 1, math.max(0, (item.col or 1) - 1) })
+    pcall(vim.cmd, "normal! zz")
+end
+
+--- Set the DOCKED container height from `cfg.preview_heights` ( `{ horizontal, vertical }` — a value ≤ 1 is a
+--- fraction of the screen, > 1 an absolute row count) for the side's stack direction: `horizontal` when the
+--- preview sits left/right, `vertical` when it sits above/below. No-op for a float or when the consumer didn't
+--- ask for managed heights.
+---@param state table
+---@param side string
+local function apply_dock_height(state, side)
+    if not (state.cfg.host or state.cfg.mode == "split") then
+        return -- only the DOCKED layouts (hosted msgarea zone, or a non-hosted bottom/area split) have a height
+    end
+    local hs = state.cfg.preview_heights
+    local v = hs and ((side == "above" or side == "below") and hs.vertical or hs.horizontal)
+    if type(v) ~= "number" then
+        return
+    end
+    local rows = math.max(1, v <= 1 and math.floor(vim.o.lines * v) or math.floor(v))
+    -- AUTO-fit the docked area to its content (each panel fits ITS OWN content, capped at `max_rows`), bounded
+    -- by the configured value. When the room (or this cap) can't hold the stack, the overflow shrink in
+    -- compute_geom keeps the LIST at its content and shrinks the PREVIEW first (it scrolls) — so the list height
+    -- never jumps as you navigate files of different lengths. (cfg.size is only normalised once at open, so we
+    -- set the fields compute_geom reads directly; relayout re-reserves the host.)
+    state.cfg.auto_height = true
+    state.cfg.height = nil
+    state.cfg.max_height = rows
+end
+
+--- Install the chassis keymaps. Panel buffers get sector cycling + the provider's own keys; the
+--- container buffer (bar-menu mode) gets selection move / confirm + sector cycling. `cfg.close_keys`
+--- close a modal frame from anywhere.
+---@param state table
+local function set_keys(state)
+    -- Precedence: the hardcoded fallback < the GLOBAL `ui.keys` config < this surface's own `cfg.keys`.
+    local ok_cfg, cfg = pcall(require, "lvim-ui.config")
+    local global_keys = (ok_cfg and cfg and cfg.keys) or {}
+    local K = vim.tbl_extend("force", DEFAULT_KEYS, global_keys, state.cfg.keys or {})
+    -- Expose the RESOLVED chassis keys so a hosted-terminal consumer (picker / shell) can rebind the frame nav
+    -- (sector cycling) on ITS own buffer with the SAME keys, instead of hardcoding them — one source of truth.
+    state.keys = K
+    local used = {} -- used[buf][lhs] = true — the keys we actually bind, so `lock_keys` can <Nop> the rest
+    local function map(buf, lhs, fn)
+        used[buf] = used[buf] or {}
+        for _, l in ipairs(type(lhs) == "table" and lhs or { lhs }) do
+            vim.keymap.set("n", l, fn, { buffer = buf, nowait = true, silent = true })
+            used[buf][l] = true
+        end
+    end
+    -- `cfg.lock_keys`: a MODAL panel — only the keys we bound act; every other normal-mode key (motions,
+    -- scrolls, edits, search) is `<Nop>`-ed so a stray press can't move the cursor / scroll / edit the panel.
+    -- The cmdline `:` is kept as an escape hatch. Run AFTER the panel binds (so `used` is populated) and BEFORE
+    -- map_hotkeys (so a button hotkey re-maps OVER the `<Nop>`).
+    local function lock_panel(buf)
+        local u = used[buf] or {}
+        local function nop(lhs)
+            if not u[lhs] then
+                pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
+            end
+        end
+        for i = 33, 126 do
+            local ch = string.char(i)
+            if ch ~= ":" then -- single printable keys (a stray `g`/`z` prefix is killed too → no `gg`/`zz`)
+                nop(ch)
+            end
+        end
+        for i = string.byte("a"), string.byte("z") do
+            nop("<C-" .. string.char(i) .. ">") -- the Ctrl-letter combos (scroll, etc.)
+        end
+        for _, sk in ipairs({ "<Up>", "<Down>", "<Left>", "<Right>", "<PageUp>", "<PageDown>", "<Home>", "<End>" }) do
+            nop(sk)
+        end
+    end
+    for _, pan in ipairs(state.panels) do
+        -- Panels: vertical sector cycling (header·center·footer) AND horizontal panel nav (left/right);
+        -- the panel keys are ONLY here (not on the container), so `<C-l>`/`<C-h>` are inert in a bar.
+        map(pan.buf, K.sector_next, function()
+            sector_cycle(state, 1)
+        end)
+        map(pan.buf, K.sector_prev, function()
+            sector_cycle(state, -1)
+        end)
+        map(pan.buf, K.panel_next, function()
+            state.panel(1)
+        end)
+        map(pan.buf, K.panel_prev, function()
+            state.panel(-1)
+        end)
+        map(pan.buf, K.panel_toggle, function()
+            panel_toggle(state)
+        end)
+        -- OPEN the focused selection (a provider's own `keys` below may still override these, e.g. <CR>)
+        map(pan.buf, K.open, function()
+            default_open(state, "window")
+        end)
+        map(pan.buf, K.open_split, function()
+            default_open(state, "split")
+        end)
+        map(pan.buf, K.open_vsplit, function()
+            default_open(state, "vsplit")
+        end)
+        map(pan.buf, K.open_tab, function()
+            default_open(state, "tab")
+        end)
+        -- ROTATE the preview position (live reflow of the floats)
+        map(pan.buf, K.preview_next, function()
+            state.rotate_preview(1)
+        end)
+        map(pan.buf, K.preview_prev, function()
+            state.rotate_preview(-1)
+        end)
+        -- HIDE ↔ show the preview (no-op while `dynamic`)
+        map(pan.buf, K.toggle_preview, function()
+            if state.toggle_preview then
+                state.toggle_preview()
+            end
+        end)
+        if pan.provider and pan.provider.keys then
+            pcall(pan.provider.keys, function(lhs, fn)
+                map(pan.buf, lhs, fn)
+            end, pan, state)
+        end
+        for _, ck in ipairs(state.cfg.close_keys or {}) do
+            map(pan.buf, ck, state.close)
+        end
+    end
+    map(state.container_buf, K.menu_prev, function()
+        menu_move(state, -1)
+    end)
+    map(state.container_buf, K.menu_next, function()
+        menu_move(state, 1)
+    end)
+    map(state.container_buf, K.menu_confirm, function()
+        menu_confirm(state)
+    end)
+    map(state.container_buf, K.sector_next, function()
+        sector_cycle(state, 1)
+    end)
+    map(state.container_buf, K.sector_prev, function()
+        sector_cycle(state, -1)
+    end)
+    for _, ck in ipairs(state.cfg.close_keys or {}) do
+        map(state.container_buf, ck, state.close)
+    end
+
+    -- Extra consumer keymaps that fire from ANYWHERE in the frame (every panel + the container), each a
+    -- `{ key = lhs|lhs[], run = fn(state) }` — e.g. the Quit dialog's `q` = quit without saving.
+    for _, km in ipairs(state.cfg.keymaps or {}) do
+        local fn = function()
+            km.run(state)
+        end
+        for _, pan in ipairs(state.panels) do
+            map(pan.buf, km.key, fn)
+        end
+        map(state.container_buf, km.key, fn)
+    end
+
+    if state.cfg.lock_keys then -- modal: every unbound key is a no-op — the PANELS and the chrome CONTAINER
+        for _, pan in ipairs(state.panels) do
+            local editable = pan.provider and pan.provider.editable
+            if not editable and vim.bo[pan.buf].buftype ~= "terminal" then
+                lock_panel(pan.buf)
+            end
+        end
+        -- the container is the chrome buffer (bar-menu mode) — a stray `<C-f>`/`<C-d>` on a focused bar scrolled
+        -- it, pushing the header (title + bar) off the top and the footer up into its place
+        lock_panel(state.container_buf)
+    end
+
+    -- Header button hotkeys work from EVERYWHERE: on every panel (all keys) and the container (all but
+    -- the menu nav keys, so `h`/`l` still move the selection while a bar is focused).
+    for _, pan in ipairs(state.panels) do
+        state.map_hotkeys(pan.buf, {})
+    end
+    local reserved = {}
+    for _, group in ipairs({ K.menu_prev, K.menu_next, K.menu_confirm }) do
+        for _, l in ipairs(type(group) == "table" and group or { group }) do
+            reserved[#reserved + 1] = l
+        end
+    end
+    state.map_hotkeys(state.container_buf, reserved)
+end
+
+--- The CONTENT rect of a laid-out panel `pl` (`L.panels[i]` — `{row,col,width,height,border}`). nvim draws a
+--- bordered float's border ON the given row/col, so the content begins at `row+top_inset`, `col+left_inset`
+--- (width/height are already the content size). Use it to place anything that must sit INSIDE a panel's border
+--- (e.g. the scoped input band over the LIST's first / winbar row) — recompute via this whenever a panel moves,
+--- so the position tracks the panel's border insets instead of landing on the border.
+---@param pl table
+---@return integer row, integer col, integer width, integer height
+local function panel_content_rect(pl)
+    local t, _, _, l = util.insets(util.resolve_border(pl.border))
+    return pl.row + t, pl.col + l, pl.width, pl.height
+end
+
+--- Move the center panels + editable input bands to a computed layout `L`, then repaint the chrome. NO
+--- container/cmdheight side effects — the caller has already placed the container — so it is safe to call on
+--- a host-zone reflow (`reposition`) without re-reserving (which would loop).
+---@param state table
+---@param L table
+local function place_panels(state, L)
+    state._geom = L
+    for i, pan in ipairs(state.panels) do
+        local pl = L.panels[i]
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            pcall(api.nvim_win_set_config, pan.win, {
+                relative = "editor",
+                width = pl.width,
+                height = pl.height,
+                row = pl.row,
+                col = pl.col,
+                border = pl.border,
+            })
+        end
+    end
+    -- Re-fit the editable input bands so they follow the moved panels / header (else a resize leaves the
+    -- prompt stranded). A `scope_panel` band tracks its panel's top row; a plain header band its header row.
+    local _, _, _, rcl = util.insets(L.cbord)
+    local hbi = 0
+    for _, band in ipairs(state.header_bands) do
+        -- a `scope_id` band tracks the CURRENT index of the panel with that id (rotation-safe — the input
+        -- always sits over the LIST panel however the preview is rotated); else the fixed `scope_panel` index.
+        local scope = band.scope_panel
+        if band.scope_id then
+            for i, pan in ipairs(state.panels) do
+                if pan.id == band.scope_id then
+                    scope = i
+                    break
+                end
+            end
+        end
+        if band.input and band.win and api.nvim_win_is_valid(band.win) then
+            local iw, icol, irow = L.W, L.col + rcl, L.row + L.ct + hbi
+            if scope and L.panels[scope] then
+                -- the band overlays the LIST panel's first content row — inside its border, via the shared helper
+                local prow, pcol, pwidth = panel_content_rect(L.panels[scope])
+                iw, icol, irow = pwidth, pcol, prow
+            end
+            pcall(api.nvim_win_set_config, band.win, {
+                relative = "editor",
+                row = irow,
+                col = icol,
+                width = iw,
+                height = 1,
+            })
+        end
+        if not scope then
+            hbi = hbi + 1
+        end
+    end
+    render_chrome(state, L)
+end
+
+--- Resolve the geometry of a `cmdline`-position surface, growing the command-line region to fit it. Two
+--- modes: UNHOSTED grows OUR `cmdheight` (saving the user's once, to restore on close) and floats over those
+--- rows. HOSTED (`cfg.host`) instead reserves `L.H` rows in a host zone (the msgarea, which owns cmdheight)
+--- and re-lays-out over the rect it hands back — so the host can compose messages BELOW us in the same
+--- region. Returns the (possibly re-placed) layout.
+---@param state table
+---@param L table
+---@return table
+local function host_geom(state, L)
+    -- The container float docks at the screen-bottom cmdline zone and now carries the chassis ring, so its
+    -- on-screen footprint is `content + ct + cb`. Reserve those border rows too (`pad`): reserving only the
+    -- content left the bottom border past the screen edge → nvim clamped the whole container UP a row while the
+    -- editor-relative panels stayed put (the no-result area divider then sat a row above its panels). We grow
+    -- only the RESERVED zone, not the content: `compute_geom` is still handed `H = L.H`, so the panels keep
+    -- their natural size — only the room the container border needs is added to the zone.
+    local pad = (L.ct or 0) + (L.cb or 0)
+    if state.cfg.host then
+        local rect = state.cfg.host(L.H + pad) -- reserve content + the container border; host grows cmdheight + returns our rect
+        if rect then
+            -- Fill the reserved rect EXACTLY: hand compute_geom the rect's own height (rect.height when the host
+            -- reports it, else the amount we asked for) so the container total = the reserved zone — no blank
+            -- rows left below the bottom border, and the content keeps its natural size (rect.height - border).
+            local rh = rect.height or (L.H + pad)
+            return compute_geom(state, { row = rect.row, col = rect.col, W = rect.width, H = rh })
+        end
+        return L
+    end
+    if state.base_cmdheight == nil then
+        state.base_cmdheight = vim.o.cmdheight -- save the user's cmdheight once, to restore on close
+    end
+    -- Grow the cmdline region to the content + the container border; the helper clamps to the room the splits
+    -- leave + steps down on a stray E36 (`L.H` is already clamped in compute_geom, so it normally sets as-is).
+    set_cmdheight(L.H + pad)
+    return L
+end
+
+--- (HOSTED) Re-place the surface over a NEW host-zone rect (the msgarea handed us a fresh one because it
+--- reflowed — a message appeared / cleared below us). Lays out over the rect WITHOUT re-reserving, so it
+--- cannot trigger another reflow (which would loop). No-op unless the surface is open.
+---@param state table
+---@param rect table?  { win, row, col, width, height }
+local function reposition(state, rect)
+    if state._closed or not rect or not (state.container_win and api.nvim_win_is_valid(state.container_win)) then
+        return
+    end
+    local L = compute_geom(state, { row = rect.row, col = rect.col, W = rect.width, H = rect.height })
+    pcall(api.nvim_win_set_config, state.container_win, {
+        relative = "editor",
+        width = L.W,
+        height = L.H,
+        row = L.row,
+        col = L.col,
+    })
+    place_panels(state, L)
+end
+
+--- Re-fit the floating panels to the container's CURRENT size and re-render the chrome. Called when the
+--- docked split is resized (or the editor on `VimResized`): the header/footer bands keep their fixed
+--- heights, so the CENTER absorbs the change, and the panel floats follow instead of staying put.
+---@param state table
+local function relayout(state)
+    if state._closed or not (state.container_win and api.nvim_win_is_valid(state.container_win)) then
+        return
+    end
+    local L
+    if state.cfg.mode == "split" then
+        -- The split was resized by the user. `compute_geom` floors the center at `min_content_height`
+        -- VISIBLE rows and reports the matching minimum container height — if the user shrank below it,
+        -- snap the split back up so the center keeps its rows, then re-fit.
+        local function geom()
+            local pos = api.nvim_win_get_position(state.container_win)
+            return compute_geom(state, {
+                row = pos[1],
+                col = pos[2],
+                W = api.nvim_win_get_width(state.container_win),
+                H = api.nvim_win_get_height(state.container_win),
+            })
+        end
+        L = geom()
+        if api.nvim_win_get_height(state.container_win) < L.min_h then
+            pcall(api.nvim_win_set_height, state.container_win, L.min_h)
+            L = geom()
+        end
+    else
+        -- A float reflows to the (possibly resized) screen; move the container float too.
+        L = compute_geom(state)
+        if state.cfg.position == "cmdline" then
+            L = host_geom(state, L) -- HOSTED: reserve our rows in the host zone (it owns cmdheight); else grow it
+        end
+        pcall(api.nvim_win_set_config, state.container_win, {
+            relative = "editor",
+            width = L.W,
+            height = L.H,
+            row = L.row,
+            col = L.col,
+        })
+    end
+    place_panels(state, L)
+    -- place_panels re-rendered only the chrome bands; a width change must ALSO re-flow each content panel
+    -- provider (e.g. a toolbar `ui.bar` recomputing its overflow chevrons), so re-render them too.
+    for i = 1, #state.panels do
+        render_panel(state, i)
+    end
+end
+
+-- ─── open / close ─────────────────────────────────────────────────────────────
+
+-- forward declarations: `open_panel_win`'s `pan.refresh` and the state methods inside `open_windows` reference
+-- these (the dynamic peek / restack helpers); their definitions follow below.
+local dyn_geom, dyn_update, dyn_show, dyn_hide, dyn_enable, dyn_disable, restack_panels, apply_preview_side, refocus_list
+
+--- Open (or re-open) ONE center panel's window over its computed rect + apply the window-local chrome. Used
+--- both at open and when a panel is re-docked at runtime (the preview returning from a `hide`/`dynamic` state).
+--- The scratch buffer persists across hide/show (`bufhidden = "hide"`), so its keymaps survive a close+reopen.
+---@param state table
+---@param pan table
+---@param i integer  its index in `state.panels` (drives render_panel)
+---@param pl table   the panel rect from compute_geom (`L.panels[i]`)
+---@param has_input boolean
+---@param docked boolean
+local function open_panel_win(state, pan, i, pl, has_input, docked)
+    if not (pan.buf and api.nvim_buf_is_valid(pan.buf)) then
+        pan.buf = api.nvim_create_buf(false, true)
+        vim.bo[pan.buf].bufhidden = "hide" -- keep the scratch buffer alive while hidden; deleted in close()
+        if pan.provider and pan.provider.hide_cursor then
+            vim.bo[pan.buf].filetype = FRAME_FT
+        end
+    end
+    -- Open the panel UNFOCUSED, then focus it AFTER the `w:lvim_frame` mark below. Entering it inside
+    -- `nvim_open_win` (enter=true) fires WinEnter WHILE the mark is still unset — a foreign WinEnter hook (e.g.
+    -- lvim-space's auto-close, which tears down every window it doesn't recognise) would then treat the panel as
+    -- a stray and close it mid-open → "Window was closed immediately". Mark first, focus second, so by the time
+    -- WinEnter fires those hooks already see it's a managed frame.
+    local want_focus = i == 1 and state.cfg.enter ~= false and not has_input
+    -- Floor the dimensions at 1: a TIGHT layout (a tall preview in a nearly-full editor / dashboard) can compute
+    -- a 0-or-negative panel height/width, which `nvim_open_win` rejects with `E36: Not enough room`. A 1-cell
+    -- floor keeps the panel openable (squished, not crashed) in that pathological case; a no-op when it fits.
+    pan.win = api.nvim_open_win(pan.buf, false, {
+        relative = "editor",
+        width = math.max(1, pl.width or 1),
+        height = math.max(1, pl.height or 1),
+        row = pl.row,
+        col = pl.col,
+        border = pl.border,
+        style = "minimal",
+        focusable = not docked,
+        zindex = not docked and (state.zindex + 1) or nil,
+    })
+    -- Mark EVERY panel window (float-mode too, not just docked) as managed UI — same as the container — so a
+    -- generic "close all floating windows" / "focus next float" helper skips it instead of tearing the panel
+    -- out from under the frame.
+    vim.w[pan.win].lvim_frame = true
+    if want_focus then
+        pcall(api.nvim_set_current_win, pan.win)
+    end
+    vim.wo[pan.win].wrap = false
+    if pan.provider and pan.provider.cursorline then
+        local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline)
+            or ((#state.panels > 1) and "LvimUiCursorLine" or "LvimUiPeekCursorLine")
+        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder,CursorLine:" .. cl
+        vim.wo[pan.win].cursorline = true
+    else
+        -- FloatBorder → LvimUiPeekBorder so a content-panel ring (config.content_border) paints with the same
+        -- bg/fg as the container ring, reading as one nested frame instead of the unthemed default FloatBorder.
+        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder"
+    end
+    pan.refresh = function() -- a provider re-renders its own panel after a state change (toggle, …)
+        -- find the panel's CURRENT index by identity — `state.panels` is reordered/shrunk by the preview
+        -- rotation / hide / dynamic, so the open-time `i` goes stale (a parked panel drops out entirely).
+        for idx, p in ipairs(state.panels) do
+            if p == pan then
+                render_panel(state, idx)
+                return
+            end
+        end
+        -- PARKED preview in `dynamic`: the consumer's selection-change refresh re-renders the peek FLOAT
+        -- instead (so it follows the list — its cursor lands on the new entry's location), since the picker
+        -- moves a Sel stripe, not the window cursor, so the float's own CursorMoved trigger never fires.
+        if pan == state.preview_panel and state.preview_side == "dynamic" then
+            dyn_show(state)
+        end
+    end
+    pan.frame = state -- providers reach the frame (focus_panel / close / cfg) through their panel
+    render_panel(state, i)
+end
+
+--- Which size layout a surface is — derived from its anchor `position` (the same signal the sizing uses):
+--- "cmdline" → the area dock, "bottom" → the bottom dock, anything else (centred) → a float.
+---@param cfg table
+---@return "float"|"area"|"bottom"
+local function backdrop_layout(cfg)
+    if cfg.position == "cmdline" then
+        return "area"
+    elseif cfg.position == "bottom" then
+        return "bottom"
+    end
+    return "float"
+end
+
+--- The effective backdrop veil for this surface: the consumer's per-open `cfg.backdrop` (a `{ enabled?, blend, hl }`
+--- table, or `false` to force off) OVERRIDES the layout default in `config.backdrop`; absent → that default.
+--- Returns nil when no veil applies (disabled / off).
+---@param cfg table
+---@return { blend: integer, hl: string }?
+local function resolve_backdrop(cfg)
+    local bd = cfg.backdrop
+    if bd == nil then
+        bd = (config.backdrop or {})[backdrop_layout(cfg)]
+    end
+    if not bd or bd.enabled == false then
+        return nil
+    end
+    -- Skip the veil on a TRANSPARENT editor: a `winblend` float has no solid bg to dim — nvim composites the
+    -- underlying `NONE` cells to hard BLACK, so the veil paints black blocks over the code instead of a smooth dim
+    -- (and transparency's whole point is to show the wallpaper, which a chrome veil can't cleanly darken anyway).
+    -- Detected from the LIVE `Normal` highlight (no bg = transparent) — the palette's own `transparent` flag lags.
+    local nb = vim.api.nvim_get_hl(0, { name = "Normal" })
+    if not (nb and nb.bg) then
+        return nil
+    end
+    return { blend = bd.blend or 65, hl = bd.hl or "LvimUiBackdrop" }
+end
+
+--- Open the BACKDROP veil — a full-editor float BEHIND the surface (zindex below the container), unfocusable, its
+--- Normal set to the veil colour + `winblend`, so the rest of the editor dims/darkens through it. No-op when no
+--- veil applies. `area`/`bottom` docks (higher-z panels) still paint bright on top of it.
+---@param state table
+local function open_backdrop(state)
+    -- A float auto-stacked ABOVE another frame (a modal opened FROM the browser etc.) must NOT lay its own
+    -- full-editor veil — it would black out the very panel it sits on ("панела отдолу не се вижда"). We float
+    -- above the opener; the opener's own backdrop (if any) already dims the editor behind the whole stack.
+    if state.skip_backdrop then
+        return
+    end
+    local bd = resolve_backdrop(state.cfg)
+    if not bd then
+        return
+    end
+    local ew, eh = math.max(1, vim.o.columns), math.max(1, vim.o.lines)
+    -- HANDOFF: a screen switch closes then reopens; if the just-closed veil has the SAME look and is still alive,
+    -- ADOPT its window (mark it adopted so its deferred teardown skips it) instead of a blink-off + fade-in.
+    if
+        pending_backdrop
+        and pending_backdrop.hl == bd.hl
+        and pending_backdrop.blend == bd.blend
+        and api.nvim_win_is_valid(pending_backdrop.win)
+    then
+        pending_backdrop.adopted = true
+        state.backdrop_win, state.backdrop_buf = pending_backdrop.win, pending_backdrop.buf
+        state.backdrop_hl, state.backdrop_blend = bd.hl, bd.blend
+        pcall(api.nvim_win_set_config, state.backdrop_win, {
+            relative = "editor",
+            row = 0,
+            col = 0,
+            width = ew,
+            height = eh,
+            zindex = state.zindex - 1,
+        })
+        pending_backdrop = nil
+        active_backdrop = { state = state, hl = bd.hl, blend = bd.blend, zindex = state.zindex - 1 }
+        register_backdrop_focus()
+        apply_backdrop_focus() -- keeps the adopted veil iff a surface window is current, else drops it
+        return
+    end
+    state.backdrop_hl, state.backdrop_blend = bd.hl, bd.blend -- remembered for the handoff match on the next open
+    -- The veil is built LAZILY by apply_backdrop_focus once a surface window is current — at THIS point the editor
+    -- is still current (panels are focused after open_backdrop), so building it here then would only get it dropped.
+    active_backdrop = { state = state, hl = bd.hl, blend = bd.blend, zindex = state.zindex - 1 }
+    register_backdrop_focus()
+    apply_backdrop_focus() -- builds the veil now iff a surface window is already current, else waits for one
+end
+
+--- Build the container + the N panel windows from a computed layout.
+---@param state table
+local function open_windows(state)
+    register_frame_ft() -- ensure lvim-utils.cursor knows FRAME_FT (current-only) for cursor hiding
+    if state.cfg.zindex then
+        state.zindex = state.cfg.zindex
+    else
+        state.zindex = auto_float_base()
+        -- >50 ⇒ we stacked above an existing frame → skip our own backdrop (see open_backdrop) so the panel below
+        -- stays visible; a lone float over the editor stays at 50 and keeps its veil.
+        state.skip_backdrop = state.zindex > 50
+    end
+    open_backdrop(state) -- the dim/darken veil BEHIND everything (no-op when this layout's backdrop is off)
+    state.container_buf = api.nvim_create_buf(false, true)
+    -- The chrome container hides the hardware cursor while a bar sector is focused (it becomes current).
+    vim.bo[state.container_buf].filetype = FRAME_FT
+
+    local L
+    if state.cfg.mode == "split" then
+        -- A docked split: `dock` left/right = a vertical split (fixed width from sizing, full height),
+        -- below/above = a horizontal split (fixed height, full width). The chrome lives in this split's
+        -- buffer; the panels float over its center rows at its ACTUAL screen position / size.
+        local g0 = compute_geom(state)
+        local dock = state.cfg.dock or "right"
+        local horiz = dock == "below" or dock == "above"
+        state.container_win = api.nvim_open_win(state.container_buf, false, {
+            split = dock,
+            win = -1,
+            width = (not horiz) and g0.W or nil,
+            height = horiz and g0.H or nil,
+            style = "minimal",
+            -- Focusable so native window nav can ENTER the docked peek: the panels are floats off the
+            -- layout, but this chrome split IS in the layout, so `<C-w>j`/`<C-w>k` from the surrounding
+            -- editor land here — a WinEnter hook then bounces focus into the content panel. (Horizontal
+            -- `<C-w>l`/`<C-w>h` between the editor splits is unaffected: the split is below them, not beside.)
+            focusable = true,
+        })
+        local pos = api.nvim_win_get_position(state.container_win)
+        L = compute_geom(state, {
+            row = pos[1],
+            col = pos[2],
+            W = api.nvim_win_get_width(state.container_win),
+            H = api.nvim_win_get_height(state.container_win),
+        })
+        if horiz then
+            vim.wo[state.container_win].winfixheight = true
+        else
+            vim.wo[state.container_win].winfixwidth = true
+        end
+    else
+        L = compute_geom(state)
+        -- A `cmdline` surface OWNS the command-line region: UNHOSTED grows `cmdheight` to its height so the
+        -- editor (and heirline / a global statusline) reflow ABOVE it, then floats over those rows; HOSTED
+        -- reserves its rows in the host zone (which owns the cmdheight) so messages compose below it.
+        if state.cfg.position == "cmdline" then
+            L = host_geom(state, L)
+        end
+        -- The brand is the window's TOP-border title (needs a top border, ct > 0), built by `build_brand`
+        -- from the `title` box: TITLE left, COUNTER right (`counter="title"`) on the same top-border line —
+        -- UNLESS an area dock routes the title to the chrome overlay (`title_line="statusline"`), where
+        -- build_brand returns nil and `publish_overlay_title` posts it instead. `title_pos` is LEFT (so the
+        -- counter's fill reaches the right edge); it must only be set WITH a title — nvim errors otherwise.
+        -- (`counter="footer"` instead rides the BOTTOM border, needs cb > 0, as a right-aligned footer.)
+        local brand = L.ct > 0 and build_brand(state, L.W) or nil
+        local bfooter = (L.cb or 0) > 0 and build_border_footer(state) or nil
+        state.container_win = api.nvim_open_win(state.container_buf, false, {
+            relative = "editor",
+            width = L.W,
+            height = L.H,
+            row = L.row,
+            col = L.col,
+            border = L.cbord,
+            style = "minimal",
+            focusable = false,
+            zindex = state.zindex,
+            title = brand,
+            title_pos = brand and (state.cfg.title_pos or "left") or nil,
+            footer = bfooter,
+            footer_pos = bfooter and "right" or nil,
+        })
+        publish_overlay_title(state)
+    end
+    state._geom = L
+    local docked = state.cfg.mode == "split"
+    -- The CONTAINER holds only chrome and is never directly interacted with — always mark it so generic
+    -- float helpers ("close all floats" / "focus next float") skip it and land on the content panel.
+    vim.w[state.container_win].lvim_frame = true
+    vim.wo[state.container_win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder"
+
+    render_chrome(state, L)
+
+    -- An editable input band (see below) takes the initial focus instead of a panel.
+    local has_input = false
+    for _, band in ipairs(state.header_bands) do
+        if band.input then
+            has_input = true
+            break
+        end
+    end
+
+    for i, pan in ipairs(state.panels) do
+        open_panel_win(state, pan, i, L.panels[i], has_input, docked)
+    end
+
+    -- Live "item N of M" counter: when the consumer opts into `count_follows_cursor`, the FIRST content panel's
+    -- cursor row drives the counter's `current` (read in resolve_count via `cfg._cursor_row`). Seed it now and
+    -- refresh it on every CursorMoved (set_counter re-renders the title/border/overlay counter). A per-buffer
+    -- augroup clears on re-open so the panel's reused scratch buffer never stacks duplicate autocmds.
+    if state.cfg.count_follows_cursor and state.panels[1] and state.panels[1].buf then
+        local pbuf, pwin = state.panels[1].buf, state.panels[1].win
+        state.cfg._cursor_row = (pwin and api.nvim_win_is_valid(pwin)) and api.nvim_win_get_cursor(pwin)[1] or 1
+        local grp = api.nvim_create_augroup("LvimSurfaceCounter_" .. pbuf, { clear = true })
+        api.nvim_create_autocmd("CursorMoved", {
+            group = grp,
+            buffer = pbuf,
+            callback = function()
+                if not (pwin and api.nvim_win_is_valid(pwin)) then
+                    return
+                end
+                state.cfg._cursor_row = api.nvim_win_get_cursor(pwin)[1]
+                if state.set_counter then
+                    state.set_counter(state.cfg.count)
+                end
+            end,
+        })
+    end
+
+    -- Editable INPUT bands: a focusable 1-row editable window over each input band's header row. The frame
+    -- creates it + wires a live on_change; the consumer drives the panels from on_change + the band's keys
+    -- (insert-mode), like a fuzzy-finder prompt. Not part of the normal-mode sector nav — it is always
+    -- focused (insert) while open, so there is no mode clash with the chassis keymaps.
+    do
+        local _, _, _, cl = util.insets(L.cbord)
+        for bi, band in ipairs(state.header_bands) do
+            if band.input then
+                band.buf = api.nvim_create_buf(false, true)
+                vim.bo[band.buf].bufhidden = "hide"
+                vim.bo[band.buf].modifiable = true -- it is a typed field
+                if band.filetype then
+                    vim.bo[band.buf].filetype = band.filetype
+                end
+                -- `scope_panel` narrows the input to a single panel and overlays that panel's TOP (winbar)
+                -- row — a finder whose prompt sits over its LIST, level with the other panels' titles, not on
+                -- a separate full-width header row. Otherwise it spans the full container width on its header
+                -- row.
+                local iw, icol, irow = L.W, L.col + cl, L.row + L.ct + (bi - 1)
+                if band.scope_panel and L.panels[band.scope_panel] then
+                    -- inside the LIST panel's border (shared helper), not on the border row
+                    local prow, pcol, pwidth = panel_content_rect(L.panels[band.scope_panel])
+                    iw, icol, irow = pwidth, pcol, prow
+                end
+                band.win = api.nvim_open_win(band.buf, false, {
+                    relative = "editor",
+                    row = irow,
+                    col = icol,
+                    width = iw,
+                    height = 1,
+                    style = "minimal",
+                    focusable = true,
+                    zindex = state.zindex + 2, -- above the container (z) and the panels (z+1)
+                })
+                -- The typed area uses `input_hl` (the row's Normal bg); the prompt badge uses `prompt_hl`.
+                vim.wo[band.win].winhighlight = "Normal:" .. (band.input_hl or "LvimUiPeekNormal")
+                -- No wrap/continuation chrome on the 1-row prompt (a long query scrolls horizontally; a
+                -- 'showbreak' / wrap continuation marker must never leak into the field).
+                vim.wo[band.win].wrap = false
+                vim.wo[band.win].list = false
+                vim.wo[band.win].showbreak = ""
+                if band.prompt and band.prompt ~= "" then
+                    -- `prompt` is a STRING (one badge chunk) or a LIST of `{ text, hl }` chunks (e.g. a badge
+                    -- + a gap on a different tint).
+                    local vt = type(band.prompt) == "table" and band.prompt
+                        or { { band.prompt, band.prompt_hl or "LvimUiMsgAreaItemKind" } }
+                    pcall(api.nvim_buf_set_extmark, band.buf, NS, 0, 0, {
+                        virt_text = vt,
+                        virt_text_pos = "inline",
+                        right_gravity = false,
+                    })
+                end
+                if band.on_change then
+                    api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
+                        buffer = band.buf,
+                        callback = function()
+                            band.on_change(api.nvim_buf_get_lines(band.buf, 0, 1, false)[1] or "")
+                        end,
+                    })
+                end
+                if band.keys then
+                    pcall(band.keys, band.buf, state)
+                end
+            end
+        end
+        -- Enter the FIRST input band on open (insert), unless the consumer opted out of focusing.
+        if state.cfg.enter ~= false then
+            for _, band in ipairs(state.header_bands) do
+                if band.input and band.win and api.nvim_win_is_valid(band.win) then
+                    api.nvim_set_current_win(band.win)
+                    vim.cmd("startinsert!")
+                    break
+                end
+            end
+        end
+    end
+
+    -- Wire interaction: the sector list, the keymaps, and the initial focus (the first center panel).
+    state.refresh_chrome = function() -- re-render the header/footer bands (e.g. after a tab switch)
+        render_chrome(state, state._geom)
+    end
+    -- Re-fit the frame to its providers' CURRENT content size (auto width/height) and re-centre — for an
+    -- auto-sized frame whose content changed at runtime (e.g. a tab switch swapping the form's row count).
+    state.relayout = function()
+        relayout(state)
+    end
+    state.preview_side = state.cfg.preview_side -- the live preview position (rotate_preview cycles it)
+    -- Capture the persistent list + preview panel refs, so the preview can be DROPPED (hide / dynamic) and
+    -- RE-DOCKED at runtime without losing them (the scratch buffers outlive their windows).
+    for _, pan in ipairs(state.panels) do
+        if pan.id == "preview" then
+            state.preview_panel = pan
+        else
+            state.list_panel = state.list_panel or pan
+        end
+    end
+    apply_dock_height(state, state.preview_side) -- the configured docked height for the INITIAL stack direction
+    --- Rotate the preview through FIVE positions (right → below → left → above → dynamic → …), LIVE. The four
+    --- docked sides reflow the floats in place; `dynamic` drops the docked preview to a full-width list + a
+    --- transient peek float (`apply_preview_side` handles both). No-op without a "preview" panel.
+    ---@param dir integer  +1 next position, -1 previous
+    state.rotate_preview = function(dir)
+        if not state.preview_panel then
+            return
+        end
+        local order = { "right", "below", "left", "above", "dynamic" }
+        local ci = 1
+        for i, s in ipairs(order) do
+            if s == (state.preview_side or "right") then
+                ci = i
+            end
+        end
+        state.preview_side = order[((ci - 1 + dir) % #order) + 1]
+        state.preview_hidden = false -- rotating always un-hides
+        apply_preview_side(state)
+        refocus_list(state)
+    end
+    --- Toggle the preview HIDDEN ↔ shown (the `hide` position). A no-op while `dynamic` (its peek owns the
+    --- preview); only the docked sides hide. The last docked side returns on un-hide.
+    state.toggle_preview = function()
+        if not state.preview_panel or state.preview_side == "dynamic" then
+            return
+        end
+        state.preview_hidden = not state.preview_hidden
+        apply_preview_side(state)
+        refocus_list(state)
+    end
+    -- Opened directly into a non-docked preview state (open_windows built BOTH panels): drop the docked preview
+    -- now. `hide` as an initial side = start hidden on the default side.
+    if state.preview_panel and (state.preview_side == "dynamic" or state.preview_side == "hide") then
+        if state.preview_side == "hide" then
+            state.preview_side = "right"
+            state.preview_hidden = true
+        end
+        apply_preview_side(state)
+    end
+    --- Swap the HEADER bands at runtime — a tabbed surface changing a tab's toolbar bars (each becomes its own
+    --- C-j/C-k sector). Regular bar bands are container LINES (not windows), so this just re-derives the band +
+    --- sector lists and relayouts (recomputes the header height, repositions the content, re-renders). When a
+    --- BAR sector is focused, it is re-established on the rebuilt band (its `_sel` lands on the active button,
+    --- so a just-applied filter reads as hover_active); a center focus needs nothing (the center persists).
+    ---@param spec table  the new `header` spec ({ bars = { … } })
+    state.set_header = function(spec)
+        local on_bar = state.focus and state.focus.kind == "bar"
+        -- Re-prepend the row title (a `title_line="row"` float): build_bands rebuilds from `spec` ONLY, so the
+        -- title (inserted at open, outside `spec`) would vanish on the first tab switch. Mirror open's air:
+        -- the row title supplies its own air row, so suppress build_bands' header air when it's present.
+        local tb = row_title_bands(state.cfg)
+        local header_air = state.cfg.header_air
+        if tb then
+            header_air = false
+        end
+        state.header_bands = build_bands(spec, false, header_air)
+        if tb then
+            for i = #tb, 1, -1 do
+                table.insert(state.header_bands, 1, tb[i])
+            end
+        end
+        state.sectors = build_sectors(state)
+        if on_bar then
+            local fi = math.max(1, math.min(state.focus_idx or 1, #state.sectors))
+            local sec = state.sectors[fi]
+            if sec and sec.kind == "bar" then
+                local as = 1
+                for bi, b in ipairs(sec.band.buttons or {}) do
+                    if b.active then
+                        as = bi
+                    end
+                end
+                sec.band._sel = as
+                state.focus_idx = fi
+                state.focus = { kind = "bar", band = sec.band, where = sec.where }
+            end
+        end
+        relayout(state)
+    end
+    --- Rebuild the FOOTER band(s) in place — for a live key-hint legend that tracks the focused row. The legend
+    --- is a constant-height bar, so it just re-paints the chrome (render_chrome re-derives the footer line from
+    --- the new bands and writes the CONTAINER buffer); the body float is untouched.
+    ---@param spec table
+    state.set_footer = function(spec)
+        state.cfg.footer = spec
+        state.footer_bands = build_bands(spec, true)
+        state.sectors = build_sectors(state)
+        if state._geom then
+            render_chrome(state, state._geom)
+        end
+    end
+    --- Update the surface TITLE in place — re-applies the border-title brand (via `build_brand`, so the
+    --- counter / `title_line="statusline"` routing is respected) to the live container window, re-publishes
+    --- the chrome overlay where applicable, and re-paints the chrome — so a consumer can retitle without a
+    --- teardown + reopen. Accepts the same `title` shape as `surface.open` (string | { text, icon }).
+    ---@param title any
+    state.set_title = function(title)
+        state.cfg.title = title
+        if
+            state.container_win
+            and api.nvim_win_is_valid(state.container_win)
+            and state._geom
+            and state._geom.ct > 0
+        then
+            local brand = build_brand(state, state._geom.W)
+            pcall(api.nvim_win_set_config, state.container_win, {
+                title = brand,
+                title_pos = brand and (state.cfg.title_pos or "left") or nil,
+            })
+        end
+        publish_overlay_title(state)
+        if state._geom then
+            render_chrome(state, state._geom)
+        end
+    end
+    --- Update the COUNT (the title / footer counter) in place — re-applies it to the live container window
+    --- per the active `counter` placement: a chunk in the border-title (`counter="title"`), the right-aligned
+    --- native border-FOOTER (`counter="footer"`), and/or the chrome overlay (area dock + `title_line=
+    --- "statusline"`). The navigable ACTION footer bar is separate (`set_footer`) and untouched here. `count`
+    --- is the same shape as `cfg.count` (integer | { current, total } | fun()).
+    ---@param count any
+    state.set_counter = function(count)
+        state.cfg.count = count
+        if state.container_win and api.nvim_win_is_valid(state.container_win) and state._geom then
+            if state._geom.ct > 0 then
+                local brand = build_brand(state, state._geom.W)
+                pcall(api.nvim_win_set_config, state.container_win, {
+                    title = brand,
+                    title_pos = brand and (state.cfg.title_pos or "left") or nil,
+                })
+            end
+            if (state._geom.cb or 0) > 0 then
+                local bfooter = build_border_footer(state)
+                pcall(api.nvim_win_set_config, state.container_win, {
+                    footer = bfooter,
+                    footer_pos = bfooter and "right" or nil,
+                })
+            end
+        end
+        -- title_line="row": the count lives in the title_counter CONTENT row, so re-render the chrome to refresh
+        -- it (the band re-evaluates its `count` closure, which reads the live state).
+        if state.cfg.title_line == "row" and state._geom then
+            render_chrome(state, state._geom)
+        end
+        publish_overlay_title(state)
+    end
+    -- (HOSTED) Re-place over a fresh host-zone rect WITHOUT re-reserving (the host called us because it
+    -- reflowed). Wired by the caller as the host segment's `on_rect`, so the surface follows the zone.
+    state.reposition = function(rect)
+        reposition(state, rect)
+    end
+    state.sectors = build_sectors(state)
+    state.center_panel = 1
+    local function center_idx()
+        for si, sec in ipairs(state.sectors) do
+            if sec.kind == "center" then
+                return si
+            end
+        end
+    end
+    --- Focus center panel `i` (used by a panel hosting an external buffer — the preview — and the
+    --- "preview" footer action) through the proper sector model.
+    ---@param i integer
+    state.focus_panel = function(i)
+        state.center_panel = math.max(1, math.min(i, #state.panels))
+        local ci = center_idx()
+        if ci then
+            focus_sector(state, ci)
+        end
+    end
+    --- Focus a SECTOR by index (1 = the first header bar / the filter bar, … the center, … the footer). Lets a
+    --- consumer land focus on the TOP bar on a descend from above, instead of skipping into the center.
+    ---@param i integer
+    state.focus_sector = function(i)
+        focus_sector(state, i)
+    end
+    --- Focus a center BLOCK by its `id` (`content.blocks[i].id`) — order-independent (no numeric index).
+    ---@param id any
+    state.focus_block = function(id)
+        for i, pan in ipairs(state.panels) do
+            if pan.id == id then
+                state.focus_panel(i)
+                return
+            end
+        end
+    end
+    --- Move LEFT/RIGHT between the center panels (`dir` = +1 / -1). Only meaningful inside the center.
+    --- Reads the REAL focused window (not just the tracked `center_panel`), so it works even when the
+    --- preview was focused without going through `focus_panel` (e.g. its own buffer keymaps).
+    ---@param dir integer  +1 (right) / -1 (left)
+    state.panel = function(dir)
+        if state.cfg.direction == "vertical" then
+            return -- vertical stack: panels are top↔bottom, walked with the sector nav (<C-j>/<C-k>), not <C-l>/<C-h>
+        end
+        local w = api.nvim_get_current_win()
+        local base = state.center_panel or 1
+        for i, pan in ipairs(state.panels) do
+            if pan.win == w then
+                base = i
+                break
+            end
+        end
+        local i = math.max(1, math.min(base + dir, #state.panels))
+        if i ~= base then
+            focus_panel_win(state, i)
+        end
+    end
+    --- Cycle the focused sector header · center · footer (exposed so an external-buffer panel can drive
+    --- the same navigation from its own keymaps).
+    ---@param dir integer  +1 (down) / -1 (up)
+    state.sector = function(dir)
+        sector_cycle(state, dir)
+    end
+    --- Focus the window the frame was opened from (the editor), keeping the frame open. The WinEnter
+    --- hook restores the cursor there.
+    state.to_origin = function()
+        if state.origin and api.nvim_win_is_valid(state.origin) then
+            api.nvim_set_current_win(state.origin)
+        end
+    end
+    --- Map every BAR button's hotkey (header AND footer) on `buf` (firing its `run`), so filter keys and
+    --- footer actions (e.g. the per-server form's `a`/`A`/`b`) work from anywhere — not only by navigating
+    --- to the bar. `reserved` lists extra keys to SKIP (the container's menu nav, so `h`/`l` still move the
+    --- selection there); `<CR>`/`<Space>` are ALWAYS skipped — a content provider owns them (e.g. the list
+    --- `<CR>` jump). Called on each panel buffer, the container, and the preview's file buffer.
+    state.map_hotkeys = function(buf, reserved)
+        local skip = { ["<CR>"] = true, ["<Space>"] = true }
+        for _, r in ipairs(reserved or {}) do
+            skip[r] = true
+        end
+        for _, sec in ipairs(state.sectors) do
+            if sec.kind == "bar" then
+                for _, spec in ipairs(sec.band.buttons or {}) do
+                    -- `no_hotkey` marks a DISPLAY button (e.g. a key-hint LEGEND like "j/k", "h/l") — it is shown
+                    -- and mouse-clickable, but its `key` is a label, NOT a real keymap: registering a multi-char
+                    -- label ("j/k") would make its first char ("j") a mapping PREFIX → nvim waits `timeoutlen` on
+                    -- every "j" press. The real keys are already mapped by the content/frame.
+                    if
+                        spec.key
+                        and spec.run
+                        and spec.type ~= "separator"
+                        and not spec.no_hotkey
+                        and not skip[spec.key]
+                    then
+                        vim.keymap.set("n", spec.key, function()
+                            spec.run(state)
+                        end, { buffer = buf, nowait = true, silent = true })
+                    end
+                end
+            end
+        end
+    end
+    --- Toggle the first header bar sector (the "menu" shortcut): focus it, or return to the center if it
+    --- is already focused. Returns true when it lands ON the header bar.
+    state.toggle_header = function()
+        for si, sec in ipairs(state.sectors) do
+            if sec.kind == "bar" and sec.where == "header" then
+                if state.focus and state.focus.kind == "bar" and state.focus_idx == si then
+                    local ci = center_idx()
+                    if ci then
+                        focus_sector(state, ci)
+                    end
+                    return false
+                end
+                focus_sector(state, si)
+                return true
+            end
+        end
+        return false
+    end
+    set_keys(state)
+    -- A non-focusing float (`enter == false`) leaves the cursor in the editor — record the center panel but
+    -- do NOT focus it; the consumer focuses later (e.g. a hover entered on the 2nd keypress).
+    if state.cfg.enter == false then
+        state.center_panel = center_idx() or 1
+    elseif has_input then
+        state.center_panel = center_idx() or 1 -- the input band (focused above, in insert) owns the keyboard
+    else
+        focus_sector(state, center_idx() or 1)
+    end
+
+    -- Closing any frame window externally (`:q`, a programmatic close) tears the whole frame down once.
+    state.augroup = api.nvim_create_augroup("LvimUiFrame_" .. tostring(state.container_win), { clear = true })
+    local watch = { state.container_win }
+    for _, pan in ipairs(state.panels) do
+        watch[#watch + 1] = pan.win
+    end
+    for _, band in ipairs(state.header_bands) do
+        if band.input and band.win then
+            watch[#watch + 1] = band.win
+        end
+    end
+    api.nvim_create_autocmd("WinClosed", {
+        group = state.augroup,
+        callback = function(ev)
+            local w = tonumber(ev.match)
+            for _, ww in ipairs(watch) do
+                if ww == w then
+                    state.close()
+                    return
+                end
+            end
+        end,
+    })
+    -- Re-fit on resize. Only relayout when the CONTAINER itself was resized (the user dragging the split):
+    -- relayout then resizes the floats, whose own WinResized events DON'T include the container, so there
+    -- is no feedback loop. VimResized (terminal size change) always reflows.
+    api.nvim_create_autocmd("WinResized", {
+        group = state.augroup,
+        callback = function()
+            -- A `cmdline` surface grows `cmdheight` itself, which RESIZES the container float and so fires
+            -- WinResized on it — but it already re-fits via its own content refresh (refresh_surface →
+            -- relayout), so this WinResized relayout is redundant; skip it.
+            if state._closed or state.cfg.position == "cmdline" then
+                return
+            end
+            for _, w in ipairs(vim.v.event.windows or {}) do
+                if w == state.container_win then
+                    relayout(state)
+                    return
+                end
+            end
+        end,
+    })
+    api.nvim_create_autocmd("VimResized", {
+        group = state.augroup,
+        callback = function()
+            if not state._closed then
+                relayout(state)
+            end
+        end,
+    })
+    -- Drop / restore the focused-bar selection highlight as focus leaves / re-enters the frame, so a
+    -- header button never looks hovered while the user is back in a normal buffer.
+    local function set_blur(b)
+        if state._blurred ~= b then
+            state._blurred = b
+            render_chrome(state, state._geom)
+        end
+    end
+    -- Cursor hygiene: the frame hides the hardware cursor while a list panel is focused, so when focus
+    -- moves OUT of the frame (e.g. `<C-w>w` to the editor above a docked split) the cursor must come
+    -- back, and re-hide on return. A list-style panel hides it; any other window shows it; the bar-menu
+    -- container manages its own.
+    api.nvim_create_autocmd("WinEnter", {
+        group = state.augroup,
+        callback = function()
+            if state._closed then
+                return
+            end
+            local w = api.nvim_get_current_win()
+            if w == state.container_win then
+                set_blur(false)
+                -- Native window nav landed on the chrome split (e.g. `<C-w>j` from the editor above) — the
+                -- user means "step into the panel". Land on the FIRST sector (the top header bar) so entry
+                -- is step-by-step (header → center → footer via `<C-j>`), not a jump straight to the center.
+                -- EXCEPT when focus is RETURNING from the host zone below (`_return_sector` set by sector_cycle):
+                -- land back on the footer it descended from, so up/down nav is symmetric. A frame-driven bar
+                -- focus sets `_focusing_bar`, so it stays on the chrome as intended.
+                if not state._focusing_bar then
+                    vim.schedule(function()
+                        if not state._closed and api.nvim_get_current_win() == state.container_win then
+                            focus_sector(state, state._return_sector or 1)
+                            state._return_sector = nil
+                        end
+                    end)
+                end
+                return
+            end
+            for _, pan in ipairs(state.panels) do
+                if pan.win == w then
+                    set_blur(false)
+                    cursor.update() -- panel ft decides (hide-cursor list vs editable preview)
+                    return
+                end
+            end
+            -- Focus left the frame entirely → clear the selection highlight; the cursor module shows the
+            -- cursor again (the editor's normal-ft buffer is current now).
+            set_blur(true)
+            cursor.update()
+        end,
+    })
+end
+
+-- ─── preview side: hide + dynamic ─────────────────────────────────────────────
+-- Two preview states beyond the four docked sides: `hide` (no preview — list full-width, toggled by a key)
+-- and `dynamic` (list full-width + a TRANSIENT preview FLOAT above it, shown only while the picker is focused
+-- and following the list cursor — the native-qf peek). Both drop the docked preview panel; `dynamic` then
+-- drives its own float.
+
+-- A single BOTTOM rule (no top/side border) — the SAME look as the docked `above` preview: the file winbar
+-- marks the top, a red rule (`LvimUiPickerSeparator`) divides it from what's below. Full container width.
+local DYN_BORDER = { "", "", "", "", "", "─", "", "" }
+
+--- The dynamic float's column/width, the container top, and the CONTENT-height cap. The float floats over the
+--- editor, so it is capped to LEAVE the top of the editor + its statusline VISIBLE (so you can still navigate to
+--- the real buffer): its bottom rule sits 1 row above the statusline (`top - 2`), and the top stays below a
+--- `keep_top` margin.
+---@param state table
+---@return table
+function dyn_geom(state)
+    local L = state._geom or compute_geom(state)
+    local hs = state.cfg.preview_heights
+    local capf = (hs and hs.vertical) or 0.5
+    local cfgcap = math.max(3, capf <= 1 and math.floor(vim.o.lines * capf) or math.floor(capf))
+    local top = L.row -- the container's top screen row (the editor statusline sits at top-1)
+    local keep_top = math.floor(vim.o.lines * 0.4) -- leave the top ~40% of the editor visible
+    return { col = L.col, width = L.W, top = top, cap = math.max(1, math.min(cfgcap, top - 2 - keep_top)) }
+end
+
+--- Render the preview provider into the dynamic float for the current list selection (no-op while the float
+--- itself is focused — the provider leaves an in-progress edit alone).
+---@param state table
+function dyn_update(state)
+    local d = state.dyn
+    if not (d and d.win and api.nvim_win_is_valid(d.win)) then
+        return
+    end
+    local prov = state.preview_panel and state.preview_panel.provider
+    if prov and prov.update then
+        pcall(prov.update, { win = d.win, buf = api.nvim_win_get_buf(d.win), frame = state })
+    end
+end
+
+--- Show (or reposition) the dynamic float + refresh its content.
+---@param state table
+function dyn_show(state)
+    local d = state.dyn
+    if not d or state._closed or d._positioning then
+        return
+    end
+    local g = dyn_geom(state)
+    if not (d.win and api.nvim_win_is_valid(d.win)) then
+        if not (d.buf and api.nvim_buf_is_valid(d.buf)) then
+            d.buf = api.nvim_create_buf(false, true)
+            vim.bo[d.buf].bufhidden = "hide"
+        end
+        d.win = api.nvim_open_win(d.buf, false, {
+            relative = "editor",
+            row = g.top - g.cap - 2, -- bottom rule lands at top-2 (editor statusline at top-1 stays visible)
+            col = g.col,
+            width = g.width,
+            height = g.cap,
+            style = "minimal",
+            border = DYN_BORDER,
+            focusable = true,
+            zindex = (state.zindex or 50) + 1,
+        })
+        vim.wo[d.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPickerSeparator"
+        vim.wo[d.win].wrap = false
+        -- a FRESH window has no winbar; make the provider re-assert the file title bar on the next update
+        local prov = state.preview_panel and state.preview_panel.provider
+        if prov and prov.reset then
+            prov.reset()
+        end
+    end
+    dyn_update(state)
+    -- AUTO-FIT the float to the file (a peek), capped at `g.cap`; the bottom rule lands at top-2 (above the
+    -- editor statusline), and the cap keeps the top of the editor visible.
+    if d.win and api.nvim_win_is_valid(d.win) then
+        local lines = api.nvim_buf_line_count(api.nvim_win_get_buf(d.win))
+        local wb = vim.wo[d.win].winbar
+        local h = math.max(1, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
+        pcall(api.nvim_win_set_config, d.win, {
+            relative = "editor",
+            row = g.top - h - 2,
+            col = g.col,
+            width = g.width,
+            height = h,
+            border = DYN_BORDER,
+        })
+    end
+    -- A non-current FLOAT ignores cursor positioning (it always shows from line 1). Briefly FOCUS the float to
+    -- place its cursor on the entry, then restore focus — synchronous, so nothing redraws in between.
+    -- `_positioning` makes the focus-change autocmds' dyn_show re-entry a no-op (so it can't reset what we set).
+    local prov = state.preview_panel and state.preview_panel.provider
+    local it = prov and prov.item and prov.item()
+    if it and it.filename and it.lnum and d.win and api.nvim_win_is_valid(d.win) then
+        local prev = api.nvim_get_current_win()
+        if prev ~= d.win then
+            d._positioning = true
+            pcall(api.nvim_set_current_win, d.win)
+            local cnt = api.nvim_buf_line_count(api.nvim_win_get_buf(d.win))
+            pcall(
+                api.nvim_win_set_cursor,
+                d.win,
+                { math.max(1, math.min(it.lnum, cnt)), math.max(0, (it.col or 1) - 1) }
+            )
+            pcall(vim.cmd, "normal! zz")
+            if api.nvim_win_is_valid(prev) then
+                pcall(api.nvim_set_current_win, prev)
+            end
+            d._positioning = false
+        end
+    end
+end
+
+--- Hide the dynamic float (its buffer + the editable file stay alive; only the window closes).
+---@param state table
+function dyn_hide(state)
+    local d = state.dyn
+    if d and d.win and api.nvim_win_is_valid(d.win) then
+        pcall(api.nvim_win_close, d.win, true)
+    end
+    if d then
+        d.win = nil
+    end
+end
+
+--- Turn the dynamic peek ON: a `CursorMoved` on the list follows the selection; a global `WinEnter` shows the
+--- float while any picker window is focused and hides it when focus leaves the picker. Entering the float binds
+--- `<C-j>` (on the editable file buffer, while focused) to drop back to the list.
+---@param state table
+function dyn_enable(state)
+    state.dyn = state.dyn or {}
+    if state.dyn.aug then
+        return -- already on
+    end
+    local list = state.list_panel
+    local aug = api.nvim_create_augroup("LvimUiSurfaceDyn_" .. tostring(state.container_win), { clear = true })
+    state.dyn.aug = aug
+    if list and list.buf and api.nvim_buf_is_valid(list.buf) then
+        api.nvim_create_autocmd("CursorMoved", {
+            group = aug,
+            buffer = list.buf,
+            callback = function()
+                dyn_show(state)
+            end,
+        })
+    end
+    api.nvim_create_autocmd("WinEnter", {
+        group = aug,
+        callback = function()
+            if state._closed then
+                return
+            end
+            local w = api.nvim_get_current_win()
+            local on_float = state.dyn.win and w == state.dyn.win
+            local mine = on_float or (list and w == list.win) or (w == state.container_win)
+            for _, b in ipairs(state.header_bands or {}) do
+                if b.win == w then
+                    mine = true
+                end
+            end
+            if on_float then
+                -- editing the peek → `<C-j>` drops back to the list, `<C-k>` steps UP out to the editor (the
+                -- opener) — bound on the real file buffer only while the float is focused.
+                local fb = api.nvim_win_get_buf(w)
+                state.dyn._navbuf = fb
+                pcall(vim.keymap.set, "n", "<C-j>", function()
+                    if list and list.win and api.nvim_win_is_valid(list.win) then
+                        api.nvim_set_current_win(list.win)
+                    end
+                end, { buffer = fb, nowait = true, silent = true })
+                pcall(vim.keymap.set, "n", "<C-k>", function()
+                    if state.cfg.on_escape_above then
+                        state.cfg.on_escape_above()
+                    end
+                end, { buffer = fb, nowait = true, silent = true })
+            else
+                if state.dyn._navbuf and api.nvim_buf_is_valid(state.dyn._navbuf) then
+                    pcall(vim.keymap.del, "n", "<C-j>", { buffer = state.dyn._navbuf })
+                    pcall(vim.keymap.del, "n", "<C-k>", { buffer = state.dyn._navbuf })
+                end
+                state.dyn._navbuf = nil
+                if mine then
+                    dyn_show(state)
+                else
+                    dyn_hide(state)
+                end
+            end
+        end,
+    })
+    dyn_show(state)
+end
+
+--- Turn the dynamic peek OFF: drop the autocmds + close the float.
+---@param state table
+function dyn_disable(state)
+    local d = state.dyn
+    if not d then
+        return
+    end
+    if d.aug then
+        pcall(api.nvim_del_augroup_by_id, d.aug)
+        d.aug = nil
+    end
+    if d._navbuf and api.nvim_buf_is_valid(d._navbuf) then
+        pcall(vim.keymap.del, "n", "<C-j>", { buffer = d._navbuf })
+        pcall(vim.keymap.del, "n", "<C-k>", { buffer = d._navbuf })
+        d._navbuf = nil
+    end
+    dyn_hide(state)
+end
+
+--- Re-derive the DOCKED center panels from the live preview state (side / hidden / dynamic) and reflow: a
+--- single full-width list for `hide`/`dynamic`, the re-docked list+preview otherwise. The dropped preview is
+--- PARKED behind the list (never closed — a WinClosed would bounce focus to the editor via the user's window
+--- managers); re-docking just returns it to `state.panels`. No-op on a surface without a "preview" panel.
+---@param state table
+function restack_panels(state)
+    local pv, list = state.preview_panel, state.list_panel
+    if not (pv and list) then
+        return
+    end
+    local undocked = state.preview_hidden or state.preview_side == "dynamic"
+    local vert = (state.preview_side == "above" or state.preview_side == "below") and not undocked
+    local preview_first = state.preview_side == "above" or state.preview_side == "left"
+    local docked = undocked and { list } or (preview_first and { pv, list } or { list, pv })
+    state.panels = docked
+    state.cfg.direction = vert and "vertical" or nil
+    -- (the divider glyph is oriented at render time per L.vertical — no need to rewrite state.cfg.separator here)
+    local stack_axis = vert and "height" or "width"
+    for _, pan in ipairs(docked) do
+        pan.weight = pan.size and (pan.size[stack_axis] or {}).fixed or nil
+    end
+    apply_dock_height(state, state.preview_side)
+    state.sectors = build_sectors(state)
+    relayout(state) -- positions the docked panels (place_panels)
+    -- The DROPPED preview is PARKED (not closed) behind the list: a WinClosed would fire the user's window
+    -- managers (BufSurf, …) and bounce focus to the editor. Re-docking just returns it to `state.panels`, so the
+    -- next relayout repositions it. (The list float — higher zindex + opaque — fully covers the parked one.)
+    if undocked and pv.win and api.nvim_win_is_valid(pv.win) then
+        local lp = state._geom and state._geom.panels and state._geom.panels[1]
+        if lp then
+            pcall(api.nvim_win_set_config, pv.win, {
+                relative = "editor",
+                row = lp.row,
+                col = lp.col,
+                width = math.max(1, lp.width),
+                height = math.max(1, lp.height),
+                zindex = state.zindex or 50,
+            })
+        end
+    end
+end
+
+--- Pull focus back to the list AFTER the event loop (closing a preview float bounces focus to the editor on a
+--- DEFERRED tick, so a synchronous re-focus is undone). Used by the runtime rotate / hide toggle — never at
+--- open, where the input band should keep focus.
+---@param state table
+function refocus_list(state)
+    vim.schedule(function()
+        if state._closed then
+            return
+        end
+        local w = state.list_panel and state.list_panel.win
+        if w and api.nvim_win_is_valid(w) then
+            pcall(api.nvim_set_current_win, w)
+        end
+    end)
+end
+
+--- Apply the live `preview_side` (+ `preview_hidden`): reflow the docked panels, then arm/disarm the dynamic
+--- peek. The single entry point for both the rotation and the hide toggle.
+---@param state table
+function apply_preview_side(state)
+    restack_panels(state)
+    if state.preview_side == "dynamic" then
+        dyn_enable(state)
+    else
+        dyn_disable(state)
+    end
+    -- re-render the preview next tick: a just re-docked panel (un-hide / rotate back) can read empty until the
+    -- next selection change, and the dynamic float needs its content after the windows settle.
+    vim.schedule(function()
+        if state._closed then
+            return
+        end
+        local pv = state.preview_panel
+        if pv and pv.provider and pv.provider.reset then
+            pv.provider.reset()
+        end
+        if pv and pv.refresh then
+            pv.refresh()
+        end
+    end)
+end
+
+--- Tear the frame down: close every window, restore the cursor + focus, fire `cfg.on_close` once.
+---@param state table
+local function close(state)
+    if state._closed then
+        return
+    end
+    state._closed = true
+    if state.augroup then
+        pcall(api.nvim_del_augroup_by_id, state.augroup)
+    end
+    dyn_disable(state) -- close the dynamic peek float + its autocmds, if armed
+    -- Let providers release any external state before we drop the windows (the frame's own scratch panel
+    -- buffers are deleted below, taking their keymaps/extmarks with them, but a provider may hold things
+    -- outside them — e.g. autocommands, or keymaps on a real buffer).
+    for _, pan in ipairs(state.panels or {}) do
+        if pan.provider and pan.provider.on_close then
+            pcall(pan.provider.on_close, pan)
+        end
+    end
+    -- A PARKED preview (hidden / dynamic) is not in `state.panels`, so close it explicitly too.
+    if state.preview_panel and state.preview_panel.win and api.nvim_win_is_valid(state.preview_panel.win) then
+        local docked = false
+        for _, p in ipairs(state.panels or {}) do
+            if p == state.preview_panel then
+                docked = true
+            end
+        end
+        if not docked then
+            pcall(api.nvim_win_close, state.preview_panel.win, true)
+        end
+    end
+    for _, pan in ipairs(state.panels or {}) do
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            pcall(api.nvim_win_close, pan.win, true)
+        end
+        if pan.buf and api.nvim_buf_is_valid(pan.buf) then
+            pcall(api.nvim_buf_delete, pan.buf, { force = true })
+        end
+    end
+    if state.preview_panel and state.preview_panel.buf and api.nvim_buf_is_valid(state.preview_panel.buf) then
+        pcall(api.nvim_buf_delete, state.preview_panel.buf, { force = true })
+    end
+    for _, band in ipairs(state.header_bands or {}) do -- editable input bands' overlay windows
+        if band.input then
+            if band.win and api.nvim_win_is_valid(band.win) then
+                pcall(api.nvim_win_close, band.win, true)
+            end
+            if band.buf and api.nvim_buf_is_valid(band.buf) then
+                pcall(api.nvim_buf_delete, band.buf, { force = true })
+            end
+        end
+    end
+    if state.container_win and api.nvim_win_is_valid(state.container_win) then
+        pcall(api.nvim_win_close, state.container_win, true)
+    end
+    if state.backdrop_win and api.nvim_win_is_valid(state.backdrop_win) then
+        -- Defer the veil teardown one tick and expose it for ADOPTION, so a surface reopening in the SAME tick
+        -- (a screen switch) reuses THIS window — the veil never blinks off and no second one ever overlaps it
+        -- (no darken, no brighten). If nothing adopts it, the scheduled teardown closes it.
+        local rec = {
+            win = state.backdrop_win,
+            buf = state.backdrop_buf,
+            hl = state.backdrop_hl,
+            blend = state.backdrop_blend,
+            adopted = false,
+        }
+        pending_backdrop = rec
+        state.backdrop_win, state.backdrop_buf = nil, nil
+        vim.schedule(function()
+            if pending_backdrop == rec then
+                pending_backdrop = nil
+            end
+            if not rec.adopted then -- a reopen didn't take it → close it now
+                if active_backdrop and active_backdrop.state == state then
+                    active_backdrop = nil -- the live veil is gone; the focus autocmd goes idle
+                end
+                if rec.win and api.nvim_win_is_valid(rec.win) then
+                    pcall(api.nvim_win_close, rec.win, true)
+                end
+                if rec.buf and api.nvim_buf_is_valid(rec.buf) then
+                    pcall(api.nvim_buf_delete, rec.buf, { force = true })
+                end
+            end
+        end)
+    elseif active_backdrop and active_backdrop.state == state then
+        -- the veil was DROPPED (the editor was focused, so apply_backdrop_focus closed its window but KEPT the
+        -- buffer for a fast rebuild) → no window to hand off; release the tracker and free the kept buffer.
+        active_backdrop = nil
+        if state.backdrop_buf and api.nvim_buf_is_valid(state.backdrop_buf) then
+            pcall(api.nvim_buf_delete, state.backdrop_buf, { force = true })
+            state.backdrop_buf = nil
+        end
+    end
+    if state.base_cmdheight ~= nil then -- a `cmdline` surface grew cmdheight; restore the user's value
+        vim.o.cmdheight = state.base_cmdheight
+    end
+    if state.origin and api.nvim_win_is_valid(state.origin) then
+        pcall(api.nvim_set_current_win, state.origin)
+    end
+    cursor.update() -- the frame's hide-cursor buffers are gone → show the cursor in the editor again
+    if state._host_release then -- release our auto-hosted zone rows so it shrinks back (or closes)
+        pcall(state._host_release)
+    end
+    if area_current == state then -- this area dock is gone; the zone is free for the next
+        area_current = nil
+    end
+    if state.cfg.on_close then
+        pcall(state.cfg.on_close)
+    end
+end
+
+--- NATIVE split panel: a single block as a REAL split window (NOT a float over a container). For a
+--- persistent, navigable side tree (e.g. the lsp outline) this keeps the panel IN the native window
+--- layout, so `<C-w>h/j/k/l/w` moves in and out of it AND buffer changes redraw like any window (a float
+--- panel reflects neither reliably). 1 block only — the title is a centred winbar; there are no header/
+--- footer bars in this mode. The provider interface (render / update / keys / cursorline / filetype /
+--- on_close) is reused verbatim, only the WINDOW is real instead of a float.
+---@param state table
+local function open_native_split(state)
+    register_frame_ft()
+    local cfg = state.cfg
+    local pan = state.panels[1]
+    if not pan then
+        return
+    end
+    local dock = cfg.dock or "right"
+    local horiz = dock == "below" or dock == "above"
+
+    -- Size from the provider's natural size ⊕ the explicit cfg.width/height (fraction ≤1 or a count).
+    local sw, sh = 20, 1
+    if pan.provider and pan.provider.size then
+        local ok, w, h = pcall(pan.provider.size)
+        if ok then
+            sw, sh = w or sw, h or sh
+        end
+    end
+    local function dim(fixed, nat, total)
+        if not fixed then
+            return nat
+        end
+        return fixed <= 1 and math.floor(total * fixed) or math.floor(fixed)
+    end
+    local width = math.max(1, dim(cfg.width, sw, vim.o.columns))
+    local height = math.max(1, dim(cfg.height, sh, vim.o.lines))
+
+    pan.buf = api.nvim_create_buf(false, true)
+    vim.bo[pan.buf].bufhidden = "wipe"
+    -- The provider names its filetype (drives cursor hiding via the user's panel_ft + filetype detection);
+    -- else a hide_cursor provider gets FRAME_FT so the cursor module hides while it is current.
+    if pan.provider and pan.provider.filetype then
+        vim.bo[pan.buf].filetype = pan.provider.filetype
+    elseif pan.provider and pan.provider.hide_cursor then
+        vim.bo[pan.buf].filetype = FRAME_FT
+    end
+
+    pan.win = api.nvim_open_win(pan.buf, cfg.enter == true, {
+        split = dock,
+        win = -1, -- pin to the far edge of the tabpage
+        width = (not horiz) and width or nil,
+        height = horiz and height or nil,
+        style = "minimal",
+    })
+    if horiz then
+        vim.wo[pan.win].winfixheight = true
+    else
+        vim.wo[pan.win].winfixwidth = true
+    end
+    vim.wo[pan.win].wrap = false
+    if pan.provider and pan.provider.cursorline then
+        -- A native docked panel (the outline) uses the NEUTRAL cursorline, not the popup-list yellow.
+        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,CursorLine:LvimUiCursorLine"
+        vim.wo[pan.win].cursorline = true
+    else
+        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal"
+    end
+    -- Title → a centred winbar (the whole bar carries the blue peek-title tint).
+    local tt = title_text(cfg.title)
+    if tt ~= "" then
+        vim.wo[pan.win].winhighlight = vim.wo[pan.win].winhighlight
+            .. ",WinBar:LvimUiPeekTitle,WinBarNC:LvimUiPeekTitle"
+        vim.wo[pan.win].winbar = "%=" .. tt .. "%="
+    end
+
+    state._geom =
+        { panels = { { width = api.nvim_win_get_width(pan.win), height = api.nvim_win_get_height(pan.win) } } }
+    pan.refresh = function()
+        render_panel(state, 1)
+    end
+    pan.frame = state
+    render_panel(state, 1)
+
+    -- Focus / block accessors. Navigation is NATIVE (`<C-w>`) — no sectors, bars or chrome to drive.
+    state.center_panel = 1
+    state.focus_panel = function()
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            api.nvim_set_current_win(pan.win)
+            cursor.update()
+        end
+    end
+    state.focus_block = function()
+        state.focus_panel()
+    end
+    state.focus_sector = function()
+        state.focus_panel()
+    end
+    state.panel = function() end
+    state.sector = function() end
+    state.refresh_chrome = function() end
+    state.map_hotkeys = function() end
+    state.toggle_header = function()
+        return false
+    end
+    state.to_origin = function()
+        if state.origin and api.nvim_win_is_valid(state.origin) then
+            api.nvim_set_current_win(state.origin)
+        end
+    end
+
+    -- Keys: the provider's own keys + close_keys + consumer keymaps on the panel buffer. No sector/menu
+    -- nav keys — the panel is a real window, so `<C-w>` already moves in and out of it.
+    local function map(lhs, fn)
+        for _, l in ipairs(type(lhs) == "table" and lhs or { lhs }) do
+            vim.keymap.set("n", l, fn, { buffer = pan.buf, nowait = true, silent = true })
+        end
+    end
+    if pan.provider and pan.provider.keys then
+        pcall(pan.provider.keys, map, pan, state)
+    end
+    for _, ck in ipairs(cfg.close_keys or {}) do
+        map(ck, state.close)
+    end
+    for _, km in ipairs(cfg.keymaps or {}) do
+        map(km.key, function()
+            km.run(state)
+        end)
+    end
+
+    -- Tear down when the window closes; re-render content on resize (the window itself resizes natively).
+    state.augroup = api.nvim_create_augroup("LvimUiFrameNative_" .. pan.win, { clear = true })
+    api.nvim_create_autocmd("WinClosed", {
+        group = state.augroup,
+        pattern = tostring(pan.win),
+        callback = function()
+            state.close()
+        end,
+    })
+    api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+        group = state.augroup,
+        callback = function()
+            if not state._closed and pan.win and api.nvim_win_is_valid(pan.win) then
+                state._geom.panels[1] =
+                    { width = api.nvim_win_get_width(pan.win), height = api.nvim_win_get_height(pan.win) }
+                render_panel(state, 1)
+            end
+        end,
+    })
+end
+
+--- What a host provider binds a cmdline surface to: a reserve `host` function, a `release` teardown closure,
+--- and (optional) the `on_escape_below` action (descend from the dock into the zone's content below it).
+---@class lvim-ui.HostBinding
+---@field host fun(h: integer): table  reserve `h` rows in the host zone; returns the placement rect
+---@field release fun()                release the reserved rows (the zone shrinks back / closes)
+---@field on_escape_below? fun()       descend from the dock into the zone below (the C-j-off-bottom action)
+
+--- A host provider: given a surface `state` + its `cfg`, returns a HostBinding — or `nil` to skip hosting
+--- (the dock then grows cmdheight itself).
+---@alias lvim-ui.HostProvider fun(state: table, cfg: table): lvim-ui.HostBinding?
+
+-- The auto-host provider for a `position="cmdline"` surface. Registered by the msgarea zone (via
+-- M.set_host_provider) so the surface ENGINE never references the zone — the dependency is inverted, so
+-- ui has no coupling to msgarea. nil ⇒ no zone registered ⇒ a hostless cmdline dock grows cmdheight itself.
+---@type lvim-ui.HostProvider?
+local host_provider = nil
+
+--- Open a frame.
+---@param cfg table  the frame config (see the module header)
+---@return table state
+function M.open(cfg)
+    cfg = cfg or {}
+    -- `nvim_open_win` is forbidden in the command-line window (q: / q/ / q?), so a frame opened from there
+    -- (e.g. an installer prompt that fires while `q:` is open) would raise E11. Defer the whole open until
+    -- the cmdwin closes and return a no-op stub, so the caller never crashes on the missing handle.
+    if vim.fn.getcmdwintype() ~= "" then
+        vim.api.nvim_create_autocmd("CmdwinLeave", {
+            once = true,
+            callback = function()
+                vim.schedule(function()
+                    M.open(cfg)
+                end)
+            end,
+        })
+        return setmetatable({ deferred = true }, {
+            __index = function()
+                return function() end
+            end,
+        })
+    end
+    cfg.mode = cfg.mode or "float"
+    -- Shared title / counter placement: per-open override < `config` default < the hardcoded fallback.
+    -- `title_line` ("row" | "statusline" | "border") places the title: a CONTENT row at the top (the canon —
+    -- flush-left, counter flush-right), the chrome overlay (area minibuffer style), or the native border-title.
+    -- The hardcoded fallback is "row", NOT "border": the native border-title has visual quirks (nvim's 1-col
+    -- corner inset, and it vanishes when the container border is "none"), so it is opt-in only, never a default.
+    -- `counter` ("title" | "footer") places a supplied `count` beside the title or in the native border-footer.
+    local ui_conf = config or {}
+    cfg.title_line = cfg.title_line or ui_conf.title_line or "row"
+    cfg.counter = cfg.counter or ui_conf.counter or "footer"
+    -- Title ALIGNMENT (shared by the content-row title AND the native border-title): per-open override <
+    -- `config.title_pos` < "left". "left" | "center" | "right".
+    cfg.title_pos = cfg.title_pos or ui_conf.title_pos or "left"
+    -- Inter-panel divider: LEFT as the consumer passed it (nil = use the configurable default `config.separator`,
+    -- resolved live at render via `resolve_divider`; false / a string / a { h, v } table = a per-surface override).
+    -- It only ever draws between adjacent panels (n-1 gaps), so a single-panel surface (select / info / input /
+    -- tabs) shows none; a multi-panel one (a picker's list + preview) gets the rule between each pair.
+    -- Resolve the canonical frame border to the LIVE `config.border` (the SINGLE source) at open time: a
+    -- consumer that passed the `FRAME_BORDER` marker (or no border at all) is asking for "the one config-driven
+    -- ring", so a runtime change to that key reflects here on the next open of every consumer — without editing
+    -- any of them. An explicit "rounded" / "none" / custom border (e.g. a true float) is left untouched.
+    if cfg.border == nil or cfg.border == M.FRAME_BORDER then
+        cfg.border = ui_conf.border or M.FRAME_BORDER
+    end
+    -- Modal frames close on q / <Esc> from anywhere; a `persistent` frame (e.g. a docked outline) sets
+    -- its own close_keys (or none) and is never auto-closed.
+    if cfg.close_keys == nil and not cfg.persistent then
+        cfg.close_keys = { "q", "<Esc>" }
+    end
+
+    -- Sizing: `cfg.size = { width/height = { auto, min, max, fixed } }` → the per-axis fields the geometry
+    -- uses. `auto` fits the content (within max); else `fixed`; each a screen fraction ≤1 or an absolute
+    -- count. `height.min` = minimum VISIBLE content rows; `width.min` clamps the float width.
+    local size = cfg.size or {}
+    local sw, sh = size.width or {}, size.height or {}
+    cfg.auto_width, cfg.width, cfg.max_width, cfg.min_width = sw.auto, sw.fixed, sw.max, sw.min
+    cfg.auto_height, cfg.height, cfg.max_height, cfg.min_content_height = sh.auto, sh.fixed, sh.max, sh.min
+
+    -- content.blocks → panels: each block carries an `id`, a `provider`, its share along the STACKING axis
+    -- (`size.width.fixed` when horizontal / `size.height.fixed` when vertical = a weight; absent = flex/
+    -- auto), and an optional `border`.
+    local panels = {}
+    local stack_axis = cfg.direction == "vertical" and "height" or "width"
+    for i, blk in ipairs((cfg.content or {}).blocks or {}) do
+        local bw = (blk.size or {})[stack_axis] or {}
+        -- Resolve the CONTENT_BORDER marker to the LIVE `config.content_border` (the single source for the
+        -- content-PANEL ring) at open time, so changing that one key re-borders this block on the next open —
+        -- exactly like FRAME_BORDER does for the container. An explicit "none" / "rounded" / custom table is the
+        -- consumer's own choice and is left untouched (so the nav bars / borderless select lists stay borderless).
+        local blk_border = blk.border
+        if blk_border == M.CONTENT_BORDER then
+            blk_border = config.content_border or M.CONTENT_BORDER
+        end
+        panels[i] = {
+            id = blk.id,
+            provider = blk.provider,
+            size = blk.size,
+            weight = bw.fixed,
+            border = blk_border,
+            shrink_first = blk.shrink_first, -- give up rows before protected panels when the stack overflows
+        }
+    end
+
+    -- A FLOAT carries the brand as its border title (built in open_windows). A SPLIT has no border, so the
+    -- title becomes the top CONTENT row of the chrome instead (the icon + text, flattened).
+    -- The SURFACE owns the title-row air: when the title is a CONTENT row, IT adds the single air row below the
+    -- title (the `elseif` branch) and suppresses build_bands' own header air, so a consumer never has to manage
+    -- it and the result is exactly ONE blank row under the title — no matter what `header_air` the consumer set.
+    local row_title = cfg.mode ~= "split" and cfg.title_line == "row" and cfg.title and cfg.title ~= ""
+    -- (NB: `row_title and false or cfg.header_air` is the Lua ternary trap — `and false` always falls through to
+    -- the `or`; use an explicit guard so the row-title genuinely suppresses build_bands' own header air.)
+    local header_air = cfg.header_air
+    if row_title then
+        header_air = false
+    end
+    local hbands = build_bands(cfg.header, false, header_air)
+    if cfg.mode == "split" then
+        local t = cfg.title
+        -- UPPERCASE the title text (the canon), keep the icon glyph
+        local s
+        if type(t) == "table" then
+            s = (t.icon and t.icon .. " " or "") .. (t.text and tostring(t.text):upper() or "")
+        else
+            s = t and tostring(t):upper() or ""
+        end
+        if s ~= "" then
+            table.insert(hbands, 1, { meta = s, hl = "LvimUiPeekTitle" })
+        end
+    elseif row_title then
+        -- The title (+ counter) as the FIRST content rows — a `title_counter` band + air row, drawn from column
+        -- 0 (flush-left; the native border-title reserves a 1-col corner margin). build_border_title returns nil
+        -- for "row", so the title is NOT also on the border; `set_title`/`set_counter`/`set_header` re-render this
+        -- band. Built by row_title_bands so `set_header` (a tab switch) re-prepends the SAME title.
+        local tb = row_title_bands(cfg)
+        if tb then
+            for i = #tb, 1, -1 do
+                table.insert(hbands, 1, tb[i])
+            end
+        end
+    end
+
+    local state = {
+        cfg = cfg,
+        origin = api.nvim_get_current_win(),
+        panels = panels,
+        header_bands = hbands,
+        footer_bands = build_bands(cfg.footer, true),
+    }
+    state.close = function()
+        close(state)
+    end
+    -- (SINGLE AREA OCCUPANT) A cmdline dock that HOSTS in the zone (auto-host `host == nil`, or an explicit host
+    -- fn) is the ONE app the zone holds at a time: opening a new one EVICTS the previous (a picker gives way to a
+    -- shell, and back). EXCLUDE `host == false` — that is the msgarea zone's OWN surface, which merely GROWS
+    -- cmdheight for the zone and must never be treated as an occupant (evicting it would tear down the zone). The
+    -- picker also self-replaces finder→finder via its own registry; this is the cross-consumer safety net.
+    if cfg.position == "cmdline" and cfg.host ~= false then
+        if area_current and area_current ~= state and not area_current._closed and area_current.close then
+            pcall(area_current.close)
+        end
+        area_current = state
+    end
+    -- (AUTO-HOST area dock) A `position = "cmdline"` surface with NO explicit `host` auto-homes itself in the
+    -- msgarea zone when that zone is enabled: the ENGINE (not the consumer) creates the reserve segment, derives
+    -- the stacked-row count from `preview_side`, and wires the descend + reflow-follow. So a consumer only asks
+    -- for `position = "cmdline"` — the zone owns the HEIGHT (its `reserve` clamps to `max_height * rows`) and the
+    -- placement; nobody passes a host. A consumer that DOES pass its own `cfg.host` still wins (this fills the
+    -- gap only). Hosting must sit ABOVE the zone's own panels (~200), so force the container zindex to 210 — a
+    -- hostless `cmdline` dock left at a lower zindex renders BEHIND the zone (mis-placed, half-height). The
+    -- closures read state.reposition / state.focus_sector / state.preview_side LAZILY (assigned in open_windows,
+    -- below), so at the initial reserve they may be nil — the guarded calls simply no-op until they exist.
+    -- Ask the registered host provider (the msgarea zone) to home this cmdline dock in its zone. The provider
+    -- returns a `host` fn + a `release` closure (or nil to skip); the surface engine stays zone-agnostic.
+    -- Hosting must sit ABOVE the zone's own panels, so force zindex 210 when a host is supplied.
+    if cfg.position == "cmdline" and cfg.host == nil and host_provider then
+        local bind = host_provider(state, cfg)
+        if bind and bind.host then
+            cfg.zindex = 210
+            cfg.host = bind.host
+            state._host_release = bind.release
+            -- Descend into the zone below the dock (a consumer's explicit on_escape_below still wins).
+            if cfg.on_escape_below == nil then
+                cfg.on_escape_below = bind.on_escape_below
+            end
+        end
+    end
+    -- A `native` split is a REAL window (not a float over a container) — for a navigable persistent side
+    -- panel; everything else (modal float, docked-modal peek) uses the float chassis.
+    if cfg.mode == "split" and cfg.native then
+        open_native_split(state)
+    else
+        open_windows(state)
+    end
+    return state
+end
+
+--- Register the auto-host provider for `position="cmdline"` surfaces — called ONCE by the msgarea zone so
+--- the surface engine can home a cmdline dock in the zone without ever requiring it (inverted dependency).
+--- `fn(state, cfg)` returns `{ host, release }` — the `host` reserve function + a teardown closure — or nil
+--- to skip hosting (the dock then grows cmdheight on its own).
+---@param fn lvim-ui.HostProvider
+function M.set_host_provider(fn)
+    host_provider = fn
+end
+
+return M
