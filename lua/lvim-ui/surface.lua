@@ -123,16 +123,30 @@ local function set_backdrop_dim(state, on)
         end
         for _, w in ipairs(api.nvim_list_wins()) do
             if api.nvim_win_is_valid(w) then
-                local frame = vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT
-                if not frame and not state.dimmed_wins[w] then
+                local buf = api.nvim_win_get_buf(w)
+                local frame = vim.w[w].lvim_frame == true or vim.bo[buf].filetype == FRAME_FT
+                -- Also skip SPECIAL windows (buftype ~= "" — sidebars like neo-tree, plus terminals / help /
+                -- quickfix …): they paint via their own namespace/winhighlight with a DIFFERENT (often darker)
+                -- background, so the global "dim" would mute their fg toward the EDITOR bg and LIGHTEN them. Leave
+                -- them crisp and untouched, exactly like the surface's own frame windows.
+                local special = vim.bo[buf].buftype ~= ""
+                if not frame and not special and not state.dimmed_wins[w] then
+                    -- Remember the window's CURRENT namespace so we can restore it EXACTLY on close — a window
+                    -- may already be on its OWN namespace (e.g. neo-tree paints via a private ns), and blindly
+                    -- resetting it to 0 afterwards would clobber that (leaving it on the global ns). 0 is truthy
+                    -- in Lua, so it still trips the `not state.dimmed_wins[w]` guard above.
+                    local prev = 0
+                    pcall(function()
+                        prev = api.nvim_get_hl_ns({ winid = w })
+                    end)
+                    state.dimmed_wins[w] = (type(prev) == "number" and prev >= 0) and prev or 0
                     dim.set(w, ns)
-                    state.dimmed_wins[w] = true
                 end
             end
         end
     else
-        for w in pairs(state.dimmed_wins) do
-            dim.set(w, 0)
+        for w, prev in pairs(state.dimmed_wins) do
+            dim.set(w, prev) -- restore the window's ORIGINAL namespace (0, or its own like neo-tree's)
         end
         state.dimmed_wins = {}
         dim.suspend(false) -- let the colorscheme dim manager take the windows back
@@ -165,6 +179,30 @@ local function register_backdrop_focus()
         group = api.nvim_create_augroup("LvimUiBackdropFocus", { clear = true }),
         callback = apply_backdrop_focus,
     })
+end
+
+--- Rebuild the ACTIVE backdrop's namespace (dim OR darken) from the CURRENT global highlights, so the veiled
+--- windows behind an open surface track a LIVE theme change (e.g. the colorscheme picker preview) instead of
+--- freezing on the palette captured when the backdrop opened — the windows re-read the rebuilt namespace, so
+--- no re-apply is needed. No-op unless a backdrop is currently applied to real windows.
+---@return nil
+function M.refresh_backdrop()
+    local ab = active_backdrop
+    if not (ab and ab.state and ab.state.dimmed_wins and next(ab.state.dimmed_wins)) then
+        return
+    end
+    local st = ab.state
+    local dim = require("lvim-utils.dim")
+    if st.backdrop_mode == "darken" then
+        if backdrop_darken_ns then
+            dim.darken("#000000", st.backdrop_amount or 0.5, backdrop_darken_ns)
+        end
+    elseif backdrop_dim_ns then
+        -- "dim" mutes the foreground toward the editor bg — recompute it from the NEW theme's Normal.
+        local nb = api.nvim_get_hl(0, { name = "Normal" })
+        local bg = (nb and nb.bg) and string.format("#%06x", nb.bg) or st.backdrop_bg
+        dim.build(bg, st.backdrop_amount or 0.5, backdrop_dim_ns)
+    end
 end
 --- Register the frame filetype as a CURRENT-ONLY cursor-hide panel ft with the lvim-utils cursor module,
 --- once per session (idempotent via `cursor_registered`).
@@ -3356,12 +3394,16 @@ local function open_native_split(state)
         vim.wo[pan.win].winfixwidth = true
     end
     vim.wo[pan.win].wrap = false
+    -- The panel's Normal group: the float/peek bg (`LvimUiPeekNormal`) by default, or a caller-chosen group
+    -- via `cfg.normal_hl` — e.g. a persistent DOCKED side panel (the outline) passes "NormalSB" so it wears the
+    -- opaque SIDEBAR background (matching neo-tree) instead of the transparency-following float bg.
+    local normal_hl = cfg.normal_hl or "LvimUiPeekNormal"
     if pan.provider and pan.provider.cursorline then
         -- A native docked panel (the outline) uses the NEUTRAL cursorline, not the popup-list yellow.
-        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,CursorLine:LvimUiCursorLine"
+        vim.wo[pan.win].winhighlight = "Normal:" .. normal_hl .. ",CursorLine:LvimUiCursorLine"
         vim.wo[pan.win].cursorline = true
     else
-        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal"
+        vim.wo[pan.win].winhighlight = "Normal:" .. normal_hl
     end
     -- Title → a centred winbar (the whole bar carries the blue peek-title tint).
     local tt = title_text(cfg.title)
