@@ -18,7 +18,7 @@ local api = vim.api
 local M = {}
 
 --- Create a form provider.
----@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string }
+---@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string, pad?: integer, on_move?: fun(row: Row?), on_cursor?: fun() }
 ---       cursorline_hl: name a cursorline highlight group (e.g. a bg-only one) so the hover changes only the
 ---       background and a row's own fg highlights survive; default = the frame's yellow "list hover".
 ---@return table provider
@@ -42,6 +42,21 @@ function M.new(opts)
             return api.nvim_win_get_cursor(pan.win)[1]
         end
         return 1
+    end
+
+    --- A row is DISABLED when its `disabled` field is `true`, or a PREDICATE that returns true — evaluated LIVE
+    --- (so it tracks a parent toggle, e.g. relative line numbers being inert while "show line numbers" is off).
+    --- A disabled row renders dimmed + struck through and does not activate; its value is never changed.
+    ---@param row Row|nil
+    ---@return boolean
+    local function is_disabled(row)
+        local d = row and row.disabled
+        if type(d) == "function" then
+            ---@cast d fun(row: Row): boolean
+            local ok, res = pcall(d, row)
+            return ok and res == true
+        end
+        return d == true
     end
     local function move(delta)
         if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
@@ -152,8 +167,8 @@ function M.new(opts)
     ---@param st table
     local function activate(st)
         local row = flat()[cur_line()]
-        if not row then
-            return
+        if not row or is_disabled(row) then
+            return -- a disabled setting is inert: no toggle / cycle / edit / run
         end
         if row.type == "bar" then
             -- Run the keyboard-focused button (h/l / ←/→), or the active one if not navigated yet.
@@ -288,6 +303,11 @@ function M.new(opts)
                         local sep = (r.hl and type(r.hl.inactive) == "string") and r.hl.inactive or "LvimUiSeparator"
                         hls[#hls + 1] = { i - 1, 0, #lines[i], sep }
                     end
+                elseif is_disabled(r) then
+                    -- A DISABLED setting: dim (fg muted toward bg) + strike through the WHOLE row, with NO
+                    -- per-part colours — it reads as present but inert (its value is never changed).
+                    lines[i] = util.lpad(disp, width, opts.pad or 2)
+                    hls[#hls + 1] = { i - 1, 0, #lines[i], "LvimUiRowDisabled", 250 }
                 else
                     lines[i] = util.lpad(disp, width, opts.pad or 2)
                     -- Colour the leading type icon; the rest reads on the panel background.

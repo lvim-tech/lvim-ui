@@ -31,11 +31,16 @@ local M = {}
 ---@field suffix?       string
 ---@field expanded?     boolean
 ---@field flat?         boolean  -- drop the lead type icon / expand caret (the row carries its own `icon`)
+---@field tight?         boolean  -- a flat row: drop the 2-space lead entirely (content sits at the panel edge)
 ---@field children?     Row[]
 ---@field option_icons? table<string, string>
 ---@field bracket_key?  boolean
 ---@field center?       boolean   center the row text instead of left-padding
 ---@field dim_to?        integer   dim the first N bytes of the LABEL (e.g. a file row's path before the name)
+---@field disabled?      boolean|fun(row: Row): boolean  inert in the current context → dimmed + struck through, no activate
+---@field icon_hl?       string    action/accordion rows: highlight for the `icon` column
+---@field text_hl?       string    action/accordion rows: highlight for the label/value text
+---@field suffix_hl?     string    action/accordion rows: highlight for the trailing `suffix`
 ---@field items?         table[]   bar rows: the ui.bar button / separator specs
 ---@field align?         string    bar rows: "left" | "center" (default) | "right"
 ---@field _off?          integer   bar rows: persisted horizontal scroll offset (internal)

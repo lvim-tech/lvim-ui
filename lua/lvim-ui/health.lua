@@ -53,8 +53,13 @@ function M.check()
     local config = require("lvim-ui.config")
     info("popup filetype: " .. tostring(config.filetype))
     info("title placement: " .. tostring(config.title_line) .. " · counter: " .. tostring(config.counter))
-    if config.backdrop and config.backdrop.float and config.backdrop.float.enabled == false then
-        warn("float backdrop veil is disabled")
+    if config.backdrop and config.backdrop.float then
+        local bf = config.backdrop.float
+        if bf.enabled == false then
+            warn("float backdrop is disabled")
+        else
+            info("float backdrop: " .. tostring(bf.mode) .. " · amount " .. tostring(bf.amount))
+        end
     end
 end
 

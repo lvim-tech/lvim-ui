@@ -82,81 +82,66 @@ local cursor_registered = false
 --- one upvalue — not a stray global.
 ---@type table?
 local area_current = nil
---- A just-CLOSED backdrop veil awaiting its deferred teardown — kept here so a surface reopening in the SAME tick
---- (a screen switch: close then reopen) can ADOPT it instead of the veil blinking off + a new one fading in.
---- `{ win, buf, hl, blend, adopted }`; the scheduled teardown closes it unless a reopen set `adopted`.
----@type table?
-local pending_backdrop = nil
-
--- FOCUS-AWARE veil: a DOCKED surface (control center, msgarea dock, …) lets you focus OUT to the editor while it
--- STAYS open. Its full-editor backdrop must then stop covering the window you moved INTO — and a float left over
--- the editor's cursor cell renders the cursor as a stray UNDERLINE in some terminals (kitty) EVEN at winblend=100
--- (a transparent veil is not enough — the window must not EXIST over the editor). So we DROP (close) the veil
--- whenever a non-surface window is current and REBUILD it when a surface window is focused again. `active_backdrop
--- = { state, hl, blend, zindex }`; the live veil win/buf live on `state` (backdrop_win / backdrop_buf) so the
--- surface teardown remains their single owner. One WinEnter drives it.
+-- FOCUS-AWARE backdrop: a DOCKED surface (control center, msgarea dock, …) lets you focus OUT to the editor
+-- while it STAYS open. Its dim/darken of the editor must then LIFT off the window you moved INTO, and re-apply
+-- when a surface window is focused again. `active_backdrop = { state, mode }`; one WinEnter drives it.
 ---@type table?
 local active_backdrop = nil
 local backdrop_focus_registered = false
 
---- (Re)open the full-editor veil window over `state` — sets `state.backdrop_win` / `state.backdrop_buf`.
+--- The backdrop: mute (dim = fg, darken = fg+bg) every window that is NOT part of this surface
+--- (through the shared `lvim-utils.dim` namespace), or restore them (`on = false`). Adds NO covering window —
+--- so a terminal graphics image composited under the surface stays visible (a veil would hide it). Idempotent
+--- per window; only windows WE dimmed are restored.
 ---@param state table
----@param hl string
----@param blend integer
----@param zindex integer
-local function open_veil_win(state, hl, blend, zindex)
-    local ew, eh = math.max(1, vim.o.columns), math.max(1, vim.o.lines)
-    if not (state.backdrop_buf and api.nvim_buf_is_valid(state.backdrop_buf)) then
-        state.backdrop_buf = api.nvim_create_buf(false, true)
-        vim.bo[state.backdrop_buf].filetype = FRAME_FT -- managed UI (the cursor-hide list treats it as a frame)
+---@param on boolean
+local function set_backdrop_dim(state, on)
+    local dim = require("lvim-utils.dim")
+    state.dimmed_wins = state.dimmed_wins or {}
+    if on then
+        -- Tell a per-window dim MANAGER (lvim-colorscheme's dim_inactive/dark_active) to stand down while WE own
+        -- the backdrop — else the two fight over windows and only some get covered.
+        dim.suspend(true)
+        -- "darken" mutes fg+bg toward black (the veil look); "dim" mutes the FOREGROUND toward the editor bg.
+        -- Both via a highlight namespace (no covering window), so an image composited under the surface stays
+        -- visible — and both PRESERVE data-fg groups (lvim-image ids).
+        local ns = (state.backdrop_mode == "darken") and dim.darken("#000000", state.backdrop_amount or 0.5)
+            or dim.build(state.backdrop_bg or "#000000", state.backdrop_amount or 0.5)
+        for _, w in ipairs(api.nvim_list_wins()) do
+            if api.nvim_win_is_valid(w) then
+                local frame = vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT
+                if not frame and not state.dimmed_wins[w] then
+                    dim.set(w, ns)
+                    state.dimmed_wins[w] = true
+                end
+            end
+        end
+    else
+        for w in pairs(state.dimmed_wins) do
+            dim.set(w, 0)
+        end
+        state.dimmed_wins = {}
+        dim.suspend(false) -- let the colorscheme dim manager take the windows back
     end
-    state.backdrop_win = api.nvim_open_win(state.backdrop_buf, false, {
-        relative = "editor",
-        row = 0,
-        col = 0,
-        width = ew,
-        height = eh,
-        focusable = false,
-        style = "minimal",
-        zindex = zindex, -- behind the container (z) and its panels (z+1)
-        noautocmd = true, -- the veil never takes focus; skip the autocmd cascade so re-open on refocus is snappy
-    })
-    vim.w[state.backdrop_win].lvim_frame = true -- managed UI — "close every float" helpers skip it
-    -- EndOfBuffer too, so the blank rows below the (empty) buffer also paint the veil, not a hole.
-    vim.wo[state.backdrop_win].winhighlight = ("Normal:%s,NormalNC:%s,EndOfBuffer:%s"):format(hl, hl, hl)
-    vim.wo[state.backdrop_win].winblend = blend
 end
 
---- Keep the veil in step with focus: PRESENT over the editor while a surface frame window is focused, GONE
---- (closed, buffer deleted) while any non-surface window is current — so the editor you moved into is never
---- dimmed and its cursor is never covered (a lingering transparent float still underlines the cursor in kitty).
+--- Keep the backdrop in step with focus: dim/darken the editor while a surface frame window is focused, LIFT it
+--- off while any non-surface window is current — so the editor you moved into is never dimmed.
 local function apply_backdrop_focus()
     local ab = active_backdrop
     if not (ab and ab.state) then
         return
     end
-    local st = ab.state
     local cur = api.nvim_get_current_win()
     -- A window belongs to the surface if it carries the `lvim_frame` WINDOW marker (set on the container AND
     -- every panel) — test THAT, not the buffer filetype, because a consumer may REPLACE a panel buffer's
-    -- filetype: the fzf picker swaps a `lvim-picker-fzf` terminal into its panel, which read as "not a surface
-    -- window" under the old filetype check and wrongly dropped the veil (no backdrop behind any picker).
+    -- filetype: the fzf picker swaps a `lvim-picker-fzf` terminal into its panel, which would read as "not a
+    -- surface window" under a filetype check and wrongly lift the backdrop.
     local on_surface = api.nvim_win_is_valid(cur)
         and (vim.w[cur].lvim_frame == true or vim.bo[api.nvim_win_get_buf(cur)].filetype == FRAME_FT)
-    if on_surface then
-        if not (st.backdrop_win and api.nvim_win_is_valid(st.backdrop_win)) then
-            open_veil_win(st, ab.hl, ab.blend, ab.zindex)
-        end
-    else
-        if st.backdrop_win and api.nvim_win_is_valid(st.backdrop_win) then
-            pcall(api.nvim_win_close, st.backdrop_win, true)
-        end
-        st.backdrop_win = nil
-        -- KEEP st.backdrop_buf alive (hidden, no window) for a fast rebuild when a surface window is focused
-        -- again — a bufferless veil is invisible to the cursor-hide list; the surface teardown frees it.
-    end
+    set_backdrop_dim(ab.state, on_surface)
 end
---- One session-wide WinEnter that keeps the live veil (`active_backdrop`) in step with focus.
+--- One session-wide WinEnter that keeps the live backdrop (`active_backdrop`) in step with focus.
 local function register_backdrop_focus()
     if backdrop_focus_registered then
         return
@@ -2262,7 +2247,7 @@ end
 --- table, or `false` to force off) OVERRIDES the layout default in `config.backdrop`; absent → that default.
 --- Returns nil when no veil applies (disabled / off).
 ---@param cfg table
----@return { blend: integer, hl: string }?
+---@return { mode: string, amount: number, bg: string }?
 local function resolve_backdrop(cfg)
     local bd = cfg.backdrop
     if bd == nil then
@@ -2271,25 +2256,35 @@ local function resolve_backdrop(cfg)
     if not bd or bd.enabled == false then
         return nil
     end
-    -- Skip the veil on a TRANSPARENT editor: a `winblend` float has no solid bg to dim — nvim composites the
-    -- underlying `NONE` cells to hard BLACK, so the veil paints black blocks over the code instead of a smooth dim
-    -- (and transparency's whole point is to show the wallpaper, which a chrome veil can't cleanly darken anyway).
-    -- Detected from the LIVE `Normal` highlight (no bg = transparent) — the palette's own `transparent` flag lags.
+    -- Skip on a TRANSPARENT editor: with no solid `Normal` bg there is nothing to darken (and transparency's
+    -- point is to show the wallpaper). Detected from the LIVE `Normal` highlight (no bg = transparent) — the
+    -- palette's own `transparent` flag lags.
     local nb = vim.api.nvim_get_hl(0, { name = "Normal" })
     if not (nb and nb.bg) then
         return nil
     end
-    return { blend = bd.blend or 65, hl = bd.hl or "LvimUiBackdrop" }
+    -- The backdrop mutes the windows BEHIND the surface through a shared highlight namespace (lvim-utils.dim) —
+    -- NO covering window, so a terminal graphics image (kitty) composited under the surface stays visible.
+    --   • "darken" (default) — foreground + background toward black (a uniform darker look)
+    --   • "dim"              — foreground only (lighter)
+    -- Each mode carries its OWN `amount` sub-table (`bd.dim.amount` / `bd.darken.amount`); pick the LIVE mode's.
+    -- `bg` is the editor bg (the fg-mute target for "dim").
+    local mode = bd.mode == "dim" and "dim" or "darken"
+    local sub = (mode == "dim" and bd.dim or bd.darken) or {}
+    return {
+        mode = mode,
+        amount = sub.amount or 0.5,
+        bg = string.format("#%06x", nb.bg),
+    }
 end
 
---- Open the BACKDROP veil — a full-editor float BEHIND the surface (zindex below the container), unfocusable, its
---- Normal set to the veil colour + `winblend`, so the rest of the editor dims/darkens through it. No-op when no
---- veil applies. `area`/`bottom` docks (higher-z panels) still paint bright on top of it.
+--- Apply the BACKDROP: dim/darken the windows behind the surface (through lvim-utils.dim — no covering window,
+--- so an image composited under the surface stays visible). No-op when none applies; lifts/re-applies with
+--- focus via apply_backdrop_focus.
 ---@param state table
 local function open_backdrop(state)
     -- A float auto-stacked ABOVE another frame (a modal opened FROM the browser etc.) must NOT lay its own
-    -- full-editor veil — it would black out the very panel it sits on ("панела отдолу не се вижда"). We float
-    -- above the opener; the opener's own backdrop (if any) already dims the editor behind the whole stack.
+    -- backdrop — the opener's own backdrop already covers the editor behind the whole stack.
     if state.skip_backdrop then
         return
     end
@@ -2297,38 +2292,12 @@ local function open_backdrop(state)
     if not bd then
         return
     end
-    local ew, eh = math.max(1, vim.o.columns), math.max(1, vim.o.lines)
-    -- HANDOFF: a screen switch closes then reopens; if the just-closed veil has the SAME look and is still alive,
-    -- ADOPT its window (mark it adopted so its deferred teardown skips it) instead of a blink-off + fade-in.
-    if
-        pending_backdrop
-        and pending_backdrop.hl == bd.hl
-        and pending_backdrop.blend == bd.blend
-        and api.nvim_win_is_valid(pending_backdrop.win)
-    then
-        pending_backdrop.adopted = true
-        state.backdrop_win, state.backdrop_buf = pending_backdrop.win, pending_backdrop.buf
-        state.backdrop_hl, state.backdrop_blend = bd.hl, bd.blend
-        pcall(api.nvim_win_set_config, state.backdrop_win, {
-            relative = "editor",
-            row = 0,
-            col = 0,
-            width = ew,
-            height = eh,
-            zindex = state.zindex - 1,
-        })
-        pending_backdrop = nil
-        active_backdrop = { state = state, hl = bd.hl, blend = bd.blend, zindex = state.zindex - 1 }
-        register_backdrop_focus()
-        apply_backdrop_focus() -- keeps the adopted veil iff a surface window is current, else drops it
-        return
-    end
-    state.backdrop_hl, state.backdrop_blend = bd.hl, bd.blend -- remembered for the handoff match on the next open
-    -- The veil is built LAZILY by apply_backdrop_focus once a surface window is current — at THIS point the editor
-    -- is still current (panels are focused after open_backdrop), so building it here then would only get it dropped.
-    active_backdrop = { state = state, hl = bd.hl, blend = bd.blend, zindex = state.zindex - 1 }
+    state.backdrop_bg, state.backdrop_amount, state.backdrop_mode = bd.bg, bd.amount, bd.mode
+    -- Applied LAZILY by apply_backdrop_focus once a surface window is current — at THIS point the editor is
+    -- still current (panels are focused after open_backdrop), so applying it here would only get it lifted.
+    active_backdrop = { state = state, mode = bd.mode }
     register_backdrop_focus()
-    apply_backdrop_focus() -- builds the veil now iff a surface window is already current, else waits for one
+    apply_backdrop_focus() -- applies the backdrop now iff a surface window is already current
 end
 
 --- Build the container + the N panel windows from a computed layout.
@@ -3289,43 +3258,14 @@ local function close(state)
     if state.container_win and api.nvim_win_is_valid(state.container_win) then
         pcall(api.nvim_win_close, state.container_win, true)
     end
-    if state.backdrop_win and api.nvim_win_is_valid(state.backdrop_win) then
-        -- Defer the veil teardown one tick and expose it for ADOPTION, so a surface reopening in the SAME tick
-        -- (a screen switch) reuses THIS window — the veil never blinks off and no second one ever overlaps it
-        -- (no darken, no brighten). If nothing adopts it, the scheduled teardown closes it.
-        local rec = {
-            win = state.backdrop_win,
-            buf = state.backdrop_buf,
-            hl = state.backdrop_hl,
-            blend = state.backdrop_blend,
-            adopted = false,
-        }
-        pending_backdrop = rec
-        state.backdrop_win, state.backdrop_buf = nil, nil
-        vim.schedule(function()
-            if pending_backdrop == rec then
-                pending_backdrop = nil
-            end
-            if not rec.adopted then -- a reopen didn't take it → close it now
-                if active_backdrop and active_backdrop.state == state then
-                    active_backdrop = nil -- the live veil is gone; the focus autocmd goes idle
-                end
-                if rec.win and api.nvim_win_is_valid(rec.win) then
-                    pcall(api.nvim_win_close, rec.win, true)
-                end
-                if rec.buf and api.nvim_buf_is_valid(rec.buf) then
-                    pcall(api.nvim_buf_delete, rec.buf, { force = true })
-                end
-            end
-        end)
-    elseif active_backdrop and active_backdrop.state == state then
-        -- the veil was DROPPED (the editor was focused, so apply_backdrop_focus closed its window but KEPT the
-        -- buffer for a fast rebuild) → no window to hand off; release the tracker and free the kept buffer.
+    -- Backdrop: restore any windows we dim/darkened (which also resumes the colorscheme dim manager) and release
+    -- the focus tracker. When the backdrop was already lifted (focus had moved to the editor), dimmed_wins is
+    -- empty and only the tracker needs clearing.
+    if state.dimmed_wins and next(state.dimmed_wins) then
+        set_backdrop_dim(state, false)
+    end
+    if active_backdrop and active_backdrop.state == state then
         active_backdrop = nil
-        if state.backdrop_buf and api.nvim_buf_is_valid(state.backdrop_buf) then
-            pcall(api.nvim_buf_delete, state.backdrop_buf, { force = true })
-            state.backdrop_buf = nil
-        end
     end
     if state.base_cmdheight ~= nil then -- a `cmdline` surface grew cmdheight; restore the user's value
         vim.o.cmdheight = state.base_cmdheight

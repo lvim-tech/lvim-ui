@@ -14,7 +14,7 @@
 ---@field separator_hl       string               Highlight group for the inter-panel divider
 ---@field chevrons           table                Overflow-chevron glyphs ({ left, right }) a bar shows when its buttons don't all fit
 ---@field size               table                Shared surface geometry per layout (float / area / bottom + auto_max)
----@field backdrop           table                Per-layout dim/darken veil behind an open surface ({ float, area, bottom } each { enabled, blend, hl })
+---@field backdrop           table                Per-layout backdrop behind an open surface ({ float, area, bottom } each { enabled, mode, dim = { amount }, darken = { amount } })
 ---@field disable_completion boolean              Disable all completion sources (native, nvim-cmp, blink.cmp) for input popups
 ---@field position           string               Popup anchor ("editor")
 ---@field width              number               Default popup width (fraction of the editor)
@@ -102,20 +102,25 @@ return {
         area = { height = 0.5, height_auto = false, auto_hide = false, keep_focus = true },
         bottom = { height = 0.4, height_auto = false, auto_hide = false, keep_focus = true },
     },
-    -- The BACKDROP veil — a full-editor float drawn BEHIND an open surface so the rest of the editor dims, marking
-    -- the surface as the focus. PER LAYOUT (3 independent settings), so each can dim differently (or not at all):
-    --   enabled — false → no veil for that layout.
-    --   hl      — the veil colour = the DARKEN amount: a dark bg group (LvimUiBackdrop, self-themed from the
-    --             palette) darkens; a lighter/tinted group gives a softer haze.
-    --   blend   — winblend 0–100 = the DIM amount: how much the editor SHOWS THROUGH. Low (30) → strong, near-
-    --             opaque darken; high (75) → a light, smoky dim. So `hl` + `blend` together dial darken↔dim.
-    -- A consumer may override its layout's veil per-open via `surface.open({ backdrop = { … } | false })`; absent →
-    -- these defaults. The veil never takes focus and is torn down with the surface. `area`/`bottom` docks dim the
-    -- editor ABOVE the dock (the dock stays bright on top).
+    -- The BACKDROP — mutes the windows BEHIND an open surface (via a shared highlight namespace, lvim-utils.dim)
+    -- so the surface reads as the focus, WITHOUT a covering window (which would hide a terminal image beneath).
+    -- PER LAYOUT (3 independent settings), so each can differ (or be off):
+    --   enabled — false → no backdrop for that layout.
+    --   mode    — which look is LIVE: "darken" (foreground + background toward black, a uniform darker look) or
+    --             "dim" (foreground only, lighter).
+    --   dim / darken — each carries its OWN `amount` (mute fraction 0..1, higher = stronger), tuned separately;
+    --                  `mode` selects which one applies.
+    -- A consumer may override its layout's backdrop per-open via `surface.open({ backdrop = { … } | false })`;
+    -- absent → these defaults. It is lifted while the editor is focused and torn down with the surface.
+    -- The backdrop mutes the windows BEHIND a surface through a shared highlight namespace (lvim-utils.dim) — no
+    -- covering window, so a terminal-composited image (kitty) under the surface stays VISIBLE. `mode` picks which
+    -- of the two looks is live: "darken" (fg+bg toward black — a uniform darker look) or "dim" (foreground only,
+    -- lighter). BOTH carry their OWN `amount` (mute fraction 0..1, higher = stronger), so each is tuned
+    -- independently and switching `mode` uses that mode's amount.
     backdrop = {
-        float = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
-        area = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
-        bottom = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
+        float = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
+        area = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
+        bottom = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
     },
     -- Disable all completion sources (native, nvim-cmp, blink.cmp) for input popups
     disable_completion = true,
