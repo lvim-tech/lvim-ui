@@ -88,6 +88,13 @@ local area_current = nil
 ---@type table?
 local active_backdrop = nil
 local backdrop_focus_registered = false
+-- The backdrop's OWN dim/darken namespaces — SEPARATE from lvim-colorscheme's focus-follow default namespaces,
+-- so the backdrop's amount and the focus dim_inactive amount never overwrite each other (they build the same
+-- shared `lvim-utils.dim` module but into DIFFERENT namespaces). Created lazily, once per session.
+---@type integer?
+local backdrop_dim_ns = nil
+---@type integer?
+local backdrop_darken_ns = nil
 
 --- The backdrop: mute (dim = fg, darken = fg+bg) every window that is NOT part of this surface
 --- (through the shared `lvim-utils.dim` namespace), or restore them (`on = false`). Adds NO covering window —
@@ -104,9 +111,16 @@ local function set_backdrop_dim(state, on)
         dim.suspend(true)
         -- "darken" mutes fg+bg toward black (the veil look); "dim" mutes the FOREGROUND toward the editor bg.
         -- Both via a highlight namespace (no covering window), so an image composited under the surface stays
-        -- visible — and both PRESERVE data-fg groups (lvim-image ids).
-        local ns = (state.backdrop_mode == "darken") and dim.darken("#000000", state.backdrop_amount or 0.5)
-            or dim.build(state.backdrop_bg or "#000000", state.backdrop_amount or 0.5)
+        -- visible — and both PRESERVE data-fg groups (lvim-image ids). Build into the backdrop's OWN namespace
+        -- (never the focus-follow default) so its amount can't clobber lvim-colorscheme's dim_inactive amount.
+        local ns
+        if state.backdrop_mode == "darken" then
+            backdrop_darken_ns = backdrop_darken_ns or api.nvim_create_namespace("lvim_ui_backdrop_darken")
+            ns = dim.darken("#000000", state.backdrop_amount or 0.5, backdrop_darken_ns)
+        else
+            backdrop_dim_ns = backdrop_dim_ns or api.nvim_create_namespace("lvim_ui_backdrop_dim")
+            ns = dim.build(state.backdrop_bg or "#000000", state.backdrop_amount or 0.5, backdrop_dim_ns)
+        end
         for _, w in ipairs(api.nvim_list_wins()) do
             if api.nvim_win_is_valid(w) then
                 local frame = vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT

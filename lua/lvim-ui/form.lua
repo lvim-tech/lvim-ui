@@ -360,7 +360,9 @@ function M.new(opts)
         keys = function(map, p, st)
             pan = p
             local fr = flat()
-            local first = rows.first_selectable(fr) or 1
+            -- Honour an `initial_row` hint (a row `name` or 1-based index) so a caller can open
+            -- FOCUSED on a specific row (e.g. jump-to-setting); falls back to the first selectable.
+            local first = rows.resolve_initial_row(fr, opts.initial_row)
             vim.schedule(function()
                 if p.win and api.nvim_win_is_valid(p.win) then
                     pcall(api.nvim_win_set_cursor, p.win, { first, 0 })

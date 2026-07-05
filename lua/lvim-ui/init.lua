@@ -59,6 +59,7 @@ end
 ---@field position? string           -- "cursor" (anchor at the cursor) | "win" | "bottom" | "top" | nil (centred)
 ---@field layout? string             -- tabs: "float" (default centred) | "area" (cmdline/minibuffer dock) | "bottom"
 ---@field tab_selector? integer|string -- tabs: initial active tab — an index or a tab `name`
+---@field initial_row? integer|string  -- tabs/form: focus this row on open — a row `name` or 1-based index (jump-to)
 ---@field title_count? fun(): integer|table  -- tabs: a live count for the chassis border counter — a total `number` or `{ current, total }` (placed per `counter`; default the bottom-right border-footer)
 ---@field title_line? string         -- title placement: "row" (a top content row, default) | "statusline" (publish to the chrome overlay) | "border" (opt-in native border-title)
 ---@field title_pos? string           -- title alignment: "left" (default) | "center" | "right"
@@ -680,6 +681,8 @@ function M.tabs(opts)
     local update_footer -- forward decl: rebuild the live key-hint footer (assigned once footer_hints_spec exists)
     local form_p = form.new({
         rows = content1,
+        -- Focus a specific row on open (jump-to): a row `name` or index in the initially-active tab.
+        initial_row = opts.initial_row,
         on_change = opts.on_change,
         cursorline_hl = opts.cursorline_hl,
         pad = opts.pad, -- body content lpad (default 2); a compact picker can drop it (e.g. 0)
