@@ -29,8 +29,20 @@ function M.new(opts)
     local pan
 
     -- The visible rows (tree flattened, collapsed children hidden). The window line N maps to flat[N].
+    -- Memoized: `flat()` is called ≥2× per keystroke (move / bar_nav / cycle / activate / render / CursorMoved
+    -- / hints / cursor_name), and re-flattening the whole tree each time is pure waste. Only the SET (set_rows)
+    -- and an accordion's EXPAND/COLLAPSE change the flattening — value edits do not — so we rebuild only when
+    -- `invalidate_flat()` is called at those two seams.
+    ---@type Row[]?
+    local flat_cache
     local function flat()
-        return rows.flatten(model, false)
+        if not flat_cache then
+            flat_cache = rows.flatten(model, false)
+        end
+        return flat_cache
+    end
+    local function invalidate_flat()
+        flat_cache = nil
     end
     local function refresh()
         if pan and pan.refresh then
@@ -190,6 +202,7 @@ function M.new(opts)
         local t = row.type
         if row.children then
             row.expanded = not row.expanded
+            invalidate_flat()
             refresh()
         elseif t == "bool" or t == "boolean" then
             row.value = not row.value
@@ -485,6 +498,7 @@ function M.new(opts)
         ---@param new_rows Row[]
         set_rows = function(new_rows)
             model = new_rows
+            invalidate_flat()
             refresh()
             if pan and pan.win and api.nvim_win_is_valid(pan.win) then
                 pcall(api.nvim_win_set_cursor, pan.win, { rows.first_selectable(flat()) or 1, 0 })
@@ -524,6 +538,7 @@ function M.new(opts)
                 return false
             end
             if expand_to(model) then
+                invalidate_flat()
                 refresh()
             end
             for i, r in ipairs(flat()) do

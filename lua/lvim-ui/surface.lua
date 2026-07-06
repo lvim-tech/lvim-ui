@@ -3476,13 +3476,32 @@ local function open_native_split(state)
             state.close()
         end,
     })
-    api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+    local function refit_native()
+        state._geom.panels[1] = { width = api.nvim_win_get_width(pan.win), height = api.nvim_win_get_height(pan.win) }
+        render_panel(state, 1)
+    end
+    -- WinResized fires session-wide for EVERY resized window; only re-render when OUR split was one of them
+    -- (mirror the float path's `vim.v.event.windows` filter) so an unrelated split drag never re-renders us.
+    api.nvim_create_autocmd("WinResized", {
+        group = state.augroup,
+        callback = function()
+            if state._closed or not (pan.win and api.nvim_win_is_valid(pan.win)) then
+                return
+            end
+            for _, w in ipairs(vim.v.event.windows or {}) do
+                if w == pan.win then
+                    refit_native()
+                    return
+                end
+            end
+        end,
+    })
+    -- A terminal-size change (VimResized) always reflows — every window is affected.
+    api.nvim_create_autocmd("VimResized", {
         group = state.augroup,
         callback = function()
             if not state._closed and pan.win and api.nvim_win_is_valid(pan.win) then
-                state._geom.panels[1] =
-                    { width = api.nvim_win_get_width(pan.win), height = api.nvim_win_get_height(pan.win) }
-                render_panel(state, 1)
+                refit_native()
             end
         end,
     })
@@ -3511,6 +3530,30 @@ local host_provider = nil
 ---@type { handoff?: fun(fn: fun()) }|nil
 local zone_hooks = nil
 
+-- The public METHOD names a `state` handle exposes (every `state.<name> = function` below). Used by the
+-- cmdwin-deferred stub so it can answer a method call with a no-op while leaving DATA fields nil.
+---@type table<string, true>
+local DEFERRED_METHODS = {
+    close = true,
+    focus_block = true,
+    focus_panel = true,
+    focus_sector = true,
+    map_hotkeys = true,
+    panel = true,
+    refresh_chrome = true,
+    relayout = true,
+    reposition = true,
+    rotate_preview = true,
+    sector = true,
+    set_counter = true,
+    set_footer = true,
+    set_header = true,
+    set_title = true,
+    toggle_header = true,
+    toggle_preview = true,
+    to_origin = true,
+}
+
 --- Open a frame.
 ---@param cfg table  the frame config (see the module header)
 ---@return table state
@@ -3528,9 +3571,12 @@ function M.open(cfg)
                 end)
             end,
         })
+        -- Stub only the STATE METHODS as no-ops; every other key (data fields like `cfg` / `keys` / `panels` /
+        -- `sectors`) reads nil, not a function — a caller reading a data field off the deferred handle must not
+        -- get a function back (it would then be indexed/called as a table and crash).
         return setmetatable({ deferred = true }, {
-            __index = function()
-                return function() end
+            __index = function(_, k)
+                return DEFERRED_METHODS[k] and function() end or nil
             end,
         })
     end

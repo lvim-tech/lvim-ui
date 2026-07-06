@@ -25,7 +25,14 @@ function M.resolve_hl(val)
     if type(val) ~= "table" then
         return nil
     end
-    local key = vim.inspect(val)
+    -- A flat, order-stable key from the def's own fields — cheaper than `vim.inspect` (no pretty-printer)
+    -- on this hot path, and still collision-free (every field is folded in, sorted so key order is stable).
+    local parts = {}
+    for k, v in pairs(val) do
+        parts[#parts + 1] = tostring(k) .. "=" .. tostring(v)
+    end
+    table.sort(parts)
+    local key = table.concat(parts, ",")
     if not _hl_cache[key] then
         _hl_count = _hl_count + 1
         local name = "LvimUiInline_" .. _hl_count
@@ -71,8 +78,15 @@ function M.truncate(s, width)
     if budget <= 0 then
         return M.dw(ell) <= width and ell or ""
     end
+    -- Walk the UTF-8 codepoint boundaries natively (one pass, no `vim.fn.split` regex + no per-char VimL
+    -- round-trip): `str_utf_pos` gives the 1-based byte offset of every codepoint start; slice each and
+    -- accumulate display width until the budget is spent.
     local out, w = {}, 0
-    for _, ch in ipairs(vim.fn.split(s, "\\zs")) do
+    local starts = vim.str_utf_pos(s)
+    for i = 1, #starts do
+        local a = starts[i]
+        local b = starts[i + 1] and (starts[i + 1] - 1) or #s
+        local ch = s:sub(a, b)
         local cw = M.dw(ch)
         if w + cw > budget then
             break

@@ -262,8 +262,11 @@ function M.select(opts)
                     hls[#hls + 1] = { i - 1, 2, 2 + #icon, "LvimUiItemIconInactive" }
                 end
                 if suffix ~= "" then
-                    local scol = 2 + #base -- +2 for lpad's lead; #base is byte length (matches the icon offsets)
-                    hls[#hls + 1] = { i - 1, scol, scol + #suffix, "Comment" }
+                    -- +2 for lpad's lead; #base is byte length (matches the icon offsets). Clamp the span to the
+                    -- ACTUAL rendered line so a clipped row (lpad truncated it) never points the extmark past its
+                    -- end (the window is sized to fit the suffix, so this only bites a forced-narrow width).
+                    local scol = math.min(2 + #base, #lines[i])
+                    hls[#hls + 1] = { i - 1, scol, math.min(scol + #suffix, #lines[i]), "Comment" }
                 end
             end
             return lines, hls
@@ -348,7 +351,7 @@ function M.multiselect(opts)
     local confirmed = false
     local selected = {}
     local pan
-    local ico = util.cfg().icons or rows.icons()
+    local ico = util.cfg().icons or {}
 
     local function index()
         if pan and pan.win and vim.api.nvim_win_is_valid(pan.win) then
@@ -1051,6 +1054,14 @@ function M.tabs(opts)
         valid = function()
             local w = panel_win()
             return w ~= nil and vim.api.nvim_win_is_valid(w)
+        end,
+        --- Close the panel programmatically (full frame teardown — fires the close `callback`),
+        --- as if the user pressed the close key. Lets a host tear the panel down on its own events.
+        ---@return nil
+        close = function()
+            if st and st.close then
+                st.close()
+            end
         end,
         --- Re-paint the active tab's rows in place (after the consumer mutated row values).
         render = function()
