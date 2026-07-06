@@ -124,7 +124,7 @@ local NAV = {
 ---@param filename string
 ---@return string
 local function file_icon(filename)
-    local icon = iconlib.get(filename, { provider = config.icon_provider }).glyph
+    local icon = iconlib.get(filename, { provider = config.icon_provider, color_mode = config.icon_color_mode }).glyph
     if icon and icon ~= "" then
         return icon
     end
