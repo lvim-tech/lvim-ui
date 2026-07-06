@@ -2340,6 +2340,15 @@ local function open_backdrop(state)
     if state.skip_backdrop then
         return
     end
+    -- A backdrop is ALREADY active for another open surface (two coexisting docks: area + bottom, each with an
+    -- EXPLICIT zindex — the auto-zindex skip above never covers them). Do NOT install a second backdrop: it
+    -- would clobber the single `active_backdrop` tracker, so when THIS surface closes the tracker is nil'd and
+    -- the FIRST surface's dimmed windows are orphaned (stuck lifted/applied). The existing backdrop already
+    -- veils the editor behind both. Mirrors the auto-zindex "stacked above a frame ⇒ skip our own backdrop".
+    if active_backdrop and active_backdrop.state and active_backdrop.state ~= state then
+        state.skip_backdrop = true
+        return
+    end
     local bd = resolve_backdrop(state.cfg)
     if not bd then
         return
