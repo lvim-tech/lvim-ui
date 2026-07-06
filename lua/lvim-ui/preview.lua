@@ -14,6 +14,8 @@
 ---@module "lvim-ui.preview"
 
 local api = vim.api
+local config = require("lvim-ui.config")
+local iconlib = require("lvim-utils.icons")
 
 local M = {}
 
@@ -117,21 +119,14 @@ local NAV = {
     { "<C-k>", "sector", -1 },
 }
 
---- A filetype icon for `filename` from nvim-web-devicons when installed (colour discarded — the winbar
---- paints it), else a generic document glyph.
+--- A filetype icon for `filename` from the configured icon_provider (colour discarded — the winbar
+--- paints it), resolved through lvim-utils.icons; empty string when the provider yields nothing.
 ---@param filename string
 ---@return string
 local function file_icon(filename)
-    local ok, devicons = pcall(require, "nvim-web-devicons")
-    if ok then
-        local icon = devicons.get_icon(
-            vim.fn.fnamemodify(filename, ":t"),
-            vim.fn.fnamemodify(filename, ":e"),
-            { default = true }
-        )
-        if icon and icon ~= "" then
-            return icon
-        end
+    local icon = iconlib.get(filename, { provider = config.icon_provider }).glyph
+    if icon and icon ~= "" then
+        return icon
     end
     return ""
 end

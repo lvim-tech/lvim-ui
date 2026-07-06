@@ -25,6 +25,7 @@
 ---@field filetype           string               Filetype set on the popup buffer
 ---@field close_keys         string[]             Keys that close the popup
 ---@field markview           boolean              Enable markview rendering in the popup
+---@field icon_provider       string               File-icon provider for previews: "auto"|"lvim"|"devicons"|"mini" (via lvim-utils.icons)
 ---@field title_line         string               Where a frame's title goes: "row" | "border" | "statusline"
 ---@field counter            string               Where a supplied count renders: "title" | "footer"
 ---@field title_pos          string               Title alignment: "left" | "center" | "right"
@@ -133,6 +134,9 @@ return {
     filetype = "lvim-utils-ui",
     close_keys = { "q", "<Esc>" },
     markview = false,
+    -- Which icon plugin supplies the preview winbar file icon (resolved through lvim-utils.icons):
+    -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icon.
+    icon_provider = "auto",
 
     -- Shared chassis title/counter placement (a single `surface.open` may override either per-open):
     --   title_line — where a frame's TITLE goes: "row" (default — a CONTENT row at the top, drawn from column
