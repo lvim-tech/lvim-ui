@@ -563,7 +563,17 @@ end
 ---@param opts UiOpts
 function M.tabs(opts)
     opts = opts or {}
-    local tabset = vim.deepcopy(opts.tabs or {})
+    -- Share ROWS-based tabs by REFERENCE so a consumer that mutates `tab.rows` LIVE (the installer's refresh:
+    -- rebuild `state.tabs[i].rows`, then `handle.recalc()`; and the row spinners, which mutate a row in place)
+    -- is seen by split()/recalc() — they read `tabset[ti].rows`. Only ITEMS-based tabs are DEEP-COPIED: their
+    -- one-shot items→rows conversion writes `t.menu`/`t.rows` back, which on a REUSED spec (a theme picker
+    -- reopened) would leave a stale "(current)" — the per-open copy keeps that conversion isolated. (A blanket
+    -- deepcopy of ALL tabs silently broke the live-mutation contract: the handle rendered its own copy and
+    -- never saw a consumer's row updates → install/update/delete "did nothing" and the spinner never animated.)
+    local tabset = {}
+    for i, t in ipairs(opts.tabs or {}) do
+        tabset[i] = (t.items and not t.rows) and vim.deepcopy(t) or t
+    end
     if #tabset == 0 then
         return
     end

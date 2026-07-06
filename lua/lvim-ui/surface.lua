@@ -3331,8 +3331,25 @@ local function close(state)
     if state.base_cmdheight ~= nil then -- a `cmdline` surface grew cmdheight; restore the user's value
         vim.o.cmdheight = state.base_cmdheight
     end
+    -- Restore focus to the window this surface opened from — but ONLY when WE currently hold focus. A surface
+    -- closing in the BACKGROUND (e.g. the msgarea zone auto-hiding, or any dock torn down while the user has
+    -- moved on to ANOTHER float) must not yank focus to its own origin: that would steal it from whatever is
+    -- focused now (reported: opening the installer stole its focus back to the editor via the msgarea zone's
+    -- close). If focus is already elsewhere, leave it.
     if state.origin and api.nvim_win_is_valid(state.origin) then
-        pcall(api.nvim_set_current_win, state.origin)
+        local cur = api.nvim_get_current_win()
+        local we_hold_focus = cur == state.container_win
+        if not we_hold_focus and state.panels then
+            for _, p in ipairs(state.panels) do
+                if p.win == cur then
+                    we_hold_focus = true
+                    break
+                end
+            end
+        end
+        if we_hold_focus then
+            pcall(api.nvim_set_current_win, state.origin)
+        end
     end
     cursor.update() -- the frame's hide-cursor buffers are gone → show the cursor in the editor again
     if state._host_release then -- release our auto-hosted zone rows so it shrinks back (or closes)
