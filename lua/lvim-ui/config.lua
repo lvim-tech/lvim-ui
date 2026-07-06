@@ -1,5 +1,7 @@
--- lvim-ui.config: the live config for the lvim-ui windowed-UI chassis — frame borders, surface geometry
--- per layout, the popup icons / labels / keys, the tint strengths, and the two-pane peek navigator. These are
+-- lvim-ui.config: the live config for the lvim-ui windowed-UI chassis — frame borders, the popup icons /
+-- labels / keys, the tint strengths, and the two-pane peek navigator. (Surface GEOMETRY + BACKDROP per layout
+-- are NOT here — they live in the single central authority `lvim-utils.config.dock.geometry`, read at open time
+-- via `lvim-ui.surface.size_spec(layout)` and `lvim-utils.dock.slot(layout)`.) These are
 -- THE single sources of truth read live at open time by every consumer (pickers, ui.tabs, lvim-lsp peeks, …),
 -- so changing one key here re-frames them all on the next open. `setup()` merges the user's `ui = {…}` into
 -- this table in place (via lvim-utils.utils.merge); readers `require("lvim-ui.config")`.
@@ -13,15 +15,9 @@
 ---@field group_border       string[]             Common ring around the data panels as a group (8-element; false to disable)
 ---@field separator_hl       string               Highlight group for the inter-panel divider
 ---@field chevrons           table                Overflow-chevron glyphs ({ left, right }) a bar shows when its buttons don't all fit
----@field size               table                Shared surface geometry per layout (float / area / bottom + auto_max)
----@field backdrop           table                Per-layout backdrop behind an open surface ({ float, area, bottom } each { enabled, mode, dim = { amount }, darken = { amount } })
 ---@field disable_completion boolean              Disable all completion sources (native, nvim-cmp, blink.cmp) for input popups
 ---@field position           string               Popup anchor ("editor")
----@field width              number               Default popup width (fraction of the editor)
----@field max_width          number               Maximum popup width (fraction)
----@field height             number               Default popup height (fraction)
----@field max_height         number               Maximum popup height (fraction)
----@field max_items          integer              Maximum list rows shown before scrolling
+---@field max_items          integer              Maximum list rows shown before scrolling (content-fit list cap)
 ---@field filetype           string               Filetype set on the popup buffer
 ---@field close_keys         string[]             Keys that close the popup
 ---@field markview           boolean              Enable markview rendering in the popup
@@ -78,59 +74,16 @@ return {
     -- SAME glyphs; each consumer keeps its own chevron COLOUR (its own highlight group). Consumers pair the glyphs
     -- with their colour via `surface.chevrons(hl)`. Set e.g. `{ left = "‹", right = "›" }` to restyle them all.
     chevrons = { left = "❮", right = "❯" },
-    -- Shared surface GEOMETRY per LAYOUT — the SINGLE source read by every consumer (pickers, ui.tabs,
-    -- lvim-shell, lvim-space) via `require("lvim-ui").size(layout)`, and edited live by lvim-utils' own
-    -- config panel + lvim-control-center (persisted through the shared store, so both stay in sync).
-    --   height / width — always a FRACTION 0.1–1.0 of the available space (a concrete number, never "auto").
-    --   height_auto / width_auto — a boolean PER DIMENSION: false → the axis is EXACTLY the fraction (fixed);
-    --                     true → the axis AUTO-FITS its content, with the fraction used as the MAX cap. Width
-    --                     and height are independent (e.g. a float can fixed-width + auto-height).
-    --   float  — a centred float: height AND width (each with its own `*_auto`).
-    --   area   — the msgarea/cmdline dock (editor + statusline stay above it): height only (full-width).
-    --   bottom — a plain bottom float dock: height only (full-width).
-    -- The `area` height is the TOTAL dock height (drives the msgarea reserve cap); a STACKED preview SPLITS it
-    -- (preview keeps its content-fit height, the list takes the rest) so the dock never exceeds it. Defaults are
-    -- FIXED (auto off) — a full-bleed terminal / form has no content height to fit, so auto would collapse it;
-    -- turn an axis's `*_auto` on for content that should shrink to fit (a short list) up to that cap.
-    --
-    -- Two per-layout BEHAVIOUR flags also live here (edited from the same panels):
-    --   auto_hide  — close the surface when a file is opened FROM it. `float` closes (a modal is one-shot);
-    --                `area`/`bottom` DON'T (a dock stays so you can open more). The dock is NOT torn down — the
-    --                tool (which exits on select) is restarted IN PLACE, so the frame never flickers.
-    --   keep_focus — after opening a file from an area/bottom dock that stayed, keep focus IN the dock (default)
-    --                so you keep selecting, or move it to the opened file (false). Irrelevant to `float`.
-    size = {
-        float = { height = 0.85, width = 0.8, height_auto = false, width_auto = false, auto_hide = true },
-        area = { height = 0.5, height_auto = false, auto_hide = false, keep_focus = true },
-        bottom = { height = 0.4, height_auto = false, auto_hide = false, keep_focus = true },
-    },
-    -- The BACKDROP — mutes the windows BEHIND an open surface (via a shared highlight namespace, lvim-utils.dim)
-    -- so the surface reads as the focus, WITHOUT a covering window (which would hide a terminal image beneath).
-    -- PER LAYOUT (3 independent settings), so each can differ (or be off):
-    --   enabled — false → no backdrop for that layout.
-    --   mode    — which look is LIVE: "darken" (foreground + background toward black, a uniform darker look) or
-    --             "dim" (foreground only, lighter).
-    --   dim / darken — each carries its OWN `amount` (mute fraction 0..1, higher = stronger), tuned separately;
-    --                  `mode` selects which one applies.
-    -- A consumer may override its layout's backdrop per-open via `surface.open({ backdrop = { … } | false })`;
-    -- absent → these defaults. It is lifted while the editor is focused and torn down with the surface.
-    -- The backdrop mutes the windows BEHIND a surface through a shared highlight namespace (lvim-utils.dim) — no
-    -- covering window, so a terminal-composited image (kitty) under the surface stays VISIBLE. `mode` picks which
-    -- of the two looks is live: "darken" (fg+bg toward black — a uniform darker look) or "dim" (foreground only,
-    -- lighter). BOTH carry their OWN `amount` (mute fraction 0..1, higher = stronger), so each is tuned
-    -- independently and switching `mode` uses that mode's amount.
-    backdrop = {
-        float = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
-        area = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
-        bottom = { enabled = true, mode = "darken", dim = { amount = 0.4 }, darken = { amount = 0.5 } },
-    },
+    -- Surface GEOMETRY and BACKDROP per layout (float / area / bottom) are NOT defined here — they live in the
+    -- SINGLE central authority `lvim-utils.config.dock.geometry`, read live at open time by `lvim-ui.surface`
+    -- through `lvim-ui.surface.size_spec(layout)` (size) and `lvim-utils.dock.slot(layout)` (backdrop). That is the
+    -- one place control-center's "Utils" panel edits; keeping a second copy here would fork the source of truth.
     -- Disable all completion sources (native, nvim-cmp, blink.cmp) for input popups
     disable_completion = true,
     position = "editor",
-    width = 0.8,
-    max_width = 0.8,
-    height = 0.8,
-    max_height = 0.8,
+    -- No `width/max_width/height/max_height`: a modal's OUTER (float) geometry now comes from the CENTRAL
+    -- authority `lvim-utils.config.dock.geometry.float` (via `dock.slot` / the surface's derivation). Only the
+    -- content-fit list cap stays here.
     max_items = 15,
     filetype = "lvim-utils-ui",
     close_keys = { "q", "<Esc>" },

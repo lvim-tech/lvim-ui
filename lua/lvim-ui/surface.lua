@@ -83,126 +83,48 @@ local cursor_registered = false
 ---@type table?
 local area_current = nil
 -- FOCUS-AWARE backdrop: a DOCKED surface (control center, msgarea dock, …) lets you focus OUT to the editor
--- while it STAYS open. Its dim/darken of the editor must then LIFT off the window you moved INTO, and re-apply
--- when a surface window is focused again. `active_backdrop = { state, mode }`; one WinEnter drives it.
+-- while it STAYS open. Its dim/darken of the editor must LIFT off the window you moved INTO and re-apply when a
+-- surface window is focused again — that focus-awareness now lives ENTIRELY in `lvim-utils.dim.apply_backdrop`
+-- (a single session WinEnter drives it there). The surface only tracks WHICH state currently owns THE surface
+-- backdrop, so two coexisting surface docks share ONE veil (the second skips its own) and the close path knows
+-- when to release it. One at a time; module-level.
 ---@type table?
-local active_backdrop = nil
-local backdrop_focus_registered = false
--- The backdrop's OWN dim/darken namespaces — SEPARATE from lvim-colorscheme's focus-follow default namespaces,
--- so the backdrop's amount and the focus dim_inactive amount never overwrite each other (they build the same
--- shared `lvim-utils.dim` module but into DIFFERENT namespaces). Created lazily, once per session.
----@type integer?
-local backdrop_dim_ns = nil
----@type integer?
-local backdrop_darken_ns = nil
+local active_surface_bd = nil
 
---- The backdrop: mute (dim = fg, darken = fg+bg) every window that is NOT part of this surface
---- (through the shared `lvim-utils.dim` namespace), or restore them (`on = false`). Adds NO covering window —
---- so a terminal graphics image composited under the surface stays visible (a veil would hide it). Idempotent
---- per window; only windows WE dimmed are restored.
----@param state table
----@param on boolean
-local function set_backdrop_dim(state, on)
-    local dim = require("lvim-utils.dim")
-    state.dimmed_wins = state.dimmed_wins or {}
-    if on then
-        -- Tell a per-window dim MANAGER (lvim-colorscheme's dim_inactive/dark_active) to stand down while WE own
-        -- the backdrop — else the two fight over windows and only some get covered.
-        dim.suspend(true)
-        -- "darken" mutes fg+bg toward black (the veil look); "dim" mutes the FOREGROUND toward the editor bg.
-        -- Both via a highlight namespace (no covering window), so an image composited under the surface stays
-        -- visible — and both PRESERVE data-fg groups (lvim-image ids). Build into the backdrop's OWN namespace
-        -- (never the focus-follow default) so its amount can't clobber lvim-colorscheme's dim_inactive amount.
-        local ns
-        if state.backdrop_mode == "darken" then
-            backdrop_darken_ns = backdrop_darken_ns or api.nvim_create_namespace("lvim_ui_backdrop_darken")
-            ns = dim.darken("#000000", state.backdrop_amount or 0.5, backdrop_darken_ns)
-        else
-            backdrop_dim_ns = backdrop_dim_ns or api.nvim_create_namespace("lvim_ui_backdrop_dim")
-            ns = dim.build(state.backdrop_bg or "#000000", state.backdrop_amount or 0.5, backdrop_dim_ns)
-        end
-        for _, w in ipairs(api.nvim_list_wins()) do
-            if api.nvim_win_is_valid(w) then
-                local buf = api.nvim_win_get_buf(w)
-                local frame = vim.w[w].lvim_frame == true or vim.bo[buf].filetype == FRAME_FT
-                -- Also skip SPECIAL windows (buftype ~= "" — sidebars like neo-tree, plus terminals / help /
-                -- quickfix …): they paint via their own namespace/winhighlight with a DIFFERENT (often darker)
-                -- background, so the global "dim" would mute their fg toward the EDITOR bg and LIGHTEN them. Leave
-                -- them crisp and untouched, exactly like the surface's own frame windows.
-                local special = vim.bo[buf].buftype ~= ""
-                if not frame and not special and not state.dimmed_wins[w] then
-                    -- Remember the window's CURRENT namespace so we can restore it EXACTLY on close — a window
-                    -- may already be on its OWN namespace (e.g. neo-tree paints via a private ns), and blindly
-                    -- resetting it to 0 afterwards would clobber that (leaving it on the global ns). 0 is truthy
-                    -- in Lua, so it still trips the `not state.dimmed_wins[w]` guard above.
-                    local prev = 0
-                    pcall(function()
-                        prev = api.nvim_get_hl_ns({ winid = w })
-                    end)
-                    state.dimmed_wins[w] = (type(prev) == "number" and prev >= 0) and prev or 0
-                    dim.set(w, ns)
-                end
-            end
-        end
-    else
-        for w, prev in pairs(state.dimmed_wins) do
-            dim.set(w, prev) -- restore the window's ORIGINAL namespace (0, or its own like neo-tree's)
-        end
-        state.dimmed_wins = {}
-        dim.suspend(false) -- let the colorscheme dim manager take the windows back
-    end
-end
-
---- Keep the backdrop in step with focus: dim/darken the editor while a surface frame window is focused, LIFT it
---- off while any non-surface window is current — so the editor you moved into is never dimmed.
-local function apply_backdrop_focus()
-    local ab = active_backdrop
-    if not (ab and ab.state) then
-        return
-    end
-    local cur = api.nvim_get_current_win()
-    -- A window belongs to the surface if it carries the `lvim_frame` WINDOW marker (set on the container AND
-    -- every panel) — test THAT, not the buffer filetype, because a consumer may REPLACE a panel buffer's
-    -- filetype: the fzf picker swaps a `lvim-picker-fzf` terminal into its panel, which would read as "not a
-    -- surface window" under a filetype check and wrongly lift the backdrop.
-    local on_surface = api.nvim_win_is_valid(cur)
-        and (vim.w[cur].lvim_frame == true or vim.bo[api.nvim_win_get_buf(cur)].filetype == FRAME_FT)
-    set_backdrop_dim(ab.state, on_surface)
-end
---- One session-wide WinEnter that keeps the live backdrop (`active_backdrop`) in step with focus.
-local function register_backdrop_focus()
-    if backdrop_focus_registered then
-        return
-    end
-    backdrop_focus_registered = true
-    api.nvim_create_autocmd("WinEnter", {
-        group = api.nvim_create_augroup("LvimUiBackdropFocus", { clear = true }),
-        callback = apply_backdrop_focus,
-    })
-end
-
---- Rebuild the ACTIVE backdrop's namespace (dim OR darken) from the CURRENT global highlights, so the veiled
---- windows behind an open surface track a LIVE theme change (e.g. the colorscheme picker preview) instead of
---- freezing on the palette captured when the backdrop opened — the windows re-read the rebuilt namespace, so
---- no re-apply is needed. No-op unless a backdrop is currently applied to real windows.
+--- Rebuild the surface's live backdrop namespace from the CURRENT global highlights, so windows veiled behind an
+--- open surface track a LIVE theme change (e.g. the colorscheme picker preview) instead of freezing on the
+--- palette captured at open. Pure delegation to the shared applier, which recomputes every live backdrop's
+--- namespace in place (the dimmed windows re-read it — no re-apply needed).
 ---@return nil
 function M.refresh_backdrop()
-    local ab = active_backdrop
-    if not (ab and ab.state and ab.state.dimmed_wins and next(ab.state.dimmed_wins)) then
-        return
-    end
-    local st = ab.state
-    local dim = require("lvim-utils.dim")
-    if st.backdrop_mode == "darken" then
-        if backdrop_darken_ns then
-            dim.darken("#000000", st.backdrop_amount or 0.5, backdrop_darken_ns)
+    require("lvim-utils.dim").refresh_backdrop()
+end
+
+--- The fraction-based surface `size` spec `{ height?, width? }` for a dock LAYOUT, resolved from the CENTRAL
+--- geometry authority `lvim-utils.config.dock.geometry.<layout>`. This is the ONE place the fraction →
+--- `{ auto = true, max = f }` / `{ fixed = f }` shape the chassis `axis_size` consumes is built: the surface
+--- derives its OWN size from here when a consumer passes no `size`, and the lvim-ui modals call it too (so there
+--- is a single canonical resolver — the old public `lvim-ui.M.size` is gone). FRACTIONS, not resolved cells, so
+--- the surface re-fits on `VimResized`. `area`/`bottom` are full-width → no `width`; only `float` carries width.
+---@param layout "float"|"area"|"bottom"
+---@return { height?: table, width?: table }
+function M.size_spec(layout)
+    local ok, uconf = pcall(require, "lvim-utils.config")
+    local g = (ok and uconf and uconf.dock and uconf.dock.geometry and uconf.dock.geometry[layout]) or {}
+    local function dim(v, auto)
+        if type(v) ~= "number" then
+            return nil
         end
-    elseif backdrop_dim_ns then
-        -- "dim" mutes the foreground toward the editor bg — recompute it from the NEW theme's Normal.
-        local nb = api.nvim_get_hl(0, { name = "Normal" })
-        local bg = (nb and nb.bg) and string.format("#%06x", nb.bg) or st.backdrop_bg
-        dim.build(bg, st.backdrop_amount or 0.5, backdrop_dim_ns)
+        return (auto == true) and { auto = true, max = v } or { fixed = v }
     end
+    local out = {}
+    if g.height ~= nil then
+        out.height = dim(g.height, g.height_auto)
+    end
+    if layout == "float" and g.width ~= nil then
+        out.width = dim(g.width, g.width_auto)
+    end
+    return out
 end
 --- Register the frame filetype as a CURRENT-ONLY cursor-hide panel ft with the lvim-utils cursor module,
 --- once per session (idempotent via `cursor_registered`).
@@ -2295,16 +2217,15 @@ local function backdrop_layout(cfg)
     return "float"
 end
 
---- The effective backdrop veil for this surface: the consumer's per-open `cfg.backdrop` (a `{ enabled?, blend, hl }`
---- table, or `false` to force off) OVERRIDES the layout default in `config.backdrop`; absent → that default.
---- Returns nil when no veil applies (disabled / off).
+--- The effective backdrop veil for this surface, sourced from the CENTRAL `lvim-utils.dock` geometry authority:
+--- `dock.slot(layout, { backdrop = cfg.backdrop }).backdrop` resolves the layout default AND applies the
+--- consumer's per-open `cfg.backdrop` anchored override (a `{ enabled?, mode, dim, darken }` table merged over
+--- the central spec, or `false` to force it OFF — `dock.slot` turns that into `{ enabled = false }`). Returns
+--- nil when no veil applies (disabled / off / a transparent editor).
 ---@param cfg table
 ---@return { mode: string, amount: number, bg: string }?
 local function resolve_backdrop(cfg)
-    local bd = cfg.backdrop
-    if bd == nil then
-        bd = (config.backdrop or {})[backdrop_layout(cfg)]
-    end
+    local bd = require("lvim-utils.dock").slot(backdrop_layout(cfg), { backdrop = cfg.backdrop }).backdrop
     if not bd or bd.enabled == false then
         return nil
     end
@@ -2330,9 +2251,11 @@ local function resolve_backdrop(cfg)
     }
 end
 
---- Apply the BACKDROP: dim/darken the windows behind the surface (through lvim-utils.dim — no covering window,
---- so an image composited under the surface stays visible). No-op when none applies; lifts/re-applies with
---- focus via apply_backdrop_focus.
+--- Apply the BACKDROP: dim/darken the windows behind the surface through the SHARED focus-aware applier
+--- (`lvim-utils.dim.apply_backdrop` — no covering window, so an image composited under the surface stays
+--- visible). No-op when none applies. The applier keys the mute to CURRENT focus at apply time; at THIS point
+--- the editor is still current (panels are focused AFTER open_backdrop), so the veil starts lifted and the
+--- applier's own WinEnter drops it in when a surface window is focused — matching the old lazy behaviour.
 ---@param state table
 local function open_backdrop(state)
     -- A float auto-stacked ABOVE another frame (a modal opened FROM the browser etc.) must NOT lay its own
@@ -2340,12 +2263,11 @@ local function open_backdrop(state)
     if state.skip_backdrop then
         return
     end
-    -- A backdrop is ALREADY active for another open surface (two coexisting docks: area + bottom, each with an
-    -- EXPLICIT zindex — the auto-zindex skip above never covers them). Do NOT install a second backdrop: it
-    -- would clobber the single `active_backdrop` tracker, so when THIS surface closes the tracker is nil'd and
-    -- the FIRST surface's dimmed windows are orphaned (stuck lifted/applied). The existing backdrop already
-    -- veils the editor behind both. Mirrors the auto-zindex "stacked above a frame ⇒ skip our own backdrop".
-    if active_backdrop and active_backdrop.state and active_backdrop.state ~= state then
+    -- A surface backdrop is ALREADY active for another open surface (two coexisting docks: area + bottom, each
+    -- with an EXPLICIT zindex — the auto-zindex skip above never covers them). Do NOT install a second: the
+    -- existing veil already covers the editor behind both, and letting THIS surface own the tracker would orphan
+    -- the first's veil when this one closes. Mirrors the auto-zindex "stacked above a frame ⇒ skip our own".
+    if active_surface_bd and active_surface_bd ~= state then
         state.skip_backdrop = true
         return
     end
@@ -2353,12 +2275,20 @@ local function open_backdrop(state)
     if not bd then
         return
     end
-    state.backdrop_bg, state.backdrop_amount, state.backdrop_mode = bd.bg, bd.amount, bd.mode
-    -- Applied LAZILY by apply_backdrop_focus once a surface window is current — at THIS point the editor is
-    -- still current (panels are focused after open_backdrop), so applying it here would only get it lifted.
-    active_backdrop = { state = state, mode = bd.mode }
-    register_backdrop_focus()
-    apply_backdrop_focus() -- applies the backdrop now iff a surface window is already current
+    active_surface_bd = state
+    -- `protect(win)` = this surface's OWN windows (the container + every panel carry the `lvim_frame` window
+    -- marker, or the FRAME_FT filetype for a panel whose buffer a consumer swapped) — never muted. Keyed by the
+    -- state's identity so several backdrops could coexist in the shared applier (here one at a time).
+    require("lvim-utils.dim").apply_backdrop(tostring(state), {
+        enabled = true,
+        mode = bd.mode,
+        amount = bd.amount,
+        bg = bd.bg,
+        protect = function(w)
+            return api.nvim_win_is_valid(w)
+                and (vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT)
+        end,
+    })
 end
 
 --- Build the container + the N panel windows from a computed layout.
@@ -3319,14 +3249,11 @@ local function close(state)
     if state.container_win and api.nvim_win_is_valid(state.container_win) then
         pcall(api.nvim_win_close, state.container_win, true)
     end
-    -- Backdrop: restore any windows we dim/darkened (which also resumes the colorscheme dim manager) and release
-    -- the focus tracker. When the backdrop was already lifted (focus had moved to the editor), dimmed_wins is
-    -- empty and only the tracker needs clearing.
-    if state.dimmed_wins and next(state.dimmed_wins) then
-        set_backdrop_dim(state, false)
-    end
-    if active_backdrop and active_backdrop.state == state then
-        active_backdrop = nil
+    -- Backdrop: tear down this surface's veil through the shared applier (restores every window it muted to its
+    -- original namespace and resumes the colorscheme dim manager) and release the surface's ownership tracker.
+    require("lvim-utils.dim").clear_backdrop(tostring(state))
+    if active_surface_bd == state then
+        active_surface_bd = nil
     end
     if state.base_cmdheight ~= nil then -- a `cmdline` surface grew cmdheight; restore the user's value
         vim.o.cmdheight = state.base_cmdheight
@@ -3636,9 +3563,32 @@ function M.open(cfg)
         cfg.close_keys = { "q", "<Esc>" }
     end
 
-    -- Sizing: `cfg.size = { width/height = { auto, min, max, fixed } }` → the per-axis fields the geometry
-    -- uses. `auto` fits the content (within max); else `fixed`; each a screen fraction ≤1 or an absolute
-    -- count. `height.min` = minimum VISIBLE content rows; `width.min` clamps the float width.
+    -- Sizing SOURCE — the rule: NO explicit `cfg.size` ⇒ the CENTRAL dock slot; an explicit `cfg.size` ⇒ the
+    -- consumer's OWN size (untouched). A consumer that passed no size is a 3-layout DOCK consumer, so derive its
+    -- size from the central geometry authority (`lvim-utils.config.dock.geometry`) through the `lvim-ui.size`
+    -- façade — which returns the fraction-based `{ height, width = { auto/fixed, max } }` shape `axis_size`
+    -- resolves ITSELF (read the config's fractions + auto flags, never the already-resolved cells, so we don't
+    -- double-resolve). A consumer that DID pass `cfg.size` (a content-fit SPECIAL float: hover, image viewer,
+    -- cheatsheet, the select / input modals) keeps that size verbatim. `cfg.slot` is an optional per-open
+    -- ANCHORED override (height / width ≤ 1 = a fraction, > 1 = an absolute count; `*_auto` picks fixed vs
+    -- content-fit-up-to-max) that WINS over the central defaults for THIS open only.
+    if cfg.size == nil then
+        local layout = backdrop_layout(cfg) -- "cmdline"→area, "bottom"→bottom, else float (same signal as sizing)
+        cfg.size = M.size_spec(layout)
+        if cfg.slot then
+            if cfg.slot.height ~= nil then
+                cfg.size.height = (cfg.slot.height_auto == true) and { auto = true, max = cfg.slot.height }
+                    or { fixed = cfg.slot.height }
+            end
+            if layout == "float" and cfg.slot.width ~= nil then
+                cfg.size.width = (cfg.slot.width_auto == true) and { auto = true, max = cfg.slot.width }
+                    or { fixed = cfg.slot.width }
+            end
+        end
+    end
+    -- `cfg.size = { width/height = { auto, min, max, fixed } }` → the per-axis fields the geometry uses. `auto`
+    -- fits the content (within max); else `fixed`; each a screen fraction ≤1 or an absolute count. `height.min` =
+    -- minimum VISIBLE content rows; `width.min` clamps the float width.
     local size = cfg.size or {}
     local sw, sh = size.width or {}, size.height or {}
     cfg.auto_width, cfg.width, cfg.max_width, cfg.min_width = sw.auto, sw.fixed, sw.max, sw.min

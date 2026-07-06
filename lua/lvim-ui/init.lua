@@ -66,6 +66,8 @@ end
 ---@field counter? string            -- tabs: "footer" (count in the bottom-right border, default) | "title" (count folded into the border-title)
 ---@field max_items? integer         -- select/multiselect: cap the VISIBLE list rows (a longer list scrolls past N); default config.max_items
 ---@field area_height? integer       -- tabs (docked): the docked content row budget (default AREA_CAP); scrolls past it
+---@field slot? table                -- tabs: a per-open ANCHORED geometry override `{ height?, height_auto?, width?, width_auto?, backdrop? }` (a consumer's `config.force[layout]`) — WINS over the shared central geometry for THIS open; area/bottom ignore width/width_auto (always full-width)
+---@field backdrop? table|false      -- tabs: backdrop veil override `{ enabled?, mode, dim, darken }` (or `false` to force OFF); falls back to `slot.backdrop`
 ---@field enter? boolean             -- false → open without focusing (cursor stays in the editor, e.g. hover)
 ---@field border? any                -- frame border override
 ---@field close_keys? string[]       -- keys that close the frame
@@ -100,34 +102,20 @@ M.FRAME_BORDER = FRAME_BORDER
 local CONTENT_BORDER = frame.CONTENT_BORDER
 M.CONTENT_BORDER = CONTENT_BORDER
 
---- The surface `size` table for a LAYOUT ("float" | "area" | "bottom"), resolved from the shared
---- `config.size` (the single source, edited live by the config panels + control-center). `height`/`width`
---- are fractions 0.1–1.0; a PER-AXIS boolean picks each axis's mode — `height_auto` for height, `width_auto`
---- for width (float): off → `{ fixed = n }` (exactly that size); on → `{ auto = true, max = n }` (fit content
---- up to that cap). `area` / `bottom` carry HEIGHT only (full-width docks); `float` carries height AND width.
---- Pass straight to `frame.open({ size = … })`.
----@param layout string  "float" | "area" | "bottom"
----@return table size  { height = table?, width = table? }
-function M.size(layout)
-    local sz = (config or {}).size or {}
-    local l = sz[layout] or {}
-    -- Auto is PER AXIS: `height_auto` for height, `width_auto` for width (float only). An axis with auto ON fits
-    -- content up to its fraction (as MAX); OFF → a fixed size.
-    local function dim(v, auto)
-        if type(v) ~= "number" then
-            return nil
-        end
-        return (auto == true) and { auto = true, max = v } or { fixed = v }
-    end
-    local out = {}
-    if l.height ~= nil then
-        out.height = dim(l.height, l.height_auto)
-    end
-    if layout == "float" and l.width ~= nil then
-        out.width = dim(l.width, l.width_auto)
-    end
-    return out
+--- The CENTRAL float geometry (`lvim-utils.config.dock.geometry.float`) — the single authority a modal's
+--- content-fit cap (`max_width` / `max_height`) defaults to, so a select / input / tabs float fits its content
+--- UP TO the shared float slot (0.9 × 0.7 by default) instead of a private constant.
+---@return { width?: number, height?: number }
+local function float_geo()
+    local ok, uconf = pcall(require, "lvim-utils.config")
+    return (ok and uconf and uconf.dock and uconf.dock.geometry and uconf.dock.geometry.float) or {}
 end
+
+-- (The old public `lvim-ui.M.size(layout)` façade is GONE — geometry is fully centralized. There is ONE
+-- canonical path: `lvim-utils.config.dock.geometry` is the size authority; `lvim-utils.dock.slot(layout)`
+-- resolves it to a rect (cells), and `lvim-ui.surface.size_spec(layout)` builds the fraction-based
+-- `{ height, width }` axis shape the chassis needs. Consumers pass NO `size` and the surface derives it;
+-- the modals here call `frame.size_spec` / `float_geo`.)
 
 -- Docked (area / bottom) tabs cap their content to this many rows (it scrolls past the cap) when the consumer
 -- gives no `area_height` — the cmdline zone grows `cmdheight`, so an unbounded accordion can't drive it (and a
@@ -293,8 +281,8 @@ function M.select(opts)
         size = {
             -- a given `width` is FIXED (e.g. a 0.9-wide prompt); else auto-fit to the items, capped at max_width
             width = type(opts.width) == "number" and { fixed = opts.width }
-                or { auto = true, max = opts.max_width or config.max_width or 0.6 },
-            height = { auto = true, max = opts.max_height or config.max_height or 0.6 },
+                or { auto = true, max = opts.max_width or float_geo().width or 0.9 },
+            height = { auto = true, max = opts.max_height or float_geo().height or 0.7 },
         },
         -- An optional `subtitle` (description / warning line) under the title — the SAME meta-band model as
         -- M.tabs, so a select can carry a one-liner like "Deletes it from disk." above its list.
@@ -932,6 +920,9 @@ function M.tabs(opts)
         -- border-title in the top border by default, or (area + `title_line="statusline"`) the chrome overlay.
         -- The count (`opts.title_count`) rides the border per `counter` (default the bottom-right border-footer).
         border = opts.border or FRAME_BORDER,
+        -- Backdrop veil override: an explicit `opts.backdrop`, else the anchored `slot.backdrop` (so a
+        -- consumer's `config.force[layout].backdrop` forces the veil for this open). nil = the central default.
+        backdrop = opts.backdrop or (opts.slot and opts.slot.backdrop) or nil,
         title = opts.title,
         title_line = opts.title_line,
         title_pos = opts.title_pos, -- "left" (default) | "center" | "right" — title alignment
@@ -949,28 +940,47 @@ function M.tabs(opts)
         end or nil,
         -- on_escape_below (descend into the messages) is wired by the surface auto-host provider for a hosted
         -- area dock — ui no longer references msgarea.
-        -- Size DEFAULTS from the SHARED `config.size` (ui.size(layout)), so a change in :LvimUtils / the
-        -- control-center's Utils tab resizes every ui.tabs consumer (the control center, the :LvimUtils panel,
-        -- …). An explicit per-call `opts.width` / `opts.height` / `opts.area_height` still overrides. Docked: the
+        -- Size DEFAULTS from the CENTRAL geometry authority `lvim-utils.config.dock.geometry` (via
+        -- `frame.size_spec(layout)`), so a change in control-center's Utils tab resizes every ui.tabs consumer.
+        -- An explicit per-call `opts.width` / `opts.height` / `opts.area_height` still overrides. Docked: the
         -- area height also passes through the msgarea reserve cap; the tabs scroll past it.
         size = (function()
-            local shared = M.size(docked and (area and "area" or "bottom") or "float")
+            local shared = frame.size_spec(docked and (area and "area" or "bottom") or "float")
+            -- `opts.slot` is an optional per-open ANCHORED geometry override (a consumer's `config.force[layout]`):
+            -- `height`/`width` ≤ 1 = a screen fraction, > 1 = an absolute count; `*_auto` picks content-fit-up-to-max
+            -- over fixed. It WINS over the shared central geometry for THIS open only. area/bottom are ALWAYS
+            -- full-width, so `width`/`width_auto` are ignored there — matching `dock.slot`.
+            local slot = opts.slot
+            local function slot_axis(val, auto)
+                if val == nil then
+                    return nil
+                end
+                return (auto == true) and { auto = true, max = val } or { fixed = val }
+            end
             if docked then
-                return { height = shared.height or { auto = true, max = opts.area_height or AREA_CAP } }
+                return {
+                    height = (slot and slot_axis(slot.height, slot.height_auto))
+                        or shared.height
+                        or { auto = true, max = opts.area_height or AREA_CAP },
+                }
             end
             return {
                 -- A caller may FORCE the axis at the call site by passing a size SPEC table — `{ auto = true,
                 -- max = 0.9 }` to override the shared FIXED width and auto-fit content (e.g. the install / quit
                 -- prompts), or `{ fixed = n }`. A plain NUMBER is shorthand for `{ fixed = n }`. `type == number`
                 -- (not truthy) also means a stray non-number (an old `"auto"` string) is ignored — it would become
-                -- `{ fixed = "auto" }` and crash `axis_size` — and auto-fits instead. Else the SHARED size, then a
-                -- final auto cap.
-                width = (type(opts.width) == "table" and opts.width) or (type(opts.width) == "number" and {
-                    fixed = opts.width,
-                }) or shared.width or { auto = true, max = config.max_width or 0.7 },
-                height = (type(opts.height) == "table" and opts.height) or (type(opts.height) == "number" and {
-                    fixed = opts.height,
-                }) or shared.height or { auto = true, max = config.max_height or 0.9 },
+                -- `{ fixed = "auto" }` and crash `axis_size` — and auto-fits instead. Then the `slot` anchored
+                -- override, else the SHARED size, then a final auto cap.
+                width = (type(opts.width) == "table" and opts.width)
+                    or (type(opts.width) == "number" and { fixed = opts.width })
+                    or (slot and slot_axis(slot.width, slot.width_auto))
+                    or shared.width
+                    or { auto = true, max = float_geo().width or 0.7 },
+                height = (type(opts.height) == "table" and opts.height)
+                    or (type(opts.height) == "number" and { fixed = opts.height })
+                    or (slot and slot_axis(slot.height, slot.height_auto))
+                    or shared.height
+                    or { auto = true, max = float_geo().height or 0.9 },
             }
         end)(),
         header = (function()
@@ -1221,9 +1231,9 @@ function M.info(content, opts)
         -- (fraction ≤ 1 or absolute count; default 0.7 / 0.85). A cursor-anchored hover passes a tight cap.
         size = {
             width = type(opts.width) == "number" and { fixed = opts.width }
-                or { auto = true, max = opts.max_width or config.max_width or 0.7 },
+                or { auto = true, max = opts.max_width or 0.7 },
             height = type(opts.height) == "number" and { fixed = opts.height }
-                or { auto = true, max = opts.max_height or config.max_height or 0.85 },
+                or { auto = true, max = opts.max_height or 0.85 },
         },
         -- The info viewer IS the data-content panel → the single-source content ring (CONTENT_BORDER →
         -- config.content_border, resolved live). The `q close` footer is a nav bar, so it stays borderless.
@@ -1249,8 +1259,8 @@ end
 ---   border/title_pos/position/close_keys/filetype/markview/footer_hints/layout/…  -- per-open DEFAULTS
 --- The `highlights` are registered once here; everything ELSE is merged UNDER each presenter's per-call opts
 --- (the caller's opts win) so the instance's frames carry its overrides instead of the raw module defaults.
---- NOTE: SIZE is NOT taken from here — it comes from the shared `config.size` (via `ui.size`); pass an
---- explicit per-call `width`/`height` on the individual opts if a frame must deviate.
+--- NOTE: SIZE is NOT taken from here — it comes from the CENTRAL `lvim-utils.config.dock.geometry` (via the
+--- surface's `size_spec` / `dock.slot`); pass an explicit per-call `width`/`height` on the opts to deviate.
 ---@return { select: fun(opts: table), multiselect: fun(opts: table),
 ---          input: fun(opts: table), confirm: fun(opts: table), tabs: fun(opts: table),
 ---          info: fun(content: any, opts: table): integer, integer }

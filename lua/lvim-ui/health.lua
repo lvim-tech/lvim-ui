@@ -48,8 +48,12 @@ function M.check()
     local config = require("lvim-ui.config")
     health.info("popup filetype: " .. tostring(config.filetype))
     health.info("title placement: " .. tostring(config.title_line) .. " · counter: " .. tostring(config.counter))
-    if config.backdrop and config.backdrop.float then
-        local bf = config.backdrop.float
+    -- Backdrop geometry now lives in the single central authority (lvim-utils.config.dock.geometry), not in
+    -- lvim-ui.config — report the float layout's backdrop from THERE.
+    local ok_uconf, uconf = pcall(require, "lvim-utils.config")
+    local geo_float = ok_uconf and uconf and uconf.dock and uconf.dock.geometry and uconf.dock.geometry.float
+    if geo_float and geo_float.backdrop then
+        local bf = geo_float.backdrop
         if bf.enabled == false then
             health.warn("float backdrop is disabled")
         else
