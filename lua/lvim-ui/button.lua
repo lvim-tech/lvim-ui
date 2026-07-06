@@ -103,7 +103,7 @@ function M.key_pos(label, key, key_pos)
     if not pos and key and #key == 1 then
         pos = label:lower():find(key:lower(), 1, true)
     end
-    return math.max(1, math.min(pos or 1, #label > 0 and #label or 1))
+    return math.max(1, math.min(pos or 1, vim.fn.strchars(label) > 0 and vim.fn.strchars(label) or 1))
 end
 
 -- ── render ────────────────────────────────────────────────────────────────────
@@ -150,16 +150,18 @@ function M.render(spec, state)
     put(sp(tf), thl) -- text box left pad
     if not spec.key_badge and (spec.key or spec.key_pos) and txt ~= "" then
         local pos = M.key_pos(txt, spec.key, spec.key_pos)
-        put(txt:sub(1, pos - 1), thl)
+        local byte_pos = vim.str_byteindex(txt, "utf-32", pos - 1, false) + 1
+        local next_byte = vim.str_byteindex(txt, "utf-32", pos, false) + 1
+        put(txt:sub(1, byte_pos - 1), thl)
         -- The shortcut hint takes the lead/accent colour — but FALLS BACK to the text colour when the button
         -- defines no lead box (no `style.icon`), so `[X]`/brackets read as part of the caption instead of a
         -- stray default colour.
         if spec.key_brackets == false then
-            put(txt:sub(pos, pos), ihl or thl) -- just the hotkey letter, no brackets
+            put(txt:sub(byte_pos, next_byte - 1), ihl or thl) -- just the hotkey letter, no brackets
         else
-            put("[" .. txt:sub(pos, pos) .. "]", ihl or thl) -- the bracketed key
+            put("[" .. txt:sub(byte_pos, next_byte - 1) .. "]", ihl or thl) -- the bracketed key
         end
-        put(txt:sub(pos + 1), thl)
+        put(txt:sub(next_byte), thl)
     else
         put(txt, thl)
     end

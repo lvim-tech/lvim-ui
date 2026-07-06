@@ -153,8 +153,11 @@ function M.segmented_segments(row, ico)
         -- bracket convention; the active option is then shown by highlight (bold), not by brackets.
         local label = opt
         if row.bracket_key and #opt > 0 then
-            local pos = button.key_pos(opt, opt:sub(1, 1))
-            label = opt:sub(1, pos - 1) .. "[" .. opt:sub(pos, pos) .. "]" .. opt:sub(pos + 1)
+            local first = vim.fn.strcharpart(opt, 0, 1)
+            local pos = button.key_pos(opt, first)
+            local byte_pos = vim.str_byteindex(opt, "utf-32", pos - 1, false) + 1
+            local next_byte = vim.str_byteindex(opt, "utf-32", pos, false) + 1
+            label = opt:sub(1, byte_pos - 1) .. "[" .. opt:sub(byte_pos, next_byte - 1) .. "]" .. opt:sub(next_byte)
         end
         local inner = (oicon and (oicon .. " ") or "") .. label
         local text

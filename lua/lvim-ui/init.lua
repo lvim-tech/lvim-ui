@@ -76,6 +76,8 @@ end
 ---@field footer_fill? boolean       -- tabs: false → no tinted strip under the footer action bar (buttons float on the panel bg)
 ---@field footer_hints? boolean|table[] -- tabs: `true` → live key-hint LEGEND footer (panel keys • focused-row keys); a list `{ {key,label} }` → footer hint BUTTONS wired to `opts.keymaps[key].fn`
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
+---@field pad? integer               -- tabs/form: body row left padding
+---@field on_item_change? fun(item: table) -- tabs item-list mode: live preview callback on focused item
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
 ---@field hide_cursor? boolean       -- info: hide the hardware cursor (read-only viewer)
 ---@field wrap? boolean              -- info: enable line wrap in the window (default off)
@@ -558,7 +560,7 @@ end
 ---@param opts UiOpts
 function M.tabs(opts)
     opts = opts or {}
-    local tabset = opts.tabs or {}
+    local tabset = vim.deepcopy(opts.tabs or {})
     if #tabset == 0 then
         return
     end
@@ -592,11 +594,9 @@ function M.tabs(opts)
                     label = (it.label or "") .. (is_current and "  (current)" or ""),
                     _item = it,
                     run = function(_, close)
-                        done = true
                         if close then
-                            close()
+                            close(true, { tab = t, index = j, item = it })
                         end
-                        cb(true, { tab = t, index = j, item = it })
                     end,
                 }
             end
@@ -665,12 +665,14 @@ function M.tabs(opts)
         end
         return content, actions, bars
     end
-    -- Typed-row values of the active tab, keyed by name (the callback result).
+    -- Typed-row values from every tab, keyed by name (the callback result).
     local function collect()
         local res = {}
-        for _, r in ipairs((tabset[active] or {}).rows or {}) do
-            if r.name and r.type ~= "action" and r.type ~= "spacer" and r.type ~= "spacer_line" then
-                res[r.name] = r.value
+        for _, tab in ipairs(tabset) do
+            for _, r in ipairs(tab.rows or {}) do
+                if r.name and r.type ~= "action" and r.type ~= "spacer" and r.type ~= "spacer_line" then
+                    res[r.name] = r.value
+                end
             end
         end
         return res
@@ -700,6 +702,12 @@ function M.tabs(opts)
                 opts.on_item_change(r._item)
             end
         end or nil,
+        on_action_close = function(confirmed, result)
+            if confirmed ~= nil then
+                done = true
+                cb(confirmed == true, result or collect())
+            end
+        end,
     })
 
     local function action_specs(actions)
@@ -709,11 +717,11 @@ function M.tabs(opts)
                 key = a.key or (a.label or "?"):sub(1, 1):lower(),
                 name = a.label or a.name or "",
                 run = function(st)
-                    done = true
                     if a.run then
                         a.run(a.value, function(confirmed, r)
                             st.close()
                             if confirmed ~= nil then
+                                done = true
                                 cb(confirmed == true, r or collect())
                             end
                         end)
@@ -739,10 +747,10 @@ function M.tabs(opts)
                 run = function(st)
                     local km = opts.keymaps and opts.keymaps[key]
                     if km and km.fn then
-                        done = true
                         km.fn(function(confirmed, r)
                             st.close()
                             if confirmed ~= nil then
+                                done = true
                                 cb(confirmed == true, r or collect())
                             end
                         end)
@@ -952,7 +960,10 @@ function M.tabs(opts)
                 }) or shared.height or { auto = true, max = config.max_height or 0.9 },
             }
         end)(),
-        header = (#header_spec().bars > 0) and header_spec() or nil,
+        header = (function()
+            local hs = header_spec()
+            return (#hs.bars > 0) and hs or nil
+        end)(),
         -- The tab CONTENT panel carries the single-source content ring (CONTENT_BORDER → config.content_border,
         -- resolved live). The tab BAR + footer hint bands are nav bars, not blocks, so they stay borderless.
         content = { blocks = { { id = "form", provider = form_p, border = CONTENT_BORDER } } },
@@ -996,7 +1007,7 @@ function M.tabs(opts)
     -- After-open hook: hand the content buffer/window to the consumer (e.g. the installer's per-row action
     -- keymaps r/u/d/b). The content panel is the first frame panel.
     if opts.on_open then
-        local p = st.panels and st.panels[1]
+        local p = st and st.panels and st.panels[1]
         if p then
             opts.on_open(p.buf, p.win)
         end
@@ -1013,7 +1024,7 @@ function M.tabs(opts)
     -- `l` / `h` switch tabs from the content body too (multi-tab) — not only while the tab bar is focused,
     -- matching the project panel. (Plain h/l are free on the body; the form owns j/k/<CR>.)
     if set_active_tab then
-        local body_buf = st.panels[1] and st.panels[1].buf
+        local body_buf = st and st.panels and st.panels[1] and st.panels[1].buf
         if body_buf and vim.api.nvim_buf_is_valid(body_buf) then
             -- On a toolbar `bar` row, h/l move the focused button; otherwise they switch tabs.
             vim.keymap.set("n", "l", function()

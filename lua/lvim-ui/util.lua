@@ -49,7 +49,7 @@ end
 ---@param s any
 ---@return integer
 function M.dw(s)
-    return vim.fn.strdisplaywidth(tostring(s or ""))
+    return api.nvim_strwidth(tostring(s or ""))
 end
 
 --- Clip `s` to at most `width` DISPLAY cells, appending an ellipsis ("…") when it is clipped. Multibyte /
@@ -69,7 +69,7 @@ function M.truncate(s, width)
     local ell = "…"
     local budget = width - M.dw(ell) -- reserve room for the ellipsis
     if budget <= 0 then
-        return ell:sub(1, width) -- degenerate width; best effort
+        return M.dw(ell) <= width and ell or ""
     end
     local out, w = {}, 0
     for _, ch in ipairs(vim.fn.split(s, "\\zs")) do

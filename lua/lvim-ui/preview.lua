@@ -150,6 +150,9 @@ function M.new(opts)
     local frame -- the owning frame state (captured from pan.frame), so the nav keys can reach it
     local nav_buf -- the buffer the nav keys are currently bound on (nil = none)
     local augroup -- the WinEnter/WinLeave group that adds/removes the nav keys
+    local augroup_win -- the preview window the current augroup watches
+    ---@type table<integer, true>
+    local owned_buffers = {}
 
     local function remove_nav()
         if nav_buf and api.nvim_buf_is_valid(nav_buf) then
@@ -180,9 +183,14 @@ function M.new(opts)
     --- them again the moment focus leaves, so the shared file buffer is never left mapped elsewhere.
     ---@param pan table
     local function ensure_autocmds(pan)
-        if augroup then
+        if augroup and augroup_win == pan.win then
             return
         end
+        remove_nav()
+        if augroup then
+            pcall(api.nvim_del_augroup_by_id, augroup)
+        end
+        augroup_win = pan.win
         augroup = api.nvim_create_augroup("LvimUiPreviewNav_" .. tostring(pan.win), { clear = true })
         api.nvim_create_autocmd("WinEnter", {
             group = augroup,
@@ -208,13 +216,26 @@ function M.new(opts)
         -- re-rendered into a FRESH window (the dynamic peek float, recreated on each show), which has no winbar.
         reset = function()
             cur_file = nil
+            remove_nav()
+            if augroup then
+                pcall(api.nvim_del_augroup_by_id, augroup)
+                augroup = nil
+                augroup_win = nil
+            end
         end,
         on_close = function()
             remove_nav()
             if augroup then
                 pcall(api.nvim_del_augroup_by_id, augroup)
                 augroup = nil
+                augroup_win = nil
             end
+            for buf in pairs(owned_buffers) do
+                if api.nvim_buf_is_valid(buf) and vim.bo[buf].modified == false then
+                    pcall(api.nvim_buf_delete, buf, { force = true })
+                end
+            end
+            owned_buffers = {}
         end,
         update = function(pan, _geom)
             local it = opts.item and opts.item()
@@ -246,7 +267,11 @@ function M.new(opts)
             -- buffer). Only swap when it actually changes (navigating rows of the same file just moves the
             -- cursor). `nvim_win_set_buf` (not `:edit`) avoids E37 on a modified buffer.
             local pbuf = vim.fn.bufadd(it.filename)
+            local was_loaded = vim.api.nvim_buf_is_loaded(pbuf)
             vim.fn.bufload(pbuf)
+            if not was_loaded then
+                owned_buffers[pbuf] = true
+            end
             if api.nvim_win_get_buf(pan.win) ~= pbuf then
                 api.nvim_win_set_buf(pan.win, pbuf)
             end

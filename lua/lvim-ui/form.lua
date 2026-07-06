@@ -18,7 +18,7 @@ local api = vim.api
 local M = {}
 
 --- Create a form provider.
----@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string, pad?: integer, on_move?: fun(row: Row?), on_cursor?: fun() }
+---@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string, pad?: integer, initial_row?: integer|string, on_move?: fun(row: Row?), on_cursor?: fun(), on_action_close?: fun(confirmed: boolean|nil, result: any) }
 ---       cursorline_hl: name a cursorline highlight group (e.g. a bg-only one) so the hover changes only the
 ---       background and a row's own fg highlights survive; default = the frame's yellow "list hover".
 ---@return table provider
@@ -204,12 +204,23 @@ function M.new(opts)
             cycle_value(1) -- forward; <BS> calls cycle_value(-1) for backward
         elseif t == "int" or t == "integer" or t == "float" or t == "number" or t == "string" or t == "text" then
             local numeric = t ~= "string" and t ~= "text"
-            vim.ui.input({
-                prompt = (row.label or row.name or "") .. ": ",
+            require("lvim-ui").input({
+                prompt = row.label or row.name or "",
                 default = tostring(row.value ~= nil and row.value or row.default or ""),
-            }, function(input)
-                if input ~= nil then
-                    row.value = numeric and (tonumber(input) or row.value) or input
+                callback = function(confirmed, input)
+                    if confirmed ~= true then
+                        return
+                    end
+                    if numeric then
+                        local n = tonumber(input)
+                        if not n then
+                            vim.notify("Invalid number: " .. tostring(input), vim.log.levels.WARN)
+                            return
+                        end
+                        row.value = n
+                    else
+                        row.value = input
+                    end
                     if row.run then
                         row.run(row.value)
                     end
@@ -217,11 +228,14 @@ function M.new(opts)
                         on_change(row)
                     end
                     refresh()
-                end
-            end)
+                end,
+            })
         elseif t == "action" and row.run then
-            row.run(row.value, function()
+            row.run(row.value, function(confirmed, result)
                 st.close()
+                if opts.on_action_close then
+                    opts.on_action_close(confirmed, result)
+                end
             end)
         end
     end
@@ -257,6 +271,7 @@ function M.new(opts)
         render = function(width)
             local fr = flat()
             local lines, hls = {}, {}
+            local lead = opts.pad or 2
             for i, r in ipairs(fr) do
                 local disp = rows.row_display(r, ico)
                 if r.type == "bar" then
@@ -295,7 +310,7 @@ function M.new(opts)
                         hls[#hls + 1] = { i - 1, s[1], s[2], s[3] }
                     end
                 elseif not rows.is_selectable(r) then
-                    lines[i] = r.center and util.center(disp, width) or util.lpad(disp, width, opts.pad or 2)
+                    lines[i] = r.center and util.center(disp, width) or util.lpad(disp, width, lead)
                     -- A spacer / divider row (the `──────` between groups) takes the separator colour — UNLESS it
                     -- carries an explicit `hl` (e.g. a wrapped value's continuation SPACER), in which case honour
                     -- hl.inactive so the wrap matches its field's value instead of taking the separator colour.
@@ -306,20 +321,20 @@ function M.new(opts)
                 elseif is_disabled(r) then
                     -- A DISABLED setting: dim (fg muted toward bg) + strike through the WHOLE row, with NO
                     -- per-part colours — it reads as present but inert (its value is never changed).
-                    lines[i] = util.lpad(disp, width, opts.pad or 2)
+                    lines[i] = util.lpad(disp, width, lead)
                     hls[#hls + 1] = { i - 1, 0, #lines[i], "LvimUiRowDisabled", 250 }
                 else
-                    lines[i] = util.lpad(disp, width, opts.pad or 2)
+                    lines[i] = util.lpad(disp, width, lead)
                     -- Colour the leading type icon; the rest reads on the panel background.
                     local icon_str = rows.row_icon_info(r, ico)
                     if icon_str and #icon_str > 0 then
-                        hls[#hls + 1] = { i - 1, 2, 2 + #icon_str, "LvimUiRowIconInactive" }
+                        hls[#hls + 1] = { i - 1, lead, lead + #icon_str, "LvimUiRowIconInactive" }
                     end
                     -- Per-part colours an action / accordion row can request: `icon_hl` on its `icon` column,
                     -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix — at their byte offsets in
                     -- `disp`, which lays out as: lead-icon + "  " + icon + " " + label [+ " " + suffix].
                     if (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl) then
-                        local base = 2 + #(icon_str or "") + 2 -- past the lead icon + its 2-space separator
+                        local base = (r.tight and 0 or lead) + #(icon_str or "") + 2
                         local ricon = (r.icon and r.icon ~= "") and r.icon or nil
                         if ricon and r.icon_hl then
                             hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
@@ -330,14 +345,16 @@ function M.new(opts)
                             hls[#hls + 1] = { i - 1, ls, ls + #label, r.text_hl }
                         end
                         if r.suffix and r.suffix ~= "" and r.suffix_hl then
-                            hls[#hls + 1] = { i - 1, 2 + #disp - #r.suffix, 2 + #disp, r.suffix_hl }
+                            local suffix_start = math.max(lead, math.min(#lines[i], lead + #disp - #r.suffix))
+                            hls[#hls + 1] =
+                                { i - 1, suffix_start, math.min(#lines[i], suffix_start + #r.suffix), r.suffix_hl }
                         end
                     end
                     -- A file row's label = "<dimmed path>/<bright name>". `r.dim_to` is a byte count into the
                     -- LABEL (the SUFFIX of `disp`) up to the name; offset by the lpad indent (2), clamped to
                     -- the rendered line. Dim the path, brighten the name, so the name stands out.
                     if r.dim_to and r.dim_to > 0 and type(r.label) == "string" then
-                        local lstart = 2 + (#disp - #r.label)
+                        local lstart = lead + #(icon_str or "") + 2
                         local dim_end = math.min(lstart + r.dim_to, #lines[i])
                         if dim_end > lstart then
                             hls[#hls + 1] = { i - 1, lstart, dim_end, "LvimUiPathDim" }

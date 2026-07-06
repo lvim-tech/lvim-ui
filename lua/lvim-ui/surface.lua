@@ -53,7 +53,7 @@ local M = {}
 -- on the next open of EVERY consumer without touching their code; the marker only has to keep the identity
 -- the consumers captured, which it does (it is never reassigned). Later phases delete the per-plugin copies.
 ---@type string[]
-M.FRAME_BORDER = config.border
+M.FRAME_BORDER = config.border --[[@as string[] ]]
 
 -- A SECOND single-source ring — `config.content_border` — for the CONTENT PANELS ONLY: the DATA blocks
 -- INSIDE the container (the picker's list / preview, lvim-space's list, the tabs content block). `M.CONTENT_BORDER`
@@ -63,7 +63,7 @@ M.FRAME_BORDER = config.border
 -- NAVIGATION bands (footer / filter / tab / input) are bars, not blocks, so they are never affected. A block's
 -- explicit "none" / custom border is honoured untouched.
 ---@type string[]
-M.CONTENT_BORDER = config.content_border
+M.CONTENT_BORDER = config.content_border --[[@as string[] ]]
 
 -- ─── cursor hiding ────────────────────────────────────────────────────────────
 -- Hiding the hardware cursor is delegated to lvim-utils.cursor (the ONE cursor system): the chrome
