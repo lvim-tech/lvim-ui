@@ -2728,6 +2728,12 @@ local function open_windows(state)
     state.sector = function(dir)
         sector_cycle(state, dir)
     end
+    --- Focus the frame's FIRST sector (its header — e.g. a tab bar) — the landing point when DESCENDING
+    --- into the frame from an OUTSIDE editor window (the dock's global descend). A further `<C-j>` then
+    --- steps down into the content, the mirror of the `<C-k>` escape-UP from the top sector.
+    state.enter = function()
+        focus_sector(state, 1)
+    end
     --- Focus the window the frame was opened from (the editor), keeping the frame open. The WinEnter
     --- hook restores the cursor there.
     state.to_origin = function()

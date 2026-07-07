@@ -44,8 +44,10 @@ end
 ---@field items? any[]               -- select / multiselect items
 ---@field current_item? any          -- select: focus this item on open (e.g. the installed version)
 ---@field mark_current? boolean      -- select: default true → the focused current_item also gets a "  (current)" suffix; false = focus only (caller owns the marker)
----@field tabs? table[]              -- tabs: { { label, icon?, rows, menu? } , … }
+---@field tabs? table[]              -- tabs: { { label, icon?, rows, menu?, hl?, actions? } , … } — or PROVIDER tabs (every tab carries `provider`; see M.tabs)
 ---@field menu? boolean              -- tabs: render the rows as a navigable MENU (action rows stay a selectable BODY list, not footer buttons); per-tab via `tab.menu`
+---@field tab_bar? boolean           -- tabs: force the header tab bar ON (true — even with a single tab) or OFF (false); nil = auto (shown for >1 tab or when any tab-bar affordance exists)
+---@field tab_bar_actions? table[]   -- tabs: trailing affordance buttons at the END of the tab bar (e.g. a `+` new-tab), each { name, icon?, key?, hl?, run(st) }
 ---@field callback? fun(...): any    -- result callback (signature varies per presenter)
 ---@field on_change? fun(row: table) -- tabs: fired on every typed-row edit
 ---@field subtitle? string|table|table[]  -- tabs / select: message line(s) under the title. A string, ONE line `{ text, type?, hl?, icon?, blank_below? }`, or a LIST of such lines. `type` ∈ "info"|"warn"|"error" (predefined fg colour); `hl` overrides; `icon` is fronted when given.
@@ -76,7 +78,7 @@ end
 ---@field on_open? fun(buf: integer, win: integer)  -- info: after open
 ---@field footer? boolean            -- info: false → no footer
 ---@field footer_fill? boolean       -- tabs: false → no tinted strip under the footer action bar (buttons float on the panel bg)
----@field footer_hints? boolean|table[] -- tabs: `true` → live key-hint LEGEND footer (panel keys • focused-row keys); a list `{ {key,label} }` → footer hint BUTTONS wired to `opts.keymaps[key].fn`
+---@field footer_hints? boolean|table[] -- tabs: `true` → live key-hint LEGEND footer (panel keys • focused-row keys); a list `{ {key,label,run?,no_hotkey?} }` → footer hint BUTTONS (an item's own `run` wins, else `opts.keymaps[key].fn`; `no_hotkey` = label-only chip; a `type="separator"` item passes through as a divider)
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
 ---@field pad? integer               -- tabs/form: body row left padding
 ---@field on_item_change? fun(item: table) -- tabs item-list mode: live preview callback on focused item
@@ -570,38 +572,53 @@ function M.tabs(opts)
     local active = 1
     local done = false
 
+    -- PROVIDER-tab mode: a tab carrying `provider` supplies its content as a raw surface CONTENT PROVIDER —
+    -- an `update` provider that OWNS the shared panel window (it may swap an EXTERNAL buffer in via
+    -- nvim_win_set_buf: the lsp-outline / peek-preview pattern) — instead of typed rows. There is ONE content
+    -- block, so the whole tabset must be provider tabs (rows/items tabs cannot mix in). Switching tabs
+    -- relayouts the chassis, which re-fires the ACTIVE tab's `update` — that is the buffer swap. The
+    -- provider's `keys` hook fires ONCE at open, for the tab active then (the shared pan/st recorder — the
+    -- outline pattern); a tab's own keymaps belong buffer-local on the buffer its `update` swaps in.
+    local provider_mode = tabset[1].provider ~= nil
+
     -- Back-compat item-list PICKER mode: a tab with `.items` (each item = label/icon + a payload) is a simple
     -- selectable list, NOT typed rows. Convert each to a navigable MENU row carrying the item, so
     -- `on_item_change(item)` fires on cursor move (live preview), <CR> returns `{ tab, index, item }`, and
     -- `current_item` (an item REFERENCE) focuses its row + gets a ➤ marker on open.
     local item_focus -- the row `name` to focus on open (the current item)
-    for ti, t in ipairs(tabset) do
-        if t.items and not t.rows then
-            t.menu = true
-            local rs = {}
-            for j, it in ipairs(t.items) do
-                local rname = ("__item_%d_%d"):format(ti, j)
-                local is_current = opts.current_item ~= nil and it == opts.current_item
-                if is_current then
-                    item_focus = rname
-                end
-                rs[j] = {
-                    type = "action",
-                    flat = true,
-                    tight = true, -- a compact list: no 2-space lead (the body lpad gives a single space)
-                    icon = it.icon or "",
-                    name = rname,
-                    -- the CURRENT item is marked with a "(current)" suffix on its label
-                    label = (it.label or "") .. (is_current and "  (current)" or ""),
-                    _item = it,
-                    run = function(_, close)
-                        if close then
-                            close(true, { tab = t, index = j, item = it })
-                        end
-                    end,
-                }
+    --- Convert one items-tab into menu rows in place (also reused by the handle's `set_tabs`).
+    ---@param ti integer  the tab's index (row-name namespace)
+    ---@param t table     the tab spec (mutated: `menu` + `rows`)
+    local function items_to_rows(ti, t)
+        t.menu = true
+        local rs = {}
+        for j, it in ipairs(t.items) do
+            local rname = ("__item_%d_%d"):format(ti, j)
+            local is_current = opts.current_item ~= nil and it == opts.current_item
+            if is_current then
+                item_focus = rname
             end
-            t.rows = rs
+            rs[j] = {
+                type = "action",
+                flat = true,
+                tight = true, -- a compact list: no 2-space lead (the body lpad gives a single space)
+                icon = it.icon or "",
+                name = rname,
+                -- the CURRENT item is marked with a "(current)" suffix on its label
+                label = (it.label or "") .. (is_current and "  (current)" or ""),
+                _item = it,
+                run = function(_, close)
+                    if close then
+                        close(true, { tab = t, index = j, item = it })
+                    end
+                end,
+            }
+        end
+        t.rows = rs
+    end
+    for ti, t in ipairs(tabset) do
+        if t.items and not t.rows and not t.provider then
+            items_to_rows(ti, t)
         end
     end
 
@@ -679,37 +696,102 @@ function M.tabs(opts)
         return res
     end
 
-    local content1, actions1 = split(active)
     local st -- forward decl: the frame state (assigned by frame.open below); reached by the footer's deferred callbacks
     local update_footer -- forward decl: rebuild the live key-hint footer (assigned once footer_hints_spec exists)
-    local form_p = form.new({
-        rows = content1,
-        -- Focus a specific row on open (jump-to): a row `name` or index in the initially-active tab.
-        initial_row = opts.initial_row,
-        on_change = opts.on_change,
-        cursorline_hl = opts.cursorline_hl,
-        pad = opts.pad, -- body content lpad (default 2); a compact picker can drop it (e.g. 0)
-        -- a footer key-hint legend tracks the focused row: re-notify on cursor move (legend only, not the
-        -- static button-list form of `footer_hints`)
-        on_cursor = opts.footer_hints == true and function()
-            if update_footer then
-                update_footer()
+    local actions1 = {} -- the initially-active tab's footer action rows (rows mode only)
+    local form_p -- the typed-row form provider (nil in provider-tab mode)
+    local content_p -- the ONE content-block provider the frame hosts (the form, or the provider-tab delegate)
+    if provider_mode then
+        -- The DELEGATE content provider: one panel window shared by every tab, each call forwarded to the
+        -- ACTIVE tab's provider — so `set_active_tab`'s relayout re-fires `update` on the newly-active tab
+        -- (the buffer swap) with zero window churn. `hide_cursor` only when EVERY tab hides it (an interactive
+        -- tab — e.g. a terminal — needs the real cursor, so one such tab keeps it for the shared panel);
+        -- `filetype` from the initially-active tab (the shared scratch buffer is stamped once).
+        local function active_provider()
+            local t = tabset[active]
+            return t and t.provider or nil
+        end
+        local all_hide = true
+        for _, t in ipairs(tabset) do
+            if not (t.provider and t.provider.hide_cursor) then
+                all_hide = false
+                break
             end
-        end or nil,
-        -- Item-list picker live preview: fire the consumer's `on_item_change` with the focused item on EVERY
-        -- cursor move (raw, no dedup — the variant rows are all `action`, so a sig-deduped hook would miss them).
-        on_move = opts.on_item_change and function(r)
-            if r and r._item then
-                opts.on_item_change(r._item)
-            end
-        end or nil,
-        on_action_close = function(confirmed, result)
-            if confirmed ~= nil then
-                done = true
-                cb(confirmed == true, result or collect())
-            end
-        end,
-    })
+        end
+        content_p = {
+            hide_cursor = all_hide,
+            filetype = tabset[active].provider.filetype,
+            --- Content-size hint — the active tab's, used only when an axis resolves to AUTO sizing.
+            ---@return integer width, integer height
+            size = function()
+                local pr = active_provider()
+                if pr and pr.size then
+                    return pr.size()
+                end
+                return 40, 10
+            end,
+            --- Realise the ACTIVE tab's content in the (re)laid-out shared panel window.
+            ---@param pan table
+            ---@param L table?
+            update = function(pan, L)
+                local pr = active_provider()
+                if pr and pr.update then
+                    pr.update(pan, L)
+                end
+            end,
+            --- Fired once at open (chassis key wiring) — forwarded to the tab active THEN (see above).
+            ---@param map fun(lhs: string|string[], fn: fun())
+            ---@param pan table
+            ---@param st2 table
+            keys = function(map, pan, st2)
+                local pr = active_provider()
+                if pr and pr.keys then
+                    pr.keys(map, pan, st2)
+                end
+            end,
+            --- Frame teardown — every tab's provider gets its `on_close` (each owns per-tab state).
+            ---@param pan table
+            on_close = function(pan)
+                for _, t in ipairs(tabset) do
+                    if t.provider and t.provider.on_close then
+                        pcall(t.provider.on_close, pan)
+                    end
+                end
+            end,
+        }
+    else
+        local content1
+        content1, actions1 = split(active)
+        form_p = form.new({
+            rows = content1,
+            -- Focus a specific row on open (jump-to): a row `name` or index in the initially-active tab.
+            initial_row = opts.initial_row,
+            on_change = opts.on_change,
+            cursorline_hl = opts.cursorline_hl,
+            pad = opts.pad, -- body content lpad (default 2); a compact picker can drop it (e.g. 0)
+            -- a footer key-hint legend tracks the focused row: re-notify on cursor move (legend only, not the
+            -- static button-list form of `footer_hints`)
+            on_cursor = opts.footer_hints == true and function()
+                if update_footer then
+                    update_footer()
+                end
+            end or nil,
+            -- Item-list picker live preview: fire the consumer's `on_item_change` with the focused item on EVERY
+            -- cursor move (raw, no dedup — the variant rows are all `action`, so a sig-deduped hook would miss them).
+            on_move = opts.on_item_change and function(r)
+                if r and r._item then
+                    opts.on_item_change(r._item)
+                end
+            end or nil,
+            on_action_close = function(confirmed, result)
+                if confirmed ~= nil then
+                    done = true
+                    cb(confirmed == true, result or collect())
+                end
+            end,
+        })
+        content_p = form_p
+    end
 
     local function action_specs(actions)
         local specs = {}
@@ -735,31 +817,44 @@ function M.tabs(opts)
         return specs
     end
 
-    -- `footer_hints` as a LIST `{ {key, label}, … }` renders FOOTER BUTTONS (the installer prompt's
-    -- All/Selected/Cancel, diagnostics next/prev) wired to the matching `opts.keymaps[key].fn` — distinct from
-    -- `footer_hints = true`, which is the live key-hint legend. Pressing the key OR clicking the button fires it.
+    -- `footer_hints` as a LIST `{ {key, label, run?, no_hotkey?}, … }` renders FOOTER BUTTONS (the installer
+    -- prompt's All/Selected/Cancel, diagnostics next/prev, the terminal's nav chips). An item's own `run(st)`
+    -- wins; else it wires to the matching `opts.keymaps[key].fn`; else it closes. `no_hotkey` makes it a
+    -- label-only chip (a multi-char key LABEL — "A-l", "q/Esc" — must never become a real mapping: it would
+    -- turn its first char into a mapping prefix → a timeoutlen stall); a `type = "separator"` item passes
+    -- through as a divider. Distinct from `footer_hints = true`, the live key-hint legend. Pressing the key
+    -- (when real) OR clicking the button fires it.
     local function footer_hint_specs(hints)
         local specs = {}
         for _, h in ipairs(hints) do
-            local key = h.key
-            specs[#specs + 1] = {
-                key = key,
-                name = h.label or h.name or "",
-                run = function(st)
-                    local km = opts.keymaps and opts.keymaps[key]
-                    if km and km.fn then
-                        km.fn(function(confirmed, r)
-                            st.close()
-                            if confirmed ~= nil then
-                                done = true
-                                cb(confirmed == true, r or collect())
-                            end
-                        end)
-                    else
-                        st.close()
-                    end
-                end,
-            }
+            if h.type then
+                specs[#specs + 1] = h -- a separator (or any full bar-element spec) passes through unchanged
+            else
+                local key = h.key
+                specs[#specs + 1] = {
+                    key = key,
+                    name = h.label or h.name or "",
+                    no_hotkey = h.no_hotkey,
+                    run = function(st2)
+                        if h.run then
+                            h.run(st2)
+                            return
+                        end
+                        local km = opts.keymaps and opts.keymaps[key]
+                        if km and km.fn then
+                            km.fn(function(confirmed, r)
+                                st2.close()
+                                if confirmed ~= nil then
+                                    done = true
+                                    cb(confirmed == true, r or collect())
+                                end
+                            end)
+                        else
+                            st2.close()
+                        end
+                    end,
+                }
+            end
         end
         return specs
     end
@@ -783,7 +878,7 @@ function M.tabs(opts)
                 end,
             },
         }
-        local hints = form_p.hints and form_p.hints() or {}
+        local hints = (form_p and form_p.hints) and form_p.hints() or {}
         -- The ● divider + chevrons only appear when there ARE focused-row keys to the right; on a row with no
         -- keys of its own (e.g. a display-only detail field) the divider would dangle, so drop it.
         if #hints > 0 then
@@ -795,13 +890,13 @@ function M.tabs(opts)
                 key = h.key,
                 name = h.label,
                 no_hotkey = true,
-                run = function(st)
+                run = function(st2)
                     if h.act == "next" then
                         form_p.cycle(1)
                     elseif h.act == "prev" then
                         form_p.cycle(-1)
                     elseif form_p.act then
-                        form_p.act(st)
+                        form_p.act(st2)
                     end
                 end,
             }
@@ -824,22 +919,114 @@ function M.tabs(opts)
         end
     end
 
-    -- Header bars: an optional subtitle text bar + a tab bar (live switch) when more than one tab, then the
-    -- ACTIVE tab's toolbar bars — each `type="bar"` row becomes its OWN header-band SECTOR (reached with
-    -- C-j/C-k, like the picker's filter bar). The TITLE is the frame's border-title, not a header bar.
-    local static_bars = {} -- the per-surface prefix (subtitle + tab bar + air); per-TAB bars are appended
-    local set_active_tab -- (multi-tab) switch to a tab; shared by the tab bar and the body l/h keymaps
-    local tab_bar, tab_btns
+    -- Header bars: an optional subtitle text bar + a tab bar (live switch), then the ACTIVE tab's toolbar
+    -- bars — each `type="bar"` row becomes its OWN header-band SECTOR (reached with C-j/C-k, like the
+    -- picker's filter bar). The TITLE is the frame's border-title, not a header bar.
+    local static_bars = {} -- the per-surface prefix (subtitle bars); the tab bar + per-TAB bars are appended live
+    local set_active_tab -- forward decl: switch to a tab; shared by the tab bar, the body l/h keymaps + the handle
     for _, b in ipairs(subtitle_bars(opts.subtitle)) do
         static_bars[#static_bars + 1] = b
     end
 
-    -- The full header spec for the CURRENT active tab: the static prefix + the active tab's bar rows as bands.
-    -- Re-evaluated on every tab switch / content rebuild and applied via `st.set_header`.
+    --- Map one tab-bar AFFORDANCE record — a per-tab companion (`tab.actions`, e.g. a kill ×) or a bar
+    --- trailer (`opts.tab_bar_actions`, e.g. a + new-tab) — through the shared button mapper, `plain` kind
+    --- (a bare glyph; the record's `hl` box override carries its own accent).
+    ---@param a { name?: string, icon?: string, key?: string, hl?: table, run?: fun(st: table) }
+    ---@return table  a ui.button spec
+    local function affordance_button(a)
+        return frame.button({
+            name = a.name,
+            icon = a.icon,
+            key = a.key,
+            style = "plain",
+            hl = a.hl,
+            run = a.run,
+            no_hotkey = a.no_hotkey,
+        }, "plain")
+    end
+
+    --- Whether the header shows a tab bar RIGHT NOW: the explicit `opts.tab_bar` wins; else auto — more
+    --- than one tab, or ANY tab-bar affordance (a per-tab `actions` / trailing `tab_bar_actions` bar is
+    --- functional chrome even for a single tab). Re-evaluated per header rebuild, so a tabset grown past
+    --- one tab via `set_tabs` gains its bar live.
+    ---@return boolean
+    local function want_tab_bar()
+        if opts.tab_bar ~= nil then
+            return opts.tab_bar == true
+        end
+        if #tabset > 1 then
+            return true
+        end
+        if type(opts.tab_bar_actions) == "table" and #opts.tab_bar_actions > 0 then
+            return true
+        end
+        for _, t in ipairs(tabset) do
+            if t.actions and #t.actions > 0 then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- The PERSISTENT tab-bar band (identity kept across rebuilds so `_sel`/`_off` scroll state survives a
+    -- header re-derive). `_follow` + `_sel` keep the ACTIVE tab scrolled into view on an overflowing bar,
+    -- even when the bar isn't the focused sector (tabs are usually switched with h/l from the body).
+    -- Overflow chevrons: the ui.bar DEFAULT chevron glyph is empty (a consumer supplies it), so an
+    -- overflowing tab bar needs its own — the SHARED glyphs (config.chevrons) in the tab accent.
+    local tab_bar = {
+        align = "center",
+        _follow = true,
+        chevrons = frame.chevrons("LvimUiTabChevron"),
+    }
+
+    --- (Re)build the tab bar's element list from the LIVE tabset: a `tab`-kind button per tab (icon +
+    --- label, the shared styling path; a per-tab `hl` box override rides on it — e.g. a "dead" accent) —
+    --- the tab index in `_meta` drives the switch — each followed by its affordance buttons
+    --- (`tab.actions`), then the bar trailers (`opts.tab_bar_actions`). Rebuilt on every tab switch /
+    --- `set_tabs`, anchoring `_sel` on the active tab's button.
+    local function refresh_tab_bar()
+        local items, sel = {}, nil
+        for i, t in ipairs(tabset) do
+            items[#items + 1] = frame.button({
+                name = t.label or ("Tab " .. i),
+                icon = t.icon,
+                style = "tab",
+                hl = t.hl,
+                active = (i == active),
+                meta = { tab = i },
+            }, "tab")
+            if i == active then
+                sel = #items
+            end
+            for _, a in ipairs(t.actions or {}) do
+                items[#items + 1] = affordance_button(a)
+            end
+        end
+        for _, a in ipairs(opts.tab_bar_actions or {}) do
+            items[#items + 1] = affordance_button(a)
+        end
+        tab_bar.items = items
+        tab_bar._sel = sel or 1
+    end
+    refresh_tab_bar()
+    -- A "live" bar: moving the bar's selection onto a TAB button switches to it immediately (an affordance
+    -- button under the selection is a no-op here — it fires via <CR>/its `run`).
+    tab_bar.on_change = function(spec, st2)
+        if spec and spec._meta and spec._meta.tab then
+            set_active_tab(st2, spec._meta.tab)
+        end
+    end
+
+    -- The full header spec for the CURRENT active tab: the static prefix + the tab bar (when shown) + the
+    -- active tab's bar rows as bands. Re-evaluated on every tab switch / content rebuild via `st.set_header`.
     local function header_spec()
         local hb = {}
         for _, b in ipairs(static_bars) do
             hb[#hb + 1] = b
+        end
+        if want_tab_bar() then
+            hb[#hb + 1] = tab_bar
+            hb[#hb + 1] = { text = "" } -- 1 blank "air" row between the tab bar and the toolbars/content
         end
         local _, _, tbars = split(active)
         for _, br in ipairs(tbars) do
@@ -848,61 +1035,34 @@ function M.tabs(opts)
         return { bars = hb }
     end
 
-    if #tabset > 1 then
-        tab_btns = {}
-        for i, t in ipairs(tabset) do
-            -- Built by the SHARED `surface.button` mapper with the `tab` KIND (icon + label, LvimUiTab* colours) —
-            -- the tab bar uses the same styling path as every other bar; the tab index rides in `_meta` for the
-            -- active-tab re-sync below.
-            tab_btns[i] = frame.button({
-                name = t.label or ("Tab " .. i),
-                icon = t.icon,
-                style = "tab",
-                active = (i == active),
-                meta = { tab = i },
-            }, "tab")
+    --- Switch to tab `i` (clamped): re-anchor the bar, swap the content — rows mode re-reads the new tab's
+    --- rows into the form; provider mode lets the header relayout re-fire the delegate's `update`, which
+    --- realises the NEW active tab's content in the shared panel (the buffer swap) — and re-fit.
+    ---@param st2 table    the frame state
+    ---@param i integer?   the target tab index (non-numbers are ignored — e.g. an affordance button's nil meta)
+    set_active_tab = function(st2, i)
+        if type(i) ~= "number" or #tabset == 0 then
+            return
         end
-        -- `_follow` + `_sel` keep the ACTIVE tab scrolled into view on an overflowing tab bar, even when the
-        -- bar isn't the focused sector (tabs are usually switched with h/l from the body).
-        -- Overflow chevrons: the ui.bar DEFAULT chevron glyph is empty (a consumer supplies it), so an overflowing
-        -- tab bar needs its own — the SHARED glyphs (config.chevrons) in the tab accent (LvimUiTabChevron), or
-        -- nothing marks the hidden tabs.
-        tab_bar = {
-            items = tab_btns,
-            align = "center",
-            _sel = active,
-            _follow = true,
-            chevrons = frame.chevrons("LvimUiTabChevron"),
-        }
-        set_active_tab = function(st, i)
-            i = math.max(1, math.min(i, #tabset))
-            if i == active then
-                return
-            end
-            active = i
-            -- header_spec() REUSES the static tab_bar (it doesn't rebuild it), so update the scroll anchor + the
-            -- per-button active flags HERE — this is what makes the bar follow the active tab (with `_follow`)
-            -- when it's switched from the body, not only when the bar itself is focused.
-            tab_bar._sel = active
-            for _, b in ipairs(tab_btns) do
-                b.active = (b._meta and b._meta.tab == active)
-            end
+        i = math.max(1, math.min(i, #tabset))
+        if i == active then
+            return
+        end
+        active = i
+        refresh_tab_bar()
+        if form_p then
             form_p.set_rows((split(active)))
-            -- Rebuild the header with the NEW tab's toolbar bars (+ re-fit). set_header relayouts.
-            if st.set_header then
-                st.set_header(header_spec())
-            elseif st.relayout then
-                st.relayout()
-            end
-            if st and st.set_counter then
-                st.set_counter(opts.title_count) -- refresh the border counter for the new tab
-            end
         end
-        tab_bar.on_change = function(spec, st)
-            set_active_tab(st, spec._meta and spec._meta.tab)
+        -- Rebuild the header with the NEW tab's bar state (+ re-fit). set_header relayouts, which also
+        -- re-renders the content block (the provider-mode buffer swap).
+        if st2.set_header then
+            st2.set_header(header_spec())
+        elseif st2.relayout then
+            st2.relayout()
         end
-        static_bars[#static_bars + 1] = tab_bar
-        static_bars[#static_bars + 1] = { text = "" } -- 1 blank "air" row between the tab bar and the toolbars
+        if st2.set_counter then
+            st2.set_counter(opts.title_count) -- refresh the border counter for the new tab
+        end
     end
 
     -- (HOSTED area) An `area` panel homes itself in the msgarea zone via the surface engine's auto-host
@@ -989,17 +1149,25 @@ function M.tabs(opts)
         end)(),
         -- The tab CONTENT panel carries the single-source content ring (CONTENT_BORDER → config.content_border,
         -- resolved live). The tab BAR + footer hint bands are nav bars, not blocks, so they stay borderless.
-        content = { blocks = { { id = "form", provider = form_p, border = CONTENT_BORDER } } },
+        -- ONE block either way: the typed-row form, or (provider mode) the per-tab provider delegate.
+        content = {
+            blocks = { { id = provider_mode and "content" or "form", provider = content_p, border = CONTENT_BORDER } },
+        },
         footer = (opts.footer_hints == true and footer_hints_spec())
-            or (type(opts.footer_hints) == "table" and {
-                bars = {
-                    {
-                        items = footer_hint_specs(opts.footer_hints),
-                        align = "center",
-                        fill = opts.footer_fill ~= false,
+            or (
+                type(opts.footer_hints) == "table"
+                and {
+                    bars = {
+                        {
+                            items = footer_hint_specs(opts.footer_hints),
+                            align = "center",
+                            fill = opts.footer_fill ~= false,
+                            -- overflow chevrons in the footer accent (same box as the ● divider), shared glyphs
+                            chevrons = frame.chevrons("LvimUiFooterSep"),
+                        },
                     },
-                },
-            })
+                }
+            )
             or (
                 (#actions1 > 0)
                     and {
@@ -1223,6 +1391,7 @@ function M.info(content, opts)
         position = opts.position, -- nil = centred; "cursor" anchors at the cursor (e.g. hover), "win", …
         border = opts.border or FRAME_BORDER,
         title = opts.title ~= false and (opts.title or "Info") or nil, -- border-title, blue-tinted
+        title_pos = opts.title_pos, -- "left" (default) | "center" | "right" — title alignment
         close_keys = opts.close_keys or config.close_keys,
         keymaps = opts.keymaps,
         panel_border = "none",

@@ -58,13 +58,16 @@ function M.render(opts)
     local align = opts.align or "center"
 
     -- An optional LEFT-anchored TITLE prefix (always visible): the items then lay out in the width AFTER it
-    -- (e.g. a "Messages"/"Diagnostics" title with the buttons/counter aligned to the right). ASCII-only, so
-    -- byte length == display width. Prepended at the very end, with all item/chevron offsets shifted by it.
-    -- the bar TITLE is shown UPPERCASE everywhere (the canon for these title bars — message zone, picker, …)
+    -- (e.g. a "Messages"/"Diagnostics" title with the buttons/counter aligned to the right). Prepended at the
+    -- very end, with all item/chevron offsets shifted by it (in BYTES). the bar TITLE is shown UPPERCASE
+    -- everywhere (the canon for these title bars — message zone, picker, …).
     local prefix = (opts.title and opts.title ~= "") and (" " .. tostring(opts.title):upper() .. "  ") or ""
-    local pb = #prefix
+    local pb = #prefix -- BYTE length — the offset the item/chevron/span byte ranges are shifted by below
     if pb > 0 then
-        W = math.max(1, W - pb)
+        -- Reserve the prefix's DISPLAY width (NOT its byte length) from the layout width: a title with a
+        -- nerd-font ICON is multibyte, so `#prefix` overshoots and would leave the row (and its fill strip)
+        -- short of the right edge by (bytes − cells). strdisplaywidth measures the real columns it occupies.
+        W = math.max(1, W - vim.fn.strdisplaywidth(prefix))
     end
 
     -- 1. Assemble the raw bar text, its hl spans and each item's raw byte range (with its spec). No
