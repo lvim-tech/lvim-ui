@@ -67,4 +67,11 @@ documented as `LvimUiConfig` in `lua/lvim-ui/config.lua` (border, content_border
 separator, group_border, chevrons, size, backdrop, title_line, counter,
 title_pos, tint, icons, labels, keys, …).
 
+A centred float popup is MODAL by default (`trap_focus = true`): while it is open,
+focus cannot leave it — a `<C-w>` window jump or a mouse click on another window
+bounces straight back, so the only way out is the popup's own keys (`q`/`<Esc>`/an
+action). Docked / hosted panels (which set `host`/`position`/`on_escape_*`) coexist
+with the editor and never trap. Set `trap_focus = false` to disable globally, or on
+a single `surface.open` to opt that popup out.
+
 vim:tw=78:ts=8:ft=help:norl:

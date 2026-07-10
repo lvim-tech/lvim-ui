@@ -48,6 +48,7 @@ function M.check()
     local config = require("lvim-ui.config")
     health.info("popup filetype: " .. tostring(config.filetype))
     health.info("title placement: " .. tostring(config.title_line) .. " · counter: " .. tostring(config.counter))
+    health.info("modal focus trap (centred floats): " .. tostring(config.trap_focus ~= false))
     -- Backdrop geometry now lives in the single central authority (lvim-utils.config.dock.geometry), not in
     -- lvim-ui.config — report the float layout's backdrop from THERE.
     local ok_uconf, uconf = pcall(require, "lvim-utils.config")

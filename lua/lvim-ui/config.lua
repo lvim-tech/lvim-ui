@@ -87,6 +87,13 @@ return {
     max_items = 15,
     filetype = "lvim-utils-ui",
     close_keys = { "q", "<Esc>" },
+    -- MODAL focus trap: while a CENTRED float popup/panel is open, focus cannot leave it — a `<C-w>` window
+    -- jump OR a mouse click on another field bounces straight back into the frame, so the only way out is the
+    -- popup's own keys (`q`/`<Esc>`/an action). Default true (every centred float is modal). A split, or a
+    -- docked / hosted surface that means to coexist with the editor (it sets `host`/`position`/`on_escape_*`),
+    -- never traps unless it passes `trap_focus = true` explicitly. Turn it off globally with `trap_focus = false`,
+    -- or per popup via that surface's own `trap_focus`.
+    trap_focus = true,
     markview = false,
     -- Which icon plugin supplies the preview winbar file icon (resolved through lvim-utils.icons):
     -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icon.

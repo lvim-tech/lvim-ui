@@ -1586,6 +1586,36 @@ local function escape_to_neighbor(state, nav)
     return true
 end
 
+--- Whether this surface TRAPS focus: while it is open, focus cannot leave to a real (non-float) window —
+--- a native `<C-w>` jump OR a mouse click into the editor bounces straight back into the frame, so a modal
+--- popup genuinely cannot be escaped except through its own keys (`q`/`<Esc>`/an action). Neovim has no
+--- native window-modality, so the WinEnter bounce below IS the canonical mechanism.
+---
+--- Resolution: the per-open `cfg.trap_focus` wins; else the GLOBAL `config.trap_focus`; else true. Only a
+--- CENTRED float is modal by default — a `split`, or a docked / hosted / escape-declaring surface
+--- (`host` / `position` / `on_escape_*`) is meant to COEXIST with the editor, so it never traps unless the
+--- consumer sets `trap_focus = true` explicitly.
+---@param state table
+---@return boolean
+local function traps_focus(state)
+    local cfg = state.cfg
+    local opt = cfg.trap_focus
+    if opt == nil then
+        local ok, gc = pcall(require, "lvim-ui.config")
+        opt = (ok and gc and gc.trap_focus)
+        if opt == nil then
+            opt = true
+        end
+    end
+    if not opt or cfg.mode ~= "float" then
+        return false
+    end
+    if cfg.host or cfg.position or cfg.on_escape_above or cfg.on_escape_below then
+        return cfg.trap_focus == true -- a coexisting dock/host: trap only on an explicit per-open opt-in
+    end
+    return true
+end
+
 --- Move focus to the next/prev sector, starting from the actually-focused window. At the top/bottom edge
 --- of a docked split it steps OUT to the neighbouring editor window (see `escape_to_neighbor`); otherwise
 --- it wraps around the frame.
@@ -1814,8 +1844,10 @@ local function set_keys(state)
             used[buf][l] = true
         end
     end
-    -- `cfg.lock_keys`: a MODAL panel — only the keys we bound act; every other normal-mode key (motions,
+    -- `lock_panel`: a MODAL panel — only the keys we bound act; every other normal-mode key (motions,
     -- scrolls, edits, search) is `<Nop>`-ed so a stray press can't move the cursor / scroll / edit the panel.
+    -- This is the DEFAULT for every surface (opt out per-open with `cfg.lock_keys = false`) — an unmapped key
+    -- must do nothing, so only the actions the bars/provider registered are live.
     -- The cmdline `:` is kept as an escape hatch. Run AFTER the panel binds (so `used` is populated) and BEFORE
     -- map_hotkeys (so a button hotkey re-maps OVER the `<Nop>`).
     local function lock_panel(buf)
@@ -1836,6 +1868,28 @@ local function set_keys(state)
         end
         for _, sk in ipairs({ "<Up>", "<Down>", "<Left>", "<Right>", "<PageUp>", "<PageDown>", "<Home>", "<End>" }) do
             nop(sk)
+        end
+        -- Mouse: the wheel AND a click-drag pull the VIEW directly (even with scrolloff=0), scrolling a
+        -- fit-to-window panel's top rows off the top. Nop the SCROLL + DRAG events across every mode a drag
+        -- can pass through (a normal-mode `<LeftDrag>` starts Visual, so bind there too). `<LeftMouse>` (a
+        -- plain click) is DELIBERATELY kept — a footer/header bar button must stay mouse-clickable.
+        local mouse = {
+            "<ScrollWheelUp>",
+            "<ScrollWheelDown>",
+            "<ScrollWheelLeft>",
+            "<ScrollWheelRight>",
+            "<LeftDrag>",
+            "<LeftRelease>",
+            "<2-LeftMouse>",
+            "<2-LeftDrag>",
+            "<RightMouse>",
+            "<RightDrag>",
+            "<MiddleMouse>",
+        }
+        for _, mk in ipairs(mouse) do
+            if not u[mk] then
+                pcall(vim.keymap.set, { "n", "v", "i" }, mk, "<Nop>", { buffer = buf, nowait = true, silent = true })
+            end
         end
     end
     for _, pan in ipairs(state.panels) do
@@ -1922,15 +1976,21 @@ local function set_keys(state)
         map(state.container_buf, km.key, fn)
     end
 
-    if state.cfg.lock_keys then -- modal: every unbound key is a no-op — the PANELS and the chrome CONTAINER
+    if state.cfg.lock_keys ~= false then -- modal by DEFAULT (opt out per-open with lock_keys = false): every unbound key is a no-op — the PANELS and the chrome CONTAINER
         for _, pan in ipairs(state.panels) do
-            local editable = pan.provider and pan.provider.editable
-            if not editable and vim.bo[pan.buf].buftype ~= "terminal" then
+            local prov = pan.provider or {}
+            -- Lock a CONTENT panel only when its cursor is HIDDEN: there the cursor is NOT the interaction — the
+            -- provider has bound every real key — so any other press must be inert (the picker's stray H/L, a gg,
+            -- a `/`, a `dd`). A VISIBLE-cursor panel navigates / scrolls by the NATIVE cursor (j/k/arrows, C-d/C-u
+            -- on a scrollable float or a cursor-driven list) — locking would freeze it — so it keeps its keys (it
+            -- may still bind its own maps AFTER open, e.g. lvim-space's `enable_base_maps`).
+            if prov.hide_cursor and not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
                 lock_panel(pan.buf)
             end
         end
-        -- the container is the chrome buffer (bar-menu mode) — a stray `<C-f>`/`<C-d>` on a focused bar scrolled
-        -- it, pushing the header (title + bar) off the top and the footer up into its place
+        -- the container is the chrome buffer (bar-menu mode), never cursor-navigated — h/l move a Sel stripe (re-
+        -- bound below), so lock it ALWAYS: a stray `<C-f>`/`<C-d>` on a focused bar scrolled it, pushing the
+        -- header (title + bar) off the top and the footer up into its place
         lock_panel(state.container_buf)
     end
 
@@ -2174,6 +2234,11 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
         pcall(api.nvim_set_current_win, pan.win)
     end
     vim.wo[pan.win].wrap = false
+    -- A panel is a self-contained UI whose content is sized to fit its window — it must NEVER scroll. Pin
+    -- scrolloff/sidescrolloff to 0 so the (often hidden) cursor reaching the last row can't push the top rows
+    -- (a picker's preview swatch, its mode/output header) off the top under the user's global `scrolloff`.
+    vim.wo[pan.win].scrolloff = 0
+    vim.wo[pan.win].sidescrolloff = 0
     if pan.provider and pan.provider.cursorline then
         local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline)
             or ((#state.panels > 1) and "LvimUiCursorLine" or "LvimUiPeekCursorLine")
@@ -2861,6 +2926,9 @@ local function open_windows(state)
             render_chrome(state, state._geom)
         end
     end
+    -- Resolved ONCE at open: a modal float traps focus (the WinEnter bounce below). `state._trap_return` tracks
+    -- the last frame window focused, so a bounce lands the user back where they were, not on an arbitrary sector.
+    local trap = traps_focus(state)
     -- Cursor hygiene: the frame hides the hardware cursor while a list panel is focused, so when focus
     -- moves OUT of the frame (e.g. `<C-w>w` to the editor above a docked split) the cursor must come
     -- back, and re-hide on return. A list-style panel hides it; any other window shows it; the bar-menu
@@ -2874,6 +2942,7 @@ local function open_windows(state)
             local w = api.nvim_get_current_win()
             if w == state.container_win then
                 set_blur(false)
+                state._trap_return = w
                 -- Native window nav landed on the chrome split (e.g. `<C-w>j` from the editor above) — the
                 -- user means "step into the panel". Land on the FIRST sector (the top header bar) so entry
                 -- is step-by-step (header → center → footer via `<C-j>`), not a jump straight to the center.
@@ -2893,8 +2962,33 @@ local function open_windows(state)
             for _, pan in ipairs(state.panels) do
                 if pan.win == w then
                     set_blur(false)
+                    state._trap_return = w
                     cursor.update() -- panel ft decides (hide-cursor list vs editable preview)
                     return
+                end
+            end
+            -- Focus left the frame's container/panels. A FLOAT target (a child dialog this modal spawned, an
+            -- input-band overlay, a sub-popup) is legitimate and allowed. A REAL window (the editor / a split)
+            -- means the user tried to LEAVE — and a trapping modal forbids that: bounce focus straight back so
+            -- the popup cannot be escaped by a `<C-w>` jump OR a mouse click on another field. Scheduled (never
+            -- synchronous inside WinEnter) and guarded by `_trapping` so it can't recurse.
+            if trap and not state._trapping then
+                local ok_cfg, wc = pcall(api.nvim_win_get_config, w)
+                if ok_cfg and wc.relative == "" then
+                    local back = (state._trap_return and api.nvim_win_is_valid(state._trap_return))
+                            and state._trap_return
+                        or (api.nvim_win_is_valid(state.container_win) and state.container_win)
+                        or nil
+                    if back then
+                        state._trapping = true
+                        vim.schedule(function()
+                            state._trapping = false
+                            if not state._closed and api.nvim_win_is_valid(back) then
+                                pcall(api.nvim_set_current_win, back)
+                            end
+                        end)
+                        return
+                    end
                 end
             end
             -- Focus left the frame entirely → clear the selection highlight; the cursor module shows the
@@ -3353,6 +3447,8 @@ local function open_native_split(state)
         vim.wo[pan.win].winfixwidth = true
     end
     vim.wo[pan.win].wrap = false
+    vim.wo[pan.win].scrolloff = 0 -- a fit-to-window panel must never scroll its content off (see open_panel_win)
+    vim.wo[pan.win].sidescrolloff = 0
     -- The panel's Normal group: the float/peek bg (`LvimUiPeekNormal`) by default, or a caller-chosen group
     -- via `cfg.normal_hl` — e.g. a persistent DOCKED side panel (the outline) passes "NormalSB" so it wears the
     -- opaque SIDEBAR background (matching neo-tree) instead of the transparency-following float bg.

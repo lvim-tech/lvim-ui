@@ -91,6 +91,11 @@ require("lvim-ui").setup({
     max_items = 15, -- list rows shown before scrolling
     filetype = "lvim-utils-ui", -- filetype set on the popup buffer
     close_keys = { "q", "<Esc>" }, -- keys that close the popup
+    -- Modal focus trap: while a centred float popup is open, focus cannot leave it — a <C-w> jump OR a
+    -- mouse click on another window bounces straight back, so the only way out is the popup's own keys.
+    -- Default true (every centred float is modal); docked / hosted panels coexist and never trap. Set
+    -- false to disable globally, or per popup via that surface's own `trap_focus`.
+    trap_focus = true,
     markview = false, -- markview rendering in the popup
     -- Title placement: "row" (a top content row) | "border" (native border-title) | "statusline" (overlay).
     title_line = "row",
