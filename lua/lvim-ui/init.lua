@@ -455,6 +455,11 @@ function M.input(opts)
     local confirmed = false
     local buf
 
+    -- A 2-space LEFT gutter is baked into the editable line (`PAD .. value`) instead of a side border, so the
+    -- text never butts the popup edge; it is stripped back off on confirm. `size` reserves PAD on the left AND
+    -- right, so a value narrower than the popup shows 2 spaces on both sides.
+    local PAD = "  "
+
     --- @param st table
     local function confirm(st)
         confirmed = true
@@ -462,6 +467,7 @@ function M.input(opts)
         if buf and vim.api.nvim_buf_is_valid(buf) then
             val = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
         end
+        val = val:match("^%s*(.-)%s*$") or "" -- drop the padding gutter (and any stray edge whitespace)
         st.close()
         vim.schedule(function()
             cb(true, val)
@@ -474,10 +480,16 @@ function M.input(opts)
             return math.max(util.dw(default) + 4, util.dw(opts.title or opts.prompt or "Input") + 4, 30), 1
         end,
         render = function()
-            return { default }, {}
+            return { PAD .. default }, {}
         end,
         keys = function(map, p, st)
             buf = p.buf
+            -- Land the cursor at the END of the value (past the 2-space gutter), not inside the padding.
+            vim.schedule(function()
+                if p.win and vim.api.nvim_win_is_valid(p.win) then
+                    pcall(vim.api.nvim_win_set_cursor, p.win, { 1, #(PAD .. default) })
+                end
+            end)
             vim.keymap.set("i", "<CR>", function()
                 vim.cmd("stopinsert")
                 confirm(st)
@@ -494,10 +506,16 @@ function M.input(opts)
 
     frame.open({
         mode = "float",
-        border = FRAME_BORDER,
+        -- A top-only " " border (ct=1) so the CENTRED native border-title has a row to sit on even when the
+        -- global `config.border` is "none" — else `title_line="border"` has nowhere to draw and the title
+        -- vanishes. No side borders: the input line runs flush left/right (no horizontal gutter).
+        border = { "", " ", "", "", "", "", "", "" },
         title = opts.title or opts.prompt or "Input",
-        -- The single editable line IS an INPUT / entry band, NOT a data-content panel — so it stays BORDERLESS
-        -- (panel_border "none"), per the content-vs-nav rule. Only DATA panels carry the content ring.
+        -- CENTRED border-title, with the canon air rows kept: 1 blank row under the title (above the input) and
+        -- 1 above the footer (below the input), so the input line breathes.
+        title_pos = opts.title_pos or "center",
+        title_line = "border",
+        -- No content ring — the 2-space gutter is baked into the rendered value (see PAD above), not a border.
         panel_border = "none",
         size = { width = { auto = true, max = opts.width or 0.6 }, height = { auto = true } },
         content = { blocks = { { id = "input", provider = provider } } },

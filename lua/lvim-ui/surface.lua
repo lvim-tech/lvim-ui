@@ -479,8 +479,8 @@ local function build_bands(spec, footer, add_air)
         end
     end
     if footer then
-        if #bands > 0 then
-            table.insert(bands, 1, { meta = "" }) -- 1 air row ABOVE the footer content (the only footer air)
+        if #bands > 0 and add_air ~= false then
+            table.insert(bands, 1, { meta = "" }) -- 1 air row ABOVE the footer content (skip when footer_air=false)
         end
     elseif add_air ~= false then
         table.insert(bands, 1, { meta = "" }) -- 1 air row under the (border-)title (skip when add_air=false)
@@ -1936,6 +1936,34 @@ local function set_keys(state)
                 state.toggle_preview()
             end
         end)
+        -- HIDE-CURSOR list movement: on a hide-cursor panel the native cursor keys are locked
+        -- (lock_panel nops every unbound printable), so the CHASSIS moves the hidden cursor —
+        -- cursorline is the selection (a simple `M.select` list, a help/ops list provider). A
+        -- provider that binds its own K.down/K.up (the form) overrides these below.
+        if pan.provider and pan.provider.hide_cursor and not pan.provider.editable then
+            local function list_move(delta)
+                if pan.win and api.nvim_win_is_valid(pan.win) then
+                    local line = api.nvim_win_get_cursor(pan.win)[1]
+                    local target = math.max(1, math.min(line + delta, api.nvim_buf_line_count(pan.buf)))
+                    api.nvim_win_set_cursor(pan.win, { target, 0 })
+                end
+            end
+            -- K.down/K.up may be a single lhs or a list — flatten with the arrow synonym appended.
+            local function plus_arrow(keys, arrow)
+                local out = {}
+                for _, l in ipairs(type(keys) == "table" and keys or { keys }) do
+                    out[#out + 1] = l
+                end
+                out[#out + 1] = arrow
+                return out
+            end
+            map(pan.buf, plus_arrow(K.down, "<Down>"), function()
+                list_move(1)
+            end)
+            map(pan.buf, plus_arrow(K.up, "<Up>"), function()
+                list_move(-1)
+            end)
+        end
         if pan.provider and pan.provider.keys then
             pcall(pan.provider.keys, function(lhs, fn)
                 map(pan.buf, lhs, fn)
@@ -2665,7 +2693,7 @@ local function open_windows(state)
     ---@param spec table
     state.set_footer = function(spec)
         state.cfg.footer = spec
-        state.footer_bands = build_bands(spec, true)
+        state.footer_bands = build_bands(spec, true, state.cfg.footer_air)
         state.sectors = build_sectors(state)
         if state._geom then
             render_chrome(state, state._geom)
@@ -2689,6 +2717,17 @@ local function open_windows(state)
                 title = brand,
                 title_pos = brand and (state.cfg.title_pos or "left") or nil,
             })
+        end
+        -- `title_line = "row"`: the title lives in a title_counter HEADER BAND whose text was
+        -- derived at build time — re-derive it here so a live retitle (a breadcrumb following
+        -- navigation) shows without a full header rebuild.
+        for _, band in ipairs(state.header_bands or {}) do
+            if band.title_counter then
+                local t = state.cfg.title
+                band.text = type(t) == "table" and ((t.icon and t.icon .. " " or "") .. tostring(t.text or ""))
+                    or tostring(t or "")
+                break
+            end
         end
         publish_overlay_title(state)
         if state._geom then
@@ -3304,6 +3343,13 @@ local function close(state)
     if state.augroup then
         pcall(api.nvim_del_augroup_by_id, state.augroup)
     end
+    -- The native-split footer float (owned by the surface) — close it before the panel windows.
+    if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
+        pcall(api.nvim_win_close, state._footer_win, true)
+    end
+    if state._footer_buf and api.nvim_buf_is_valid(state._footer_buf) then
+        pcall(api.nvim_buf_delete, state._footer_buf, { force = true })
+    end
     dyn_disable(state) -- close the dynamic peek float + its autocmds, if armed
     -- Let providers release any external state before we drop the windows (the frame's own scratch panel
     -- buffers are deleted below, taking their keymaps/extmarks with them, but a provider may hold things
@@ -3475,6 +3521,84 @@ local function open_native_split(state)
     end
     pan.frame = state
     render_panel(state, 1)
+
+    -- Native-split FOOTER: a 1-row bar pinned to the panel's bottom row. A native split is ONE real window
+    -- (no chrome container to host header/footer bands), so the footer is a managed float THE SURFACE owns —
+    -- `relative = "win"`, so it tracks the panel and stays put however far the content scrolls. A consumer
+    -- passes `footer = { bars = { { items = …, align = … } } }` and refreshes it live via `state.set_footer`,
+    -- instead of hand-rolling a window.
+    local function render_native_footer(spec)
+        local bar = spec and spec.bars and spec.bars[1]
+        if not (bar and bar.items and pan.win and api.nvim_win_is_valid(pan.win)) then
+            return
+        end
+        if not (state._footer_buf and api.nvim_buf_is_valid(state._footer_buf)) then
+            state._footer_buf = api.nvim_create_buf(false, true)
+            vim.bo[state._footer_buf].bufhidden = "wipe"
+            vim.keymap.set("n", "<LeftMouse>", function()
+                local m = vim.fn.getmousepos()
+                if m.winid ~= state._footer_win then
+                    return
+                end
+                local col = m.column - 1
+                for _, it in ipairs(state._footer_items or {}) do
+                    if it.c0 and col >= it.c0 and col < it.c1 and it.spec and it.spec.run then
+                        it.spec.run()
+                        return
+                    end
+                end
+            end, { buffer = state._footer_buf, nowait = true, silent = true })
+        end
+        local fw = api.nvim_win_get_width(pan.win)
+        local band = require("lvim-ui.bar").render({ items = bar.items, width = fw, align = bar.align or "center" })
+        state._footer_items = band.items
+        vim.bo[state._footer_buf].modifiable = true
+        api.nvim_buf_set_lines(state._footer_buf, 0, -1, false, { band.line })
+        vim.bo[state._footer_buf].modifiable = false
+        api.nvim_buf_clear_namespace(state._footer_buf, NS, 0, -1)
+        pcall(api.nvim_buf_set_extmark, state._footer_buf, NS, 0, 0, {
+            end_row = 1,
+            hl_eol = true,
+            hl_group = "LvimUiBarFill",
+            priority = 90,
+        })
+        for _, s in ipairs(band.spans) do
+            pcall(
+                api.nvim_buf_set_extmark,
+                state._footer_buf,
+                NS,
+                0,
+                s[1],
+                { end_col = s[2], hl_group = s[3], priority = 200 }
+            )
+        end
+        local wcfg = {
+            relative = "win",
+            win = pan.win,
+            row = math.max(0, api.nvim_win_get_height(pan.win) - 1),
+            col = 0,
+            width = fw,
+            height = 1,
+            focusable = false,
+            zindex = (state.zindex or 40) + 5,
+            style = "minimal",
+        }
+        if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
+            pcall(api.nvim_win_set_config, state._footer_win, wcfg)
+        else
+            state._footer_win = api.nvim_open_win(state._footer_buf, false, wcfg)
+            vim.wo[state._footer_win].winhighlight = "Normal:" .. normal_hl
+        end
+    end
+    --- Rebuild + repaint the native footer bar (live counts / labels).
+    ---@param spec table
+    state.set_footer = function(spec)
+        state.cfg.footer = spec
+        render_native_footer(spec)
+    end
+    if cfg.footer then
+        render_native_footer(cfg.footer)
+    end
 
     -- Focus / block accessors. Navigation is NATIVE (`<C-w>`) — no sectors, bars or chrome to drive.
     state.center_panel = 1
@@ -3764,7 +3888,7 @@ function M.open(cfg)
         origin = api.nvim_get_current_win(),
         panels = panels,
         header_bands = hbands,
-        footer_bands = build_bands(cfg.footer, true),
+        footer_bands = build_bands(cfg.footer, true, cfg.footer_air),
     }
     state.close = function()
         close(state)
