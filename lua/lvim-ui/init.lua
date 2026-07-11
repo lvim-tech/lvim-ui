@@ -19,9 +19,11 @@
 --   M.tabs(opts)          – tabbed view with typed rows or simple item lists
 --   M.info(content, opts) – read-only markdown/text info window
 --   M.close_info(win)     – programmatically close an info window
+--   M.menu(opts)          – cursor-anchored NON-FOCUSABLE popup handle (completion menus)
 ---@module "lvim-ui"
 
 local frame = require("lvim-ui.surface")
+local menu = require("lvim-ui.menu")
 local form = require("lvim-ui.form")
 local rows = require("lvim-ui.rows")
 local util = require("lvim-ui.util")
@@ -1542,6 +1544,17 @@ function M.close_info(win)
     if win and vim.api.nvim_win_is_valid(win) then
         vim.api.nvim_win_close(win, true)
     end
+end
+
+--- Create a cursor-anchored, NON-FOCUSABLE menu handle (the completion-popup primitive) — a
+--- passive projection redrawn per keystroke while focus stays in the editing buffer. Unlike
+--- every other lvim-ui shape this is NOT a modal: no sectors, no close keys, no cursor
+--- hiding — the consumer drives it (show/update/move/select/hide/close) from its own
+--- insert-mode machinery. See lvim-ui.menu for the row/box model and the handle API.
+---@param opts? LvimUiMenuOpts
+---@return table handle
+function M.menu(opts)
+    return menu.new(opts)
 end
 
 --- Create an independent UI instance with its own config overrides.

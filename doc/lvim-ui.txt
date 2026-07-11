@@ -61,6 +61,34 @@ The low-level chassis is `require("lvim-ui.surface")` (framed floating / docked
 windows) with `require("lvim-ui.button")` / `require("lvim-ui.bar")` for
 navigable button bars.
 
+                                                                 *lvim-ui.menu()*
+require("lvim-ui").menu({opts})                        → handle
+
+The cursor-anchored NON-FOCUSABLE popup primitive (completion menus): a passive
+projection redrawn per keystroke while focus stays in the editing buffer. One
+long-lived window/buffer per handle (`focusable = false`, `noautocmd`,
+repositioned via |nvim_win_set_config()| — never recreated); the window is glued
+to `anchor = { lnum, col }` (the matched keyword's START, so it does not shift
+while typing) and flips below/above per `direction_priority = { "s", "n" }`
+near the screen edge. Rows are BOX lists (lead box + label + `right = true`
+detail); ALL row colour — box highlights, LAZY matched-char `positions`
+callbacks, the scrollbar — is applied by a decoration provider as EPHEMERAL
+extmarks on VISIBLE lines only. Selection is a bg-only cursorline
+(`LvimUiMenuSel`) set via the handle. A sibling docs slot
+(`docs_show(lines, { filetype })` / `docs_hide()`) glues a second non-focusable
+window beside the menu.
+
+Options: `max_height` (12), `max_width` (60), `min_width` (0), `col_offset`
+(0), `direction_priority` ({ "s", "n" }), `scrollbar` (true), `zindex` (65),
+`docs` ({ max_width = 80, max_height = 20 }), `hl` (group overrides).
+
+Handle: `show({ items, anchor, selected })`, `update(items, selected)`,
+`move(anchor)`, `select(i)`, `select_move(delta)`, `selected()`, `count()`,
+`visible()`, `hide()`, `close()`, `docs_show()`, `docs_hide()`, `win()`.
+
+Groups: `LvimUiMenuNormal`, `LvimUiMenuSel`, `LvimUiMenuMatch`,
+`LvimUiMenuDetail`, `LvimUiMenuThumb`, `LvimUiMenuTrack` — palette-bound.
+
 ==============================================================================
 5. CONFIGURATION                                          *lvim-ui-configuration*
 

@@ -52,6 +52,59 @@ surface content provider, typically built on `require("lvim-ui.preview").new({ i
 The low-level chassis is `require("lvim-ui.surface")` (framed floating/docked windows) with
 `require("lvim-ui.button")` / `require("lvim-ui.bar")` for navigable button bars.
 
+### The `menu` primitive (cursor-anchored, non-focusable)
+
+`ui.menu(opts)` creates the PASSIVE popup primitive — a completion-menu window redrawn per keystroke while
+focus stays in the editing buffer (insert mode). Unlike every modal above it has no sectors, no close keys and
+no cursor hiding: the consumer (e.g. **lvim-cmp**) drives the returned handle from its own machinery.
+
+```lua
+local menu = require("lvim-ui").menu({
+    max_height = 12, -- visible rows cap (longer lists scroll)
+    max_width = 60, -- content width cap (cells)
+    min_width = 0, -- content width floor
+    col_offset = 0, -- shift vs the anchor col (e.g. minus a lead box width)
+    direction_priority = { "s", "n" }, -- below / above, tried in order
+    scrollbar = true, -- right-edge thumb when overflowing
+    zindex = 65,
+    docs = { max_width = 80, max_height = 20 }, -- the sibling docs slot caps
+})
+
+-- rows are BOX lists: lead box + label + right-aligned detail; `positions` is a LAZY
+-- matched-char callback the decoration provider calls only for VISIBLE rows
+menu.show({
+    items = {
+        {
+            boxes = {
+                { text = " 󰊕 ", hl = "MyKindChip" },
+                {
+                    text = "read_file",
+                    positions = function()
+                        return { 1, 2, 6 }
+                    end,
+                },
+                { text = " detail ", hl = "Comment", right = true },
+            },
+        },
+    },
+    anchor = { lnum = 10, col = 4 }, -- the matched keyword's START (no-shift while typing)
+    selected = 1, -- preselect (nil = none)
+})
+menu.update(items, selected) -- per-keystroke re-rank (same anchor)
+menu.move(anchor) -- re-anchor (new context)
+menu.select(2) -- selection = bg-only cursorline (auto-scrolls)
+menu.select_move(1) -- wraps
+menu.docs_show({ "docs…" }, { filetype = "markdown" }) -- glued sibling window
+menu.docs_hide()
+menu.hide() -- keep the long-lived buffer
+menu.close() -- destroy the handle
+```
+
+One long-lived window/buffer per handle (`focusable = false`, `noautocmd`, repositioned — never recreated);
+all row colours (box highlights, matched chars, the scrollbar) are EPHEMERAL decoration-provider extmarks on
+visible lines only. The window flips above the cursor near the screen edge per `direction_priority`. Groups:
+`LvimUiMenuNormal` / `Sel` / `Match` / `Detail` / `Thumb` / `Track` (palette-bound).
+
 ## Configuration
 
 `setup()` merges your options into the live config in place — every reader (`require("lvim-ui.config")`) sees
