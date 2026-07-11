@@ -27,6 +27,7 @@ local rows = require("lvim-ui.rows")
 local util = require("lvim-ui.util")
 local config = require("lvim-ui.config")
 local merge = require("lvim-utils.utils").merge
+local hl = require("lvim-utils.highlight")
 
 local M = {}
 
@@ -37,6 +38,33 @@ function M.setup(opts)
     if opts then
         merge(config, opts)
     end
+end
+
+--- Build a canonical COLLAPSIBLE SECTION HEADER row (a form accordion) — the ONE shape every lvim-tech UI
+--- uses for a fold whose children share an accent. The full-width band is that `accent` tinted onto the bg
+--- (0.1 at rest, 0.2 while the cursor hovers the header — the form swaps it), the label reads in the accent
+--- fg (bold), matching the caret box the caller renders in front. All three colours come from the shared
+--- `lvim-utils.highlight.section_accent`, so nothing is themed per plugin and it tracks the live palette.
+--- The caller owns the CARET BOX (its width aligns with that collection's child badges), passing it as
+--- `icon` + `box_hl`; everything else is canonical here.
+---@param opts { name: string, icon: string, box_hl: string, label: string, accent: string, expanded: boolean, children: table[], count?: integer }
+---@return Row
+function M.section(opts)
+    local s = hl.section_accent(opts.accent)
+    local label = opts.count ~= nil and ("%s (%d)"):format(opts.label, opts.count) or opts.label
+    return {
+        type = "action",
+        name = opts.name,
+        flat = true, -- suppress the form's auto-caret (the caller's box IS the caret)
+        tight = true, -- sit at the entry rows' ~2-col left gutter
+        icon = opts.icon,
+        icon_hl = opts.box_hl,
+        label = label,
+        text_hl = s.text,
+        row_hl = { inactive = s.band, active = s.hover },
+        expanded = opts.expanded,
+        children = opts.children,
+    }
 end
 
 ---@class UiOpts
@@ -81,7 +109,7 @@ end
 ---@field footer_hints? boolean|table[] -- tabs: `true` → live key-hint LEGEND footer (panel keys • focused-row keys); a list `{ {key,label,run?,no_hotkey?} }` → footer hint BUTTONS (an item's own `run` wins, else `opts.keymaps[key].fn`; `no_hotkey` = label-only chip; a `type="separator"` item passes through as a divider)
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
 ---@field pad? integer               -- tabs/form: body row left padding
----@field on_item_change? fun(item: table) -- tabs item-list mode: live preview callback on focused item
+---@field on_item_change? fun(item: table?) -- tabs item-list mode: live preview callback on focused item (nil on a row with no item — a section header / empty row — so the consumer can clear its preview)
 ---@field preview? table                -- tabs: a surface content PROVIDER shown as a second `id="preview"` block beside the tab content (e.g. built on lvim-ui.preview); plugs into the chassis preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> rotation)
 ---@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "above" | "below"
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
@@ -796,12 +824,12 @@ function M.tabs(opts)
                     update_footer()
                 end
             end or nil,
-            -- Item-list picker live preview: fire the consumer's `on_item_change` with the focused item on EVERY
-            -- cursor move (raw, no dedup — the variant rows are all `action`, so a sig-deduped hook would miss them).
+            -- Item-list picker live preview: fire the consumer's `on_item_change` on EVERY cursor move (raw, no
+            -- dedup — the variant rows are all `action`, so a sig-deduped hook would miss them). Passes the
+            -- focused row's `_item`, or NIL for a row that has none (a section header / empty row) — so the
+            -- consumer can CLEAR its preview to the placeholder instead of keeping the previous item's.
             on_move = opts.on_item_change and function(r)
-                if r and r._item then
-                    opts.on_item_change(r._item)
-                end
+                opts.on_item_change(r and r._item or nil)
             end or nil,
             on_action_close = function(confirmed, result)
                 if confirmed ~= nil then

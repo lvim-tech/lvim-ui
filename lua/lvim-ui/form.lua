@@ -347,12 +347,17 @@ function M.new(opts)
                     -- A FULL-WIDTH background strip (edge to edge, hl_eol) under the whole row — a section
                     -- header reads as one solid band. Low priority (100) so the per-part fg spans below
                     -- (icon_hl / text_hl, default priority 200) render on top. `row_hl` may be a plain group
-                    -- or a `{ inactive, active }` pair — the `active` band shows while the cursor is on the row
-                    -- (a HOVER), the CursorMoved handler re-rendering as the cursor enters / leaves such a row.
+                    -- or a `{ inactive, active }` pair — the `active` band shows only while THIS window is
+                    -- focused AND the cursor is on the row (a real HOVER, like the cursorline: it must not
+                    -- linger when focus leaves for another sector). Re-rendered on cursor move + win focus change.
                     if r.row_hl then
                         local rhl = r.row_hl
                         if type(rhl) == "table" then
-                            rhl = (cur_line() == i) and rhl.active or rhl.inactive
+                            local hovered = cur_line() == i
+                                and pan
+                                and pan.win
+                                and api.nvim_get_current_win() == pan.win
+                            rhl = hovered and rhl.active or rhl.inactive
                         end
                         if rhl then
                             hls[#hls + 1] = { i - 1, 0, -1, rhl, 100 }
@@ -538,6 +543,20 @@ function M.new(opts)
                             opts.on_cursor()
                         end
                     end
+                end,
+            })
+            -- A `{ inactive, active }` row_hl (a hover band) is gated on THIS window being current, so it must
+            -- be repainted when focus LEAVES for another sector (drop the lingering hover) and when it RETURNS
+            -- (restore it). Buffer-scoped, so it costs nothing for other windows; `vim.schedule` so the current
+            -- window reflects the completed switch.
+            api.nvim_create_autocmd({ "WinEnter", "WinLeave" }, {
+                buffer = p.buf,
+                callback = function()
+                    vim.schedule(function()
+                        if pan and pan.win and api.nvim_win_is_valid(pan.win) then
+                            refresh()
+                        end
+                    end)
                 end,
             })
         end,
