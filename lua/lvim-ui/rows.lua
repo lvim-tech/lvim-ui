@@ -41,7 +41,8 @@ local M = {}
 ---@field icon_hl?       string    action/accordion rows: highlight for the `icon` column
 ---@field text_hl?       string    action/accordion rows: highlight for the label/value text
 ---@field suffix_hl?     string    action/accordion rows: highlight for the trailing `suffix`
----@field row_hl?        string    a FULL-WIDTH background strip (hl_eol, edge to edge) under the whole row — e.g. a section-header band; the per-part fg spans (icon_hl/text_hl) render on top
+---@field label_spans?   table[]   action/accordion rows: per-segment label colours — a list of `{ c0, c1, hl }` BYTE ranges into the label (overrides a single text_hl); used for multi-tone labels (e.g. a coloured location + a dim snippet)
+---@field row_hl?        string|{ inactive: string, active: string }  a FULL-WIDTH background strip (hl_eol, edge to edge) under the whole row — e.g. a section-header band; a `{ inactive, active }` pair shows `active` while the cursor is on the row (a hover). The per-part fg spans (icon_hl/text_hl) render on top
 ---@field items?         table[]   bar rows: the ui.bar button / separator specs
 ---@field align?         string    bar rows: "left" | "center" (default) | "right"
 ---@field _off?          integer   bar rows: persisted horizontal scroll offset (internal)

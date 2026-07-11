@@ -346,9 +346,17 @@ function M.new(opts)
                     lines[i] = util.lpad(disp, width, lead)
                     -- A FULL-WIDTH background strip (edge to edge, hl_eol) under the whole row — a section
                     -- header reads as one solid band. Low priority (100) so the per-part fg spans below
-                    -- (icon_hl / text_hl, default priority 200) render on top.
+                    -- (icon_hl / text_hl, default priority 200) render on top. `row_hl` may be a plain group
+                    -- or a `{ inactive, active }` pair — the `active` band shows while the cursor is on the row
+                    -- (a HOVER), the CursorMoved handler re-rendering as the cursor enters / leaves such a row.
                     if r.row_hl then
-                        hls[#hls + 1] = { i - 1, 0, -1, r.row_hl, 100 }
+                        local rhl = r.row_hl
+                        if type(rhl) == "table" then
+                            rhl = (cur_line() == i) and rhl.active or rhl.inactive
+                        end
+                        if rhl then
+                            hls[#hls + 1] = { i - 1, 0, -1, rhl, 100 }
+                        end
                     end
                     -- Colour the leading type icon (the auto glyph row_display places at the row start); the
                     -- rest reads on the panel background. `type_w` is that glyph's width straight from
@@ -361,15 +369,24 @@ function M.new(opts)
                     -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix. Offsets come from
                     -- `icon_at` (row_display's own layout) + the body lpad `lead` — never re-derived here, so a
                     -- `tight` row (which drops the 2-space separator) colours correctly at any `pad`.
-                    if (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl) then
+                    if
+                        (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl or r.label_spans)
+                    then
                         local base = lead + (icon_at or 0)
                         local ricon = (r.icon and r.icon ~= "") and r.icon or nil
                         if ricon and r.icon_hl then
                             hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
                         end
                         local label = r.label or r.name or ""
-                        if r.text_hl and label ~= "" then
-                            local ls = base + (ricon and (#ricon + 1) or 0)
+                        local ls = base + (ricon and (#ricon + 1) or 0)
+                        if r.label_spans and label ~= "" then
+                            -- Per-SEGMENT label colours: a list of `{ c0, c1, hl }` BYTE offsets INTO the label
+                            -- (so a row can paint e.g. its location one colour and its snippet another). Takes
+                            -- precedence over the single `text_hl`.
+                            for _, sp in ipairs(r.label_spans) do
+                                hls[#hls + 1] = { i - 1, ls + sp[1], ls + sp[2], sp[3] }
+                            end
+                        elseif r.text_hl and label ~= "" then
                             hls[#hls + 1] = { i - 1, ls, ls + #label, r.text_hl }
                         end
                         if r.suffix and r.suffix ~= "" and r.suffix_hl then
@@ -475,9 +492,12 @@ function M.new(opts)
                 end
             end)
             -- On a `bar` row, suppress the full-row cursorline (only the button HOVER should read) and
-            -- re-render so the hover follows the cursor; off a bar row, restore cursorline. Refresh only on a
-            -- boundary cross, so plain list navigation stays cheap.
+            -- re-render so the hover follows the cursor; off a bar row, restore cursorline. A row with a
+            -- `{ inactive, active }` `row_hl` (a hover band, e.g. a section header) likewise needs a re-render
+            -- as the cursor enters / leaves it. Refresh only on such a boundary cross, so plain list
+            -- navigation stays cheap.
             local was_bar = false
+            local was_hover = false
             local last_hint_sig -- the footer legend's last hint SIGNATURE — re-notify only when the hints change
             api.nvim_create_autocmd("CursorMoved", {
                 buffer = p.buf,
@@ -490,11 +510,13 @@ function M.new(opts)
                         opts.on_move(r) -- raw, every move (no dedup) — drives an item-list picker's live preview
                     end
                     local is_bar = r ~= nil and r.type == "bar"
+                    local is_hover = r ~= nil and type(r.row_hl) == "table"
                     vim.wo[pan.win].cursorline = not is_bar
-                    if is_bar or was_bar then
-                        was_bar = is_bar
+                    if is_bar or was_bar or is_hover or was_hover then
                         refresh()
                     end
+                    was_bar = is_bar
+                    was_hover = is_hover
                     -- The footer legend's RIGHT half tracks the row's hints, which depend only on the row TYPE
                     -- (+ an accordion's expand state) — so re-notify only when THAT changes, not on every row.
                     if opts.on_cursor then
