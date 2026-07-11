@@ -3608,10 +3608,16 @@ local function open_native_split(state)
                 { end_col = s[2], hl_group = s[3], priority = 200 }
             )
         end
+        -- Pin the bar to the panel's LAST CONTENT row. `relative = "win"` counts rows from BELOW the winbar
+        -- (row 0 = first text row), so the anchor must be the text height, NOT `nvim_win_get_height` (which
+        -- includes the winbar row) — otherwise the bar drops one row too low and lands ON the global
+        -- statusline. `getwininfo().height` is the text height (winbar excluded), correct with or without one.
+        local info = vim.fn.getwininfo(pan.win)[1]
+        local content_h = (info and info.height) or api.nvim_win_get_height(pan.win)
         local wcfg = {
             relative = "win",
             win = pan.win,
-            row = math.max(0, api.nvim_win_get_height(pan.win) - 1),
+            row = math.max(0, content_h - 1),
             col = 0,
             width = fw,
             height = 1,
