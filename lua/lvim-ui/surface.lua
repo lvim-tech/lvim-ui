@@ -2014,18 +2014,22 @@ local function set_keys(state)
             -- may still bind its own maps AFTER open, e.g. lvim-space's `enable_base_maps`).
             if prov.hide_cursor and not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
                 lock_panel(pan.buf)
+                state._locked[pan.buf] = true -- map_hotkeys restores <Nop> (not a bare del) on a stale hotkey here
             end
         end
         -- the container is the chrome buffer (bar-menu mode), never cursor-navigated — h/l move a Sel stripe (re-
         -- bound below), so lock it ALWAYS: a stray `<C-f>`/`<C-d>` on a focused bar scrolled it, pushing the
         -- header (title + bar) off the top and the footer up into its place
         lock_panel(state.container_buf)
+        state._locked[state.container_buf] = true
     end
 
     -- Header button hotkeys work from EVERYWHERE: on every panel (all keys) and the container (all but
-    -- the menu nav keys, so `h`/`l` still move the selection while a bar is focused).
+    -- the menu nav keys, so `h`/`l` still move the selection while a bar is focused). The (buf, reserved)
+    -- targets are RECORDED so `remap_hotkeys` can re-derive the set when the header bands are swapped at
+    -- runtime (set_header — a tabbed surface switching tabs carries per-tab filter hotkeys).
     for _, pan in ipairs(state.panels) do
-        state.map_hotkeys(pan.buf, {})
+        state._hotkey_targets[#state._hotkey_targets + 1] = { buf = pan.buf, reserved = {} }
     end
     local reserved = {}
     for _, group in ipairs({ K.menu_prev, K.menu_next, K.menu_confirm }) do
@@ -2033,7 +2037,8 @@ local function set_keys(state)
             reserved[#reserved + 1] = l
         end
     end
-    state.map_hotkeys(state.container_buf, reserved)
+    state._hotkey_targets[#state._hotkey_targets + 1] = { buf = state.container_buf, reserved = reserved }
+    state.remap_hotkeys()
 end
 
 --- The CONTENT rect of a laid-out panel `pl` (`L.panels[i]` — `{row,col,width,height,border}`). nvim draws a
@@ -2685,6 +2690,9 @@ local function open_windows(state)
                 state.focus = { kind = "bar", band = sec.band, where = sec.where }
             end
         end
+        -- The swapped bands carry their own button hotkeys (per-tab filter keys) — re-derive the mapped
+        -- set on every panel + the container, so a stale key can't fire a dropped band's action.
+        state.remap_hotkeys()
         relayout(state)
     end
     --- Rebuild the FOOTER band(s) in place — for a live key-hint legend that tracks the focused row. The legend
@@ -2695,6 +2703,9 @@ local function open_windows(state)
         state.cfg.footer = spec
         state.footer_bands = build_bands(spec, true, state.cfg.footer_air)
         state.sectors = build_sectors(state)
+        -- the swapped footer carries its own button hotkeys (per-tab clear actions) — re-derive the mapped
+        -- set so a stale key can't fire a dropped band's action, same as set_header
+        state.remap_hotkeys()
         if state._geom then
             render_chrome(state, state._geom)
         end
@@ -2850,11 +2861,18 @@ local function open_windows(state)
     --- to the bar. `reserved` lists extra keys to SKIP (the container's menu nav, so `h`/`l` still move the
     --- selection there); `<CR>`/`<Space>` are ALWAYS skipped — a content provider owns them (e.g. the list
     --- `<CR>` jump). Called on each panel buffer, the container, and the preview's file buffer.
+    --- Re-runnable: the bands are SWAPPED at runtime (set_header — per-tab filter hotkeys), so the keys this
+    --- buffer got LAST time are re-derived first — a stale key goes back to the `<Nop>` a locked panel had
+    --- under it (or is deleted on an unlocked buffer), then the live set maps over.
     state.map_hotkeys = function(buf, reserved)
+        if not (buf and api.nvim_buf_is_valid(buf)) then
+            return
+        end
         local skip = { ["<CR>"] = true, ["<Space>"] = true }
         for _, r in ipairs(reserved or {}) do
             skip[r] = true
         end
+        local live = {}
         for _, sec in ipairs(state.sectors) do
             if sec.kind == "bar" then
                 for _, spec in ipairs(sec.band.buttons or {}) do
@@ -2869,12 +2887,30 @@ local function open_windows(state)
                         and not spec.no_hotkey
                         and not skip[spec.key]
                     then
+                        live[spec.key] = true
                         vim.keymap.set("n", spec.key, function()
                             spec.run(state)
                         end, { buffer = buf, nowait = true, silent = true })
                     end
                 end
             end
+        end
+        for key in pairs(state._hotkey_mapped[buf] or {}) do
+            if not live[key] then
+                if state._locked[buf] then
+                    pcall(vim.keymap.set, "n", key, "<Nop>", { buffer = buf, nowait = true, silent = true })
+                else
+                    pcall(vim.keymap.del, "n", key, { buffer = buf })
+                end
+            end
+        end
+        state._hotkey_mapped[buf] = live
+    end
+    --- Re-derive the bar hotkeys on every recorded target (each panel + the container) from the LIVE
+    --- sectors — called at open and by `set_header`, so per-tab filter keys stay correct across tab switches.
+    state.remap_hotkeys = function()
+        for _, t in ipairs(state._hotkey_targets) do
+            state.map_hotkeys(t.buf, t.reserved)
         end
     end
     --- Toggle the first header bar sector (the "menu" shortcut): focus it, or return to the center if it
@@ -3618,6 +3654,7 @@ local function open_native_split(state)
     state.sector = function() end
     state.refresh_chrome = function() end
     state.map_hotkeys = function() end
+    state.remap_hotkeys = function() end
     state.toggle_header = function()
         return false
     end
@@ -3889,6 +3926,11 @@ function M.open(cfg)
         panels = panels,
         header_bands = hbands,
         footer_bands = build_bands(cfg.footer, true, cfg.footer_air),
+        -- hotkey bookkeeping (map_hotkeys / remap_hotkeys): the (buf, reserved) targets, the keys each
+        -- buffer currently carries, and which buffers are <Nop>-locked (a stale hotkey restores the <Nop>)
+        _hotkey_targets = {},
+        _hotkey_mapped = {},
+        _locked = {},
     }
     state.close = function()
         close(state)

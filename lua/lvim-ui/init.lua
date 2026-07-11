@@ -82,6 +82,8 @@ end
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
 ---@field pad? integer               -- tabs/form: body row left padding
 ---@field on_item_change? fun(item: table) -- tabs item-list mode: live preview callback on focused item
+---@field preview? table                -- tabs: a surface content PROVIDER shown as a second `id="preview"` block beside the tab content (e.g. built on lvim-ui.preview); plugs into the chassis preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> rotation)
+---@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "above" | "below"
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
 ---@field hide_cursor? boolean       -- info: hide the hardware cursor (read-only viewer)
 ---@field wrap? boolean              -- info: enable line wrap in the window (default off)
@@ -937,6 +939,39 @@ function M.tabs(opts)
         end
     end
 
+    -- PER-TAB FOOTER: a tab may carry `footer` = a LIST of footer button specs (the same
+    -- `{ key, name/label, run, no_hotkey }` shape as `footer_hints`) — its OWN footer band, rebuilt on
+    -- every tab switch (the documented "per-tab different footer" follow-up). When ANY tab declares one,
+    -- it takes precedence over the shared `footer_hints`; a tab without a `footer` shows an empty band.
+    ---@return boolean
+    local function any_tab_footer()
+        for _, t in ipairs(tabset) do
+            if type(t.footer) == "table" and #t.footer > 0 then
+                return true
+            end
+        end
+        return false
+    end
+    --- The footer spec for tab `ti` (its `footer` list → a footer band; an empty band when it has none).
+    ---@param ti integer
+    ---@return table
+    local function tab_footer_spec(ti)
+        local t = tabset[ti]
+        if not (t and type(t.footer) == "table" and #t.footer > 0) then
+            return { bars = {} }
+        end
+        return {
+            bars = {
+                {
+                    items = footer_hint_specs(t.footer),
+                    align = "center",
+                    fill = opts.footer_fill ~= false,
+                    chevrons = frame.chevrons("LvimUiFooterSep"),
+                },
+            },
+        }
+    end
+
     -- Header bars: an optional subtitle text bar + a tab bar (live switch), then the ACTIVE tab's toolbar
     -- bars — each `type="bar"` row becomes its OWN header-band SECTOR (reached with C-j/C-k, like the
     -- picker's filter bar). The TITLE is the frame's border-title, not a header bar.
@@ -949,7 +984,7 @@ function M.tabs(opts)
     --- Map one tab-bar AFFORDANCE record — a per-tab companion (`tab.actions`, e.g. a kill ×) or a bar
     --- trailer (`opts.tab_bar_actions`, e.g. a + new-tab) — through the shared button mapper, `plain` kind
     --- (a bare glyph; the record's `hl` box override carries its own accent).
-    ---@param a { name?: string, icon?: string, key?: string, hl?: table, run?: fun(st: table) }
+    ---@param a { name?: string, icon?: string, key?: string, hl?: table, run?: fun(st: table), no_hotkey?: boolean }
     ---@return table  a ui.button spec
     local function affordance_button(a)
         return frame.button({
@@ -1081,6 +1116,30 @@ function M.tabs(opts)
         if st2.set_counter then
             st2.set_counter(opts.title_count) -- refresh the border counter for the new tab
         end
+        if any_tab_footer() and st2.set_footer then
+            st2.set_footer(tab_footer_spec(active)) -- the new tab's own footer band
+        end
+    end
+
+    -- An optional PREVIEW block beside the tab content (opt-in `opts.preview` — a raw surface content
+    -- provider, typically built on lvim-ui.preview). The tabs presenter itself stays single-content; the
+    -- CHASSIS owns the second panel exactly as it does for the picker: the block id "preview" plugs it into
+    -- the surface's preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> side rotation), the
+    -- content block takes a fixed share of the stack axis and `shrink_first` (it gives up rows before the
+    -- preview when space is tight), and `preview_side` orders the initial stack (the picker's rule).
+    local function content_blocks()
+        local list_block = { id = provider_mode and "content" or "form", provider = content_p, border = CONTENT_BORDER }
+        if not opts.preview then
+            return { list_block }
+        end
+        list_block.size = { width = { fixed = 0.4 } }
+        list_block.shrink_first = true
+        local preview_block = { id = "preview", provider = opts.preview, border = CONTENT_BORDER }
+        local side = opts.preview_side or "right"
+        if side == "left" or side == "above" then
+            return { preview_block, list_block }
+        end
+        return { list_block, preview_block }
     end
 
     -- (HOSTED area) An `area` panel homes itself in the msgarea zone via the surface engine's auto-host
@@ -1167,11 +1226,12 @@ function M.tabs(opts)
         end)(),
         -- The tab CONTENT panel carries the single-source content ring (CONTENT_BORDER → config.content_border,
         -- resolved live). The tab BAR + footer hint bands are nav bars, not blocks, so they stay borderless.
-        -- ONE block either way: the typed-row form, or (provider mode) the per-tab provider delegate.
-        content = {
-            blocks = { { id = provider_mode and "content" or "form", provider = content_p, border = CONTENT_BORDER } },
-        },
-        footer = (opts.footer_hints == true and footer_hints_spec())
+        -- ONE content block (the typed-row form, or the provider-tab delegate) — plus the optional
+        -- `opts.preview` block beside it (see content_blocks above).
+        preview_side = opts.preview and (opts.preview_side or "right") or nil,
+        content = { blocks = content_blocks() },
+        footer = (any_tab_footer() and tab_footer_spec(active))
+            or (opts.footer_hints == true and footer_hints_spec())
             or (
                 type(opts.footer_hints) == "table"
                 and {
@@ -1213,10 +1273,21 @@ function M.tabs(opts)
         end,
     })
 
+    -- The tab CONTENT panel (the form / provider delegate). With no preview it is the only panel; with an
+    -- `opts.preview` block the stack order follows `preview_side`, so it is found by id, never by position.
+    local function content_pan()
+        for _, p in ipairs((st and st.panels) or {}) do
+            if p.id ~= "preview" then
+                return p
+            end
+        end
+        return nil
+    end
+
     -- After-open hook: hand the content buffer/window to the consumer (e.g. the installer's per-row action
-    -- keymaps r/u/d/b). The content panel is the first frame panel.
+    -- keymaps r/u/d/b).
     if opts.on_open then
-        local p = st and st.panels and st.panels[1]
+        local p = content_pan()
         if p then
             opts.on_open(p.buf, p.win)
         end
@@ -1233,18 +1304,24 @@ function M.tabs(opts)
     -- `l` / `h` switch tabs from the content body too (multi-tab) — not only while the tab bar is focused,
     -- matching the project panel. (Plain h/l are free on the body; the form owns j/k/<CR>.)
     if set_active_tab then
-        local body_buf = st and st.panels and st.panels[1] and st.panels[1].buf
+        local body = content_pan()
+        local body_buf = body and body.buf
         if body_buf and vim.api.nvim_buf_is_valid(body_buf) then
-            -- On a toolbar `bar` row, h/l move the focused button; otherwise they switch tabs.
+            -- On a toolbar `bar` row, h/l move the focused button; on a COLLAPSED/EXPANDED accordion header
+            -- they unfold/fold it; otherwise they switch tabs. `l` = unfold-then-next-tab, `h` =
+            -- fold-then-prev-tab (a header already at the target fold state falls through to the tab switch,
+            -- so tabs stay reachable from a header too).
             vim.keymap.set("n", "l", function()
-                if not form_p.bar_nav(1) then
-                    set_active_tab(st, active + 1)
+                if form_p.bar_nav(1) or (form_p.fold and form_p.fold(true)) then
+                    return
                 end
+                set_active_tab(st, active + 1)
             end, { buffer = body_buf, nowait = true, silent = true })
             vim.keymap.set("n", "h", function()
-                if not form_p.bar_nav(-1) then
-                    set_active_tab(st, active - 1)
+                if form_p.bar_nav(-1) or (form_p.fold and form_p.fold(false)) then
+                    return
                 end
+                set_active_tab(st, active - 1)
             end, { buffer = body_buf, nowait = true, silent = true })
         end
     end
@@ -1252,7 +1329,8 @@ function M.tabs(opts)
     -- The interactive handle the consumer drives (validity, repaint, re-fit, cursor query / move). The frame
     -- redesign dropped this rich API; restored here as a thin layer over the frame state + the form provider.
     local function panel_win()
-        return st and st.panels and st.panels[1] and st.panels[1].win
+        local p = content_pan()
+        return p and p.win
     end
     return {
         --- Whether the content panel window is still open.

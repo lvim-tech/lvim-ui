@@ -41,6 +41,7 @@ local M = {}
 ---@field icon_hl?       string    action/accordion rows: highlight for the `icon` column
 ---@field text_hl?       string    action/accordion rows: highlight for the label/value text
 ---@field suffix_hl?     string    action/accordion rows: highlight for the trailing `suffix`
+---@field row_hl?        string    a FULL-WIDTH background strip (hl_eol, edge to edge) under the whole row — e.g. a section-header band; the per-part fg spans (icon_hl/text_hl) render on top
 ---@field items?         table[]   bar rows: the ui.bar button / separator specs
 ---@field align?         string    bar rows: "left" | "center" (default) | "right"
 ---@field _off?          integer   bar rows: persisted horizontal scroll offset (internal)
@@ -90,9 +91,16 @@ local function caret(row, ico)
     return row.expanded and (ico.expand_open or "") or (ico.expand_closed or "")
 end
 
---- Build the display string for a typed row.
+--- Build the display string for a typed row. row_display OWNS the row layout, so it also returns the two
+--- byte anchors a caller needs to paint per-part highlights WITHOUT re-deriving that layout: `icon_at` (the
+--- offset of `row.icon`, for icon_hl/text_hl — correct even when `tight` drops the separator, at any body
+--- padding) and `type_w` (the width of the LEADING auto glyph the row starts with, for the dim).
 ---@param row Row
----@return string
+---@param ico table?
+---@return string disp
+---@return integer? icon_at  byte offset of `row.icon` within `disp` (action / accordion rows only; nil otherwise)
+---@return integer type_w    byte width of the leading type glyph (bool/select/number/action/caret) at the row
+---                          start; 0 when there is none (flat rows, segmented, spacer_line) — dim exactly this
 function M.row_display(row, ico)
     local t = row.type or "string"
     local label = row.label or row.name or ""
@@ -100,37 +108,46 @@ function M.row_display(row, ico)
     ico = ico or M.icons()
     local ri = row.icon and (row.icon .. " ") or ""
 
-    -- Expandable rows (accordion) show a caret instead of their type icon.
+    -- Expandable rows (accordion) show a caret instead of a type icon. A `flat` header carries its own caret
+    -- in `icon` (so no auto caret); `tight` additionally drops the 2-space lead so it sits at the tight
+    -- entry-row gutter.
     if row.children then
-        return (row.flat and "" or caret(row, ico)) .. "  " .. ri .. label
+        local glyph = row.flat and "" or caret(row, ico)
+        local prefix = glyph .. (row.tight and "" or "  ")
+        return prefix .. ri .. label, #prefix, #glyph
     end
 
     if t == "bool" or t == "boolean" then
-        return (row.value and ico.bool_on or ico.bool_off) .. "  " .. ri .. label
+        local glyph = row.value and ico.bool_on or ico.bool_off
+        return glyph .. "  " .. ri .. label, nil, #glyph
     elseif t == "segmented" then
         local prefix, segs = M.segmented_segments(row, ico)
         local texts = {}
         for _, sg in ipairs(segs) do
             texts[#texts + 1] = sg.text
         end
-        return prefix .. table.concat(texts, " ")
+        -- segmented starts with `ri`/label (its options carry the colour) — no leading type glyph to dim.
+        return prefix .. table.concat(texts, " "), nil, 0
     elseif t == "select" then
-        return ico.select .. "  " .. ri .. label .. ": " .. val
+        return ico.select .. "  " .. ri .. label .. ": " .. val, nil, #ico.select
     elseif t == "int" or t == "integer" or t == "float" or t == "number" then
-        return ico.number .. "  " .. ri .. label .. ": " .. val
+        return ico.number .. "  " .. ri .. label .. ": " .. val, nil, #ico.number
     elseif t == "string" or t == "text" then
-        return ico.string .. "  " .. ri .. label .. ": " .. val
+        return ico.string .. "  " .. ri .. label .. ": " .. val, nil, #ico.string
     elseif t == "action" then
         -- a `tight` flat row drops the 2-space lead entirely (its own `icon` carries any leading marker) — a
-        -- compact list (e.g. a picker's items) where the row content sits right at the panel edge.
-        local lead = row.flat and (row.tight and "" or "  ") or (ico.action .. "  ")
-        return lead .. ri .. label .. (row.suffix and (" " .. row.suffix) or "")
+        -- compact list (e.g. a picker's items) where the row content sits right at the panel edge. 2nd return
+        -- = the byte offset of `row.icon` (the prefix length), consumed by the per-part colouring.
+        local glyph = row.flat and "" or ico.action
+        local prefix = row.flat and (row.tight and "" or "  ") or (glyph .. "  ")
+        return prefix .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), #prefix, #glyph
     elseif t == "spacer" then
-        return (row.flat and "" or ico.spacer) .. "  " .. ri .. label .. (row.suffix and (" " .. row.suffix) or "")
+        local glyph = row.flat and "" or ico.spacer
+        return glyph .. "  " .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), nil, #glyph
     elseif t == "spacer_line" then
-        return ""
+        return "", nil, 0
     end
-    return "   " .. label
+    return "   " .. label, nil, 0
 end
 
 --- Build a segmented row's prefix and its segment list (text + option), honouring
@@ -171,34 +188,9 @@ function M.segmented_segments(row, ico)
     return prefix, segs
 end
 
---- Return the icon string and separator length for a row.
---- Layout in the buffer line: 2-byte indent | icon | sep | text | padding
----@param row Row
----@return string icon_str, integer sep_bytes
-function M.row_icon_info(row, ico)
-    local t = row.type or "string"
-    ico = ico or M.icons()
-    if row.flat then
-        return "", 2 -- no lead icon; keep the 2-byte separator so the row's own `icon` column stays aligned
-    end
-    if row.children then
-        return caret(row, ico), 2
-    end
-    if t == "bool" or t == "boolean" then
-        return (row.value and ico.bool_on or ico.bool_off), 2
-    elseif t == "segmented" or t == "select" then
-        return ico.select, 2
-    elseif t == "int" or t == "integer" or t == "float" or t == "number" then
-        return ico.number, 2
-    elseif t == "string" or t == "text" then
-        return ico.string, 2
-    elseif t == "action" then
-        return ico.action, 2
-    elseif t == "spacer" then
-        return ico.spacer, 2
-    end
-    return "", 0
-end
+-- (row_icon_info removed: it was a SECOND type→glyph selector, duplicating what row_display already builds
+--  — and it had already drifted for `segmented` rows. row_display now returns the leading glyph width
+--  (`type_w`) as its 3rd value, so there is one source of truth for the row layout.)
 
 -- ─── item accessors ───────────────────────────────────────────────────────────
 

@@ -204,6 +204,9 @@ function M.new(opts)
             row.expanded = not row.expanded
             invalidate_flat()
             refresh()
+            if on_change then
+                on_change(row) -- an accordion FOLD is a change (a consumer may re-count / persist collapse)
+            end
         elseif t == "bool" or t == "boolean" then
             row.value = not row.value
             if row.run then
@@ -286,7 +289,10 @@ function M.new(opts)
             local lines, hls = {}, {}
             local lead = opts.pad or 2
             for i, r in ipairs(fr) do
-                local disp = rows.row_display(r, ico)
+                -- row_display owns the row layout and hands back its byte anchors: `icon_at` (offset of
+                -- `r.icon` within `disp`, tracking `tight`/`flat`) and `type_w` (the leading auto-glyph width).
+                -- The per-part colouring below just adds the body lpad (`lead`) — it never re-derives the layout.
+                local disp, icon_at, type_w = rows.row_display(r, ico)
                 if r.type == "bar" then
                     -- A toolbar row rendered through the SHARED ui.bar: centered button boxes that own their
                     -- overflow chevrons (so a wide bar scrolls instead of clipping). Three button states:
@@ -338,16 +344,25 @@ function M.new(opts)
                     hls[#hls + 1] = { i - 1, 0, #lines[i], "LvimUiRowDisabled", 250 }
                 else
                     lines[i] = util.lpad(disp, width, lead)
-                    -- Colour the leading type icon; the rest reads on the panel background.
-                    local icon_str = rows.row_icon_info(r, ico)
-                    if icon_str and #icon_str > 0 then
-                        hls[#hls + 1] = { i - 1, lead, lead + #icon_str, "LvimUiRowIconInactive" }
+                    -- A FULL-WIDTH background strip (edge to edge, hl_eol) under the whole row — a section
+                    -- header reads as one solid band. Low priority (100) so the per-part fg spans below
+                    -- (icon_hl / text_hl, default priority 200) render on top.
+                    if r.row_hl then
+                        hls[#hls + 1] = { i - 1, 0, -1, r.row_hl, 100 }
+                    end
+                    -- Colour the leading type icon (the auto glyph row_display places at the row start); the
+                    -- rest reads on the panel background. `type_w` is that glyph's width straight from
+                    -- row_display — never re-derived, so it can't drift (e.g. segmented rows, which have no
+                    -- type glyph, report 0 and are correctly left alone).
+                    if type_w > 0 then
+                        hls[#hls + 1] = { i - 1, lead, lead + type_w, "LvimUiRowIconInactive" }
                     end
                     -- Per-part colours an action / accordion row can request: `icon_hl` on its `icon` column,
-                    -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix — at their byte offsets in
-                    -- `disp`, which lays out as: lead-icon + "  " + icon + " " + label [+ " " + suffix].
+                    -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix. Offsets come from
+                    -- `icon_at` (row_display's own layout) + the body lpad `lead` — never re-derived here, so a
+                    -- `tight` row (which drops the 2-space separator) colours correctly at any `pad`.
                     if (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl) then
-                        local base = (r.tight and 0 or lead) + #(icon_str or "") + 2
+                        local base = lead + (icon_at or 0)
                         local ricon = (r.icon and r.icon ~= "") and r.icon or nil
                         if ricon and r.icon_hl then
                             hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
@@ -364,10 +379,11 @@ function M.new(opts)
                         end
                     end
                     -- A file row's label = "<dimmed path>/<bright name>". `r.dim_to` is a byte count into the
-                    -- LABEL (the SUFFIX of `disp`) up to the name; offset by the lpad indent (2), clamped to
-                    -- the rendered line. Dim the path, brighten the name, so the name stands out.
+                    -- LABEL (the SUFFIX of `disp`); anchored at the label's real start (body lpad + the row's
+                    -- icon offset + the icon column), clamped to the rendered line. Dim the path, brighten the
+                    -- name, so the name stands out.
                     if r.dim_to and r.dim_to > 0 and type(r.label) == "string" then
-                        local lstart = lead + #(icon_str or "") + 2
+                        local lstart = lead + (icon_at or 0) + ((r.icon and r.icon ~= "") and (#r.icon + 1) or 0)
                         local dim_end = math.min(lstart + r.dim_to, #lines[i])
                         if dim_end > lstart then
                             hls[#hls + 1] = { i - 1, lstart, dim_end, "LvimUiPathDim" }
@@ -446,6 +462,16 @@ function M.new(opts)
                 end
                 if r and rows.is_selectable(r) and p.win and api.nvim_win_is_valid(p.win) then
                     pcall(api.nvim_win_set_cursor, p.win, { mp.line, math.max(0, mp.column - 1) })
+                    -- Clicking an accordion HEADER toggles its fold (its whole line is the affordance),
+                    -- matching <CR>; a consumer is notified via on_change (re-count / persist collapse).
+                    if r.children and not is_disabled(r) then
+                        r.expanded = not r.expanded
+                        invalidate_flat()
+                        refresh()
+                        if on_change then
+                            on_change(r)
+                        end
+                    end
                 end
             end)
             -- On a `bar` row, suppress the full-row cursorline (only the button HOVER should read) and
@@ -573,6 +599,25 @@ function M.new(opts)
         ---@return boolean
         bar_nav = function(delta)
             return bar_nav(delta)
+        end,
+        --- Fold/unfold the accordion row under the cursor: `open=true` expands a collapsed section,
+        --- `open=false` collapses an expanded one. Returns true only when it ACTED (the cursor is on an
+        --- accordion AND its state changed) — so a caller can chain h/l as "unfold, else switch tab" (the
+        --- cursor already at the target state falls through). Fires on_change like the other fold paths.
+        ---@param open boolean
+        ---@return boolean
+        fold = function(open)
+            local row = flat()[cur_line()]
+            if not (row and row.children) or is_disabled(row) or row.expanded == open then
+                return false
+            end
+            row.expanded = open
+            invalidate_flat()
+            refresh()
+            if on_change then
+                on_change(row)
+            end
+            return true
         end,
     }
 end
