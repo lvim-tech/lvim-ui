@@ -16,43 +16,66 @@
 --     `nvim_set_decoration_provider` as EPHEMERAL extmarks on the VISIBLE lines only —
 --     match positions are computed lazily per visible row (persistent extmarks per
 --     keystroke are the slow path this design exists to avoid).
---   • Selection = cursorline canon: nvim_win_set_cursor in the non-focused window (which
---     also scrolls the view) + a bg-only CursorLine group, so row colours survive.
---   • A sibling DOCS slot: a second non-focusable window glued beside the menu, kept
---     aligned through every reposition.
+--   • Selection = a full-row EPHEMERAL `hl_eol` highlight painted by the decoration provider
+--     (on_line), the SAME path as the box spans — so it is as reliable as the chip, which never
+--     flickers (a PERSISTENT line-highlight mark, by contrast, repainted on this never-current
+--     window only intermittently). `end_col` = the row's byte length (from rows_meta) so the
+--     bar covers the whole line regardless of glyph display width; box fg-spans compose over it;
+--     `cursorline` is unusable here (a current-window feature). The cursor is moved only to
+--     auto-scroll; a pure selection change (no re-rank) forces one targeted redraw.
+--   • A sibling DOCS slot: a second non-focusable window docked FLUSH beside the menu
+--     (east, flipping/shrinking west near the edge) behind the canonical inter-panel
+--     divider (`config.separator`), kept aligned through every reposition.
+--   • Own HL NAMESPACE: both windows are pinned to a private highlight namespace (via
+--     nvim_win_set_hl_ns) that defines ONLY Normal (= the panel group) and lets every other
+--     group fall back to the live GLOBAL definitions. A float otherwise INHERITS whatever hl
+--     namespace is active, and under a colorscheme's `dim_inactive` that namespace holds
+--     EMPTY group defs (nvim_set_hl(ns, name, {})) which BLOCK the fall-back, so the menu's
+--     groups (selection bar, kind chips) would resolve to nothing and vanish. Pinning our own
+--     namespace is immune to that.
 -- Theming: the standard pipeline — a highlight.bind factory over the live palette; no
 -- cursor hiding needed (focus never enters the menu).
 --
 ---@module "lvim-ui.menu"
 
 local util = require("lvim-ui.util")
+local config = require("lvim-ui.config")
 local hl = require("lvim-utils.highlight")
 
 local api = vim.api
 
 local M = {}
 
+--- Render revision of the loaded module — bumped when the render/selection mechanism changes.
+--- Read at runtime (`require("lvim-ui.menu").RENDER_REV`) to tell whether a live session has
+--- picked up the latest code (require caches the module, so this reflects the IN-MEMORY version,
+--- not the file on disk). If it does not match the current source, the session is stale — restart.
+M.RENDER_REV = "2026-07-12.ephemeral-sel-in-on_line"
+
 -- ─── theming (the standard build()-factory pipeline) ─────────────────────────
 
 hl.bind(function(c)
     c = c or require("lvim-utils.colors")
-    ---@param color string
-    ---@param t number
-    ---@return string
-    local function mtint(color, t)
-        return hl.blend(color, c.bg, t)
-    end
     -- Same panel-bg rule as the shared chrome (config/highlight.lua): follow the theme's
     -- float shade when synced, else the transparent-or-bg_dark fallback.
     local panel_bg = c.bg_float or (c.transparent and c.none or c.bg_dark)
+    -- Concrete panel shade every ON-PANEL cell blends against (panel_bg may be "NONE" under
+    -- a transparent theme, which cannot be blended). The tint canon: a coloured cell is its
+    -- own accent tinted toward the surface it SITS ON — for the selection bar and the
+    -- scrollbar that surface is the menu PANEL, never the editor bg (which may be lighter
+    -- or darker than the panel and makes the cells read as foreign patches).
+    local sel_base = c.bg_float or c.bg_dark
     return {
         LvimUiMenuNormal = { bg = panel_bg, fg = c.fg },
-        -- Selection is BG-ONLY so each row's own fg colours (kind boxes, match chars) survive it.
-        LvimUiMenuSel = { bg = mtint(c.blue, 0.15) },
+        -- Selection is BG-ONLY so each row's own fg colours (kind boxes, match chars) survive
+        -- it. Blended over the PANEL shade at a STRONG tint — the tint canon's active level —
+        -- so the selected row is unmistakable on the float, including on matched rows where
+        -- the bold match fg would otherwise pull the eye off a faint bg.
+        LvimUiMenuSel = { bg = hl.blend(c.blue, sel_base, 0.4) },
         LvimUiMenuMatch = { fg = c.red, bold = true },
         LvimUiMenuDetail = { fg = c.comment },
-        LvimUiMenuThumb = { bg = mtint(c.blue, 0.5) },
-        LvimUiMenuTrack = { bg = mtint(c.blue, 0.08) },
+        LvimUiMenuThumb = { bg = hl.blend(c.blue, sel_base, 0.5) },
+        LvimUiMenuTrack = { bg = hl.blend(c.blue, sel_base, 0.1) },
     }
 end)
 
@@ -61,6 +84,10 @@ end)
 ---@class LvimUiMenuBox                     one cell of a menu row (the ui.button box model as data)
 ---@field text string                       the box text (already padded by the consumer if it wants a fixed column)
 ---@field hl? string                        highlight group for the whole box
+---@field sel_hl? string                    group for the box while its row is SELECTED (default `hl`). A box
+---                                         with its OWN bg needs this to re-tint against the selection bar —
+---                                         its normal bg would punch a hole in the bar (bg-less boxes just
+---                                         let the bar show through and need nothing)
 ---@field right? boolean                    right-align this box (detail column); the gap is space-filled
 ---@field positions? fun(): integer[]?      LAZY matched-char byte columns (1-based, within `text`) — called
 ---                                         only when the row is VISIBLE, once per render generation
@@ -68,6 +95,11 @@ end)
 
 ---@class LvimUiMenuRow
 ---@field boxes LvimUiMenuBox[]
+---@field hl? string                       full-row background group (painted under the box spans and the
+---                                         selection bar) — lets a consumer tint each row by category
+---@field sel_hl? string                   full-row background for THIS row while it is SELECTED, used
+---                                         INSTEAD of the shared selection group — lets the selection be
+---                                         per-row (e.g. a stronger tint of the row's own category colour)
 
 ---@class LvimUiMenuAnchor                  where the menu is glued: the matched keyword's START
 ---@field lnum integer                      1-based buffer line in the anchor window
@@ -105,6 +137,11 @@ function M.new(opts)
     opts = opts or {}
     seq = seq + 1
     local ns = api.nvim_create_namespace("lvim_ui_menu_" .. seq)
+    -- The selection bar is a PERSISTENT `line_hl_group` extmark in its OWN namespace. Why not
+    -- The window's OWN highlight namespace (see place()): pins the menu OUT of any inherited
+    -- namespace (e.g. the colorscheme's dim_inactive namespace, whose empty group defs would
+    -- otherwise block our groups from resolving). Defines only Normal; the rest fall back global.
+    local ns_win = api.nvim_create_namespace("lvim_ui_menu_hl_" .. seq)
 
     local max_height = opts.max_height or 12
     local max_width = opts.max_width or 60
@@ -135,7 +172,7 @@ function M.new(opts)
         height = 0, ---@type integer      current window height (rows)
         row = 0, ---@type integer         current editor-relative window row
         col = 0, ---@type integer         current editor-relative window col
-        -- per-render metadata the decoration provider reads: rows_meta[i] = { spans, pos }
+        -- per-render metadata the decoration provider reads: rows_meta[i] = { spans, pos, len }
         rows_meta = {}, ---@type table[]
         pos_cache = {}, ---@type table<integer, integer[]|false>  lazy positions per row (false = none)
         thumb_from = 0, ---@type integer  scrollbar thumb range (1-based rows; 0 = no bar)
@@ -186,12 +223,50 @@ function M.new(opts)
             if not meta then
                 return
             end
+            local selected = state.selected ~= nil and row + 1 == state.selected
+            -- Optional per-row BACKGROUND (the consumer's `row.hl`) — a full-row hl_eol at the
+            -- LOWEST priority, so the selection bar (100) and every box span compose on top. Lets
+            -- a consumer tint each row by category (e.g. lvim-cmp's per-kind accent rows).
+            if meta.row_hl then
+                api.nvim_buf_set_extmark(bufnr, ns, row, 0, {
+                    end_col = meta.len,
+                    hl_group = meta.row_hl,
+                    hl_eol = true,
+                    ephemeral = true,
+                    strict = false,
+                    priority = 50,
+                })
+            end
+            -- The full-row selection BAR is painted HERE, in the decoration provider, as an
+            -- EPHEMERAL extmark over the whole line (`end_col` = the line's byte length + hl_eol
+            -- to reach the window edge past the text). This is the SAME mechanism as the box
+            -- spans below (chip, match, scrollbar) — which never flicker — so the bar is as
+            -- reliable as they are. A PERSISTENT mark instead depended on nvim repainting the
+            -- line highlight on a non-current window, which it did only intermittently ("the
+            -- selected row's tint sometimes shows, sometimes not"). Low priority (100) so the
+            -- box spans (110) and match chars (120) compose on top: a fg-only box keeps the
+            -- bar's bg, a box with its OWN bg (the sel_hl chip) overrides just its cells.
+            if selected then
+                api.nvim_buf_set_extmark(bufnr, ns, row, 0, {
+                    end_col = meta.len,
+                    -- a per-row `sel_hl` overrides the shared selection group (lets the selection
+                    -- be a stronger tint of the row's own category colour, not one global bar)
+                    hl_group = meta.row_sel_hl or groups.selection,
+                    hl_eol = true,
+                    ephemeral = true,
+                    strict = false,
+                    priority = 100,
+                })
+            end
+            -- on the SELECTED row a box's `sel_hl` (span slot 4) replaces its normal group,
+            -- so boxes with their own bg compose with the selection bar instead of cutting it
             for _, s in ipairs(meta.spans) do
                 api.nvim_buf_set_extmark(bufnr, ns, row, s[1], {
                     end_col = s[2],
-                    hl_group = s[3],
+                    hl_group = (selected and s[4]) or s[3],
                     ephemeral = true,
                     strict = false,
+                    priority = 110,
                 })
             end
             -- Matched-char columns: computed LAZILY, only for rows that actually reach the
@@ -210,6 +285,7 @@ function M.new(opts)
                             hl_group = meta.pos.hl,
                             ephemeral = true,
                             strict = false,
+                            priority = 120,
                         })
                     end
                 end
@@ -285,7 +361,7 @@ function M.new(opts)
                 parts[#parts + 1] = text
                 local b = #text
                 if e.box.hl then
-                    spans[#spans + 1] = { off, off + b, e.box.hl }
+                    spans[#spans + 1] = { off, off + b, e.box.hl, e.box.sel_hl }
                 end
                 if e.box.positions then
                     pos_meta = { off = off, fn = e.box.positions, hl = e.box.match_hl or groups.match }
@@ -301,7 +377,7 @@ function M.new(opts)
                 parts[#parts + 1] = e.box.text
                 local b = #e.box.text
                 if e.box.hl then
-                    spans[#spans + 1] = { off, off + b, e.box.hl }
+                    spans[#spans + 1] = { off, off + b, e.box.hl, e.box.sel_hl }
                 end
                 off = off + b
             end
@@ -310,7 +386,10 @@ function M.new(opts)
                 line = util.truncate(line, w)
             end
             lines[i] = line .. (sb == 1 and " " or "") -- reserve the scrollbar cell
-            state.rows_meta[i] = { spans = spans, pos = pos_meta }
+            -- `len` = the row's byte length; the decoration provider uses it as the selection
+            -- bar's end_col (full-line highlight independent of glyph display width).
+            state.rows_meta[i] =
+                { spans = spans, pos = pos_meta, len = #lines[i], row_hl = row.hl, row_sel_hl = row.sel_hl }
         end
         vim.bo[buf].modifiable = true
         api.nvim_buf_set_lines(buf, 0, -1, false, lines)
@@ -376,18 +455,26 @@ function M.new(opts)
         return { row = row, col = col, height = height }
     end
 
-    --- Apply selection state to the window (cursorline + cursor row → auto-scroll).
-    local function apply_selection()
+    --- Apply the selection: (re)place the persistent bar on the selected row and move the cursor
+    --- so the view scrolls to keep it visible.
+    --- `force_redraw` — only for a PURE selection change (C-n/C-p, no re-rank): the window is not
+    --- reconfigured, and moving this never-current window's cursor does not by itself trigger a
+    --- redraw, so we ask for a targeted one. On the SHOW/UPDATE path it is FALSE: place()'s
+    --- nvim_win_set_config (or the fresh window) already schedules a redraw, and nvim COALESCES
+    --- those per input — forcing an extra flushed redraw there instead makes intermediate frames
+    --- visible (a selection-bar flicker during fast typing).
+    ---@param force_redraw boolean
+    local function apply_selection(force_redraw)
         local win = state.win
         if not (win and api.nvim_win_is_valid(win)) then
             return
         end
-        if state.selected and state.items[state.selected] then
-            vim.wo[win].cursorline = true
-            pcall(api.nvim_win_set_cursor, win, { state.selected, 0 })
-        else
-            vim.wo[win].cursorline = false
-            pcall(api.nvim_win_set_cursor, win, { 1, 0 })
+        local target = (state.selected and state.items[state.selected]) and state.selected or 1
+        pcall(api.nvim_win_set_cursor, win, { target, 0 })
+        if force_redraw then
+            -- pure selection change: no re-rank redrew the window, and the decoration provider
+            -- only repaints (the bar included) on a redraw — so trigger one for this window.
+            pcall(api.nvim__redraw, { win = win, valid = false, flush = true })
         end
     end
 
@@ -420,18 +507,26 @@ function M.new(opts)
             cfg.zindex = zindex
             state.win = api.nvim_open_win(ensure_buf(), false, cfg)
             local win = state.win
-            vim.wo[win].winhighlight = ("Normal:%s,NormalFloat:%s,CursorLine:%s,Search:None"):format(
-                groups.normal,
-                groups.normal,
-                groups.selection
-            )
+            -- Pin the window to our OWN highlight namespace (not `winhighlight`). A new float
+            -- INHERITS whatever hl namespace is active, and under `dim_inactive` that is the
+            -- colorscheme's DIM namespace — which writes EMPTY group defs (`nvim_set_hl(ns, n,
+            -- {})`) that block the fall-back to the global groups, so our LvimUiMenu*/consumer
+            -- groups resolve to nothing and the selection bar / chips vanish. Our own namespace
+            -- defines ONLY Normal/NormalFloat (= the panel group; winhighlight is bypassed under
+            -- a window-local ns, so it must be set here) and clears Search; every other group
+            -- (LvimUiMenuSel, the consumer's kind chips, …) is left UNDEFINED so it falls back
+            -- to the live global definition. dim leaves us alone (a float is never dimmed).
+            api.nvim_set_hl(ns_win, "Normal", { link = groups.normal })
+            api.nvim_set_hl(ns_win, "NormalFloat", { link = groups.normal })
+            api.nvim_set_hl(ns_win, "Search", {})
+            api.nvim_win_set_hl_ns(win, ns_win)
             vim.wo[win].wrap = false
             vim.wo[win].scrolloff = 0
             vim.wo[win].sidescrolloff = 0
-            vim.wo[win].cursorlineopt = "line"
+            vim.wo[win].cursorline = false
             vim.wo[win].winfixbuf = true
         end
-        apply_selection()
+        apply_selection(false) -- win_set_config / the fresh window already schedules the redraw
         if reposition_docs then
             reposition_docs()
         end
@@ -442,8 +537,30 @@ function M.new(opts)
     ---@type { width: integer, height: integer }?  the docs content size (while shown)
     local docs_size = nil
 
+    --- The inter-panel divider for the docs sibling — the SAME `config.separator` rule the
+    --- surface chassis draws between side-by-side panels ("│", peek-border tint), resolved
+    --- live so a global separator restyle re-divides the docs slot too. nil = disabled
+    --- (`separator = false`; the docs then docks flush with no rule).
+    ---@return string? glyph, string hl_group
+    local function docs_divider()
+        local sep = config.separator
+        if sep == false or sep == "" then
+            return nil, ""
+        end
+        local glyph = "│"
+        if type(sep) == "string" then
+            glyph = sep
+        elseif type(sep) == "table" then
+            glyph = sep.h or sep.horizontal or glyph
+        end
+        return glyph, (type(sep) == "table" and sep.hl) or config.separator_hl or "LvimUiPeekBorder"
+    end
+
     --- Re-glue the docs window beside the menu (east, flipping west near the edge),
-    --- top-aligned with the menu row. Runs on every menu reposition.
+    --- top-aligned with the menu row. Runs on every menu reposition. The docs dock FLUSH
+    --- against the menu, carrying the canonical inter-panel divider ("│") on the window's
+    --- MENU-facing border side — an open gutter would show a 1-cell sliver of the buffer
+    --- between the two panels, which reads as the popups colliding with the text.
     reposition_docs = function()
         local dwin = state.docs_win
         if not (dwin and api.nvim_win_is_valid(dwin)) or not docs_size then
@@ -452,21 +569,38 @@ function M.new(opts)
         if not (state.win and api.nvim_win_is_valid(state.win)) then
             return
         end
-        local east_col = state.col + state.width + 1
-        local east_room = vim.o.columns - east_col
-        local col
+        local glyph, sep_hl = docs_divider()
+        local edge = glyph and 1 or 0 -- the divider is a border column: it widens the frame by 1
+        local east_col = state.col + state.width -- window frame (divider first) flush at the menu edge
+        local east_room = vim.o.columns - east_col - edge
+        local west_room = state.col - edge
+        local col, width, east
         if east_room >= docs_size.width then
-            col = east_col
+            col, width, east = east_col, docs_size.width, true -- fits fully east
+        elseif west_room >= docs_size.width then
+            col, width, east = state.col - edge - docs_size.width, docs_size.width, false -- fits fully west
+        elseif east_room >= west_room then
+            -- neither side fits the full width → take the roomier side and SHRINK the docs to
+            -- it, never straddling the menu (the old code clamped west to col 0 and overlapped)
+            col, width, east = east_col, math.max(1, east_room), true
         else
-            col = math.max(0, state.col - 1 - docs_size.width)
+            width = math.max(1, west_room)
+            col, east = math.max(0, state.col - edge - width), false
         end
-        api.nvim_win_set_config(dwin, {
+        local cfg = {
             relative = "editor",
             row = state.row,
             col = col,
-            width = docs_size.width,
+            width = width,
             height = math.min(docs_size.height, math.max(1, vim.o.lines - vim.o.cmdheight - state.row)),
-        })
+        }
+        if glyph then
+            -- border order { tl, t, tr, r, br, b, bl, l }: the rule sits on the side FACING
+            -- the menu — left when the docs are east of it, right when they flipped west
+            local rule = { glyph, sep_hl }
+            cfg.border = east and { "", "", "", "", "", "", "", rule } or { "", "", "", rule, "", "", "", "" }
+        end
+        api.nvim_win_set_config(dwin, cfg)
     end
 
     -- ─── the public handle ────────────────────────────────────────────────────
@@ -520,7 +654,7 @@ function M.new(opts)
             i = math.max(1, math.min(i, #state.items))
         end
         state.selected = i
-        apply_selection()
+        apply_selection(true) -- pure selection change: force the repaint
     end
 
     --- Move the selection by `delta`, wrapping; from "nothing selected" it enters at the
@@ -594,7 +728,7 @@ function M.new(opts)
             state.docs_win = api.nvim_open_win(buf, false, {
                 relative = "editor",
                 row = state.row,
-                col = state.col + state.width + 1,
+                col = state.col + state.width, -- provisional: reposition_docs() below sets the real dock + divider
                 width = docs_size.width,
                 height = docs_size.height,
                 style = "minimal",
@@ -602,7 +736,9 @@ function M.new(opts)
                 noautocmd = true,
                 zindex = zindex - 1,
             })
-            vim.wo[state.docs_win].winhighlight = ("Normal:%s,NormalFloat:%s"):format(groups.normal, groups.normal)
+            -- Pin the docs sibling to our own namespace too (same reason as the menu window:
+            -- a float inherits the dim namespace, which would strip its panel bg).
+            api.nvim_win_set_hl_ns(state.docs_win, ns_win)
             vim.wo[state.docs_win].wrap = true
         end
         if o.filetype then
@@ -620,6 +756,30 @@ function M.new(opts)
         end
         state.docs_win = nil
         docs_size = nil
+    end
+
+    --- Whether the docs sibling is currently on screen.
+    ---@return boolean
+    function handle.docs_visible()
+        return state.docs_win ~= nil and api.nvim_win_is_valid(state.docs_win)
+    end
+
+    --- Scroll the (non-focusable) docs sibling by `delta` SCREEN lines: > 0 down, < 0 up.
+    --- Uses <C-e>/<C-y> inside the window (via nvim_win_call) so wrapped lines scroll
+    --- correctly and the view clamps at the buffer ends. Returns false when no docs
+    --- window is open (nothing to scroll).
+    ---@param delta integer
+    ---@return boolean
+    function handle.docs_scroll(delta)
+        if not handle.docs_visible() or delta == 0 then
+            return false
+        end
+        local n = math.abs(delta)
+        local key = delta > 0 and "\5" or "\25" -- <C-e> scroll down / <C-y> scroll up
+        api.nvim_win_call(state.docs_win, function()
+            vim.cmd("normal! " .. n .. key)
+        end)
+        return true
     end
 
     --- Destroy the handle: windows, buffers and the decoration provider. The handle must

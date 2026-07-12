@@ -71,12 +71,18 @@ local menu = require("lvim-ui").menu({
 })
 
 -- rows are BOX lists: lead box + label + right-aligned detail; `positions` is a LAZY
--- matched-char callback the decoration provider calls only for VISIBLE rows
+-- matched-char callback the decoration provider calls only for VISIBLE rows; a box
+-- with its OWN bg passes `sel_hl` — the group used while its row is SELECTED, so it
+-- re-tints against the selection bar instead of punching a hole in it. A ROW may also
+-- carry `hl` (a full-row background) and `sel_hl` (its background while selected, used
+-- instead of the shared selection group) — e.g. to tint each row by its category.
 menu.show({
     items = {
         {
+            hl = "MyKindRow", -- full-row background (rest)
+            sel_hl = "MyKindRowSel", -- full-row background while this row is selected
             boxes = {
-                { text = " 󰊕 ", hl = "MyKindChip" },
+                { text = " 󰊕 ", hl = "MyKindChip", sel_hl = "MyKindChipSel" },
                 {
                     text = "read_file",
                     positions = function()
@@ -92,18 +98,22 @@ menu.show({
 })
 menu.update(items, selected) -- per-keystroke re-rank (same anchor)
 menu.move(anchor) -- re-anchor (new context)
-menu.select(2) -- selection = bg-only cursorline (auto-scrolls)
+menu.select(2) -- selection = full-row bg (persistent line highlight; auto-scrolls)
 menu.select_move(1) -- wraps
-menu.docs_show({ "docs…" }, { filetype = "markdown" }) -- glued sibling window
+menu.docs_show({ "docs…" }, { filetype = "markdown" }) -- the docked docs sibling
 menu.docs_hide()
+menu.docs_scroll(3) -- scroll the docs sibling by screen lines (< 0 = up)
 menu.hide() -- keep the long-lived buffer
 menu.close() -- destroy the handle
 ```
 
 One long-lived window/buffer per handle (`focusable = false`, `noautocmd`, repositioned — never recreated);
 all row colours (box highlights, matched chars, the scrollbar) are EPHEMERAL decoration-provider extmarks on
-visible lines only. The window flips above the cursor near the screen edge per `direction_priority`. Groups:
-`LvimUiMenuNormal` / `Sel` / `Match` / `Detail` / `Thumb` / `Track` (palette-bound).
+visible lines only. The window flips above the cursor near the screen edge per `direction_priority`. The docs
+sibling docks FLUSH beside the menu (east, flipping/shrinking west near the edge) behind the canonical
+inter-panel divider (`config.separator`, the same `│` rule the surface chassis draws between side-by-side
+panels — no see-through gutter between the two panels). Groups: `LvimUiMenuNormal` / `Sel` / `Match` /
+`Detail` / `Thumb` / `Track` (palette-bound; the selection bar and scrollbar tint over the PANEL shade).
 
 ## Configuration
 

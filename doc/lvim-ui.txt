@@ -73,10 +73,22 @@ while typing) and flips below/above per `direction_priority = { "s", "n" }`
 near the screen edge. Rows are BOX lists (lead box + label + `right = true`
 detail); ALL row colour — box highlights, LAZY matched-char `positions`
 callbacks, the scrollbar — is applied by a decoration provider as EPHEMERAL
-extmarks on VISIBLE lines only. Selection is a bg-only cursorline
-(`LvimUiMenuSel`) set via the handle. A sibling docs slot
-(`docs_show(lines, { filetype })` / `docs_hide()`) glues a second non-focusable
-window beside the menu.
+extmarks on VISIBLE lines only. A row may carry a `hl` (a full-row background,
+painted under everything — tint each row by category) and a `sel_hl` (the
+full-row background while THIS row is selected, used instead of the shared
+selection group — a per-row selection colour). Selection is a full-row
+`hl_eol` background (`LvimUiMenuSel` by default, or the row's `sel_hl`) painted
+by the decoration provider — as reliable as the box spans, and NOT `cursorline`
+(a current-window feature this passive window can't use). A box with its OWN bg
+may pass its own `sel_hl`, the group used for it while its row is SELECTED, so
+it re-tints against the selection bar instead of punching a hole in it. A
+sibling docs slot
+(`docs_show(lines, { filetype })` / `docs_hide()` / `docs_scroll(delta)` /
+`docs_visible()`) docks a second non-focusable window FLUSH beside the menu
+(east, flipping/shrinking west near the edge) behind the canonical
+inter-panel divider (`config.separator` — the same `│` rule the surface
+chassis draws between side-by-side panels), so no buffer text bleeds between
+the two panels.
 
 Options: `max_height` (12), `max_width` (60), `min_width` (0), `col_offset`
 (0), `direction_priority` ({ "s", "n" }), `scrollbar` (true), `zindex` (65),
@@ -84,10 +96,12 @@ Options: `max_height` (12), `max_width` (60), `min_width` (0), `col_offset`
 
 Handle: `show({ items, anchor, selected })`, `update(items, selected)`,
 `move(anchor)`, `select(i)`, `select_move(delta)`, `selected()`, `count()`,
-`visible()`, `hide()`, `close()`, `docs_show()`, `docs_hide()`, `win()`.
+`visible()`, `hide()`, `close()`, `docs_show()`, `docs_hide()`,
+`docs_scroll(delta)`, `docs_visible()`, `win()`.
 
 Groups: `LvimUiMenuNormal`, `LvimUiMenuSel`, `LvimUiMenuMatch`,
-`LvimUiMenuDetail`, `LvimUiMenuThumb`, `LvimUiMenuTrack` — palette-bound.
+`LvimUiMenuDetail`, `LvimUiMenuThumb`, `LvimUiMenuTrack` — palette-bound; the
+selection bar and the scrollbar tint over the PANEL shade.
 
 ==============================================================================
 5. CONFIGURATION                                          *lvim-ui-configuration*
