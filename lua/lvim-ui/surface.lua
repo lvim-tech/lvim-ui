@@ -2695,6 +2695,34 @@ local function open_windows(state)
         state.remap_hotkeys()
         relayout(state)
     end
+    --- Live-repaint the INPUT prompt badge + the typed-area tint WITHOUT rebuilding the input band — the buffer,
+    --- its query text, cursor and `on_change` wiring are all untouched; only the badge extmark and the window
+    --- highlight are re-drawn. For a mode indicator on the search bar (e.g. the picker's grep⇄filter toggle).
+    ---@param prompt string|table       the new badge (a string, or a list of `{ text, hl }` chunks)
+    ---@param prompt_hl? string         badge highlight (when `prompt` is a bare string)
+    ---@param input_hl? string          the typed area's Normal background
+    state.set_prompt = function(prompt, prompt_hl, input_hl)
+        for _, band in ipairs(state.header_bands or {}) do
+            if band.input and band.buf and api.nvim_buf_is_valid(band.buf) then
+                band.prompt = prompt
+                band.prompt_hl = prompt_hl or band.prompt_hl
+                band.input_hl = input_hl or band.input_hl
+                api.nvim_buf_clear_namespace(band.buf, NS, 0, 1) -- the input line's only NS mark is the badge
+                if prompt and prompt ~= "" then
+                    local vt = type(prompt) == "table" and prompt
+                        or { { prompt, band.prompt_hl or "LvimUiMsgAreaItemKind" } }
+                    pcall(api.nvim_buf_set_extmark, band.buf, NS, 0, 0, {
+                        virt_text = vt,
+                        virt_text_pos = "inline",
+                        right_gravity = false,
+                    })
+                end
+                if band.win and api.nvim_win_is_valid(band.win) then
+                    vim.wo[band.win].winhighlight = "Normal:" .. (band.input_hl or "LvimUiPeekNormal")
+                end
+            end
+        end
+    end
     --- Rebuild the FOOTER band(s) in place — for a live key-hint legend that tracks the focused row. The legend
     --- is a constant-height bar, so it just re-paints the chrome (render_chrome re-derives the footer line from
     --- the new bands and writes the CONTAINER buffer); the body float is untouched.
