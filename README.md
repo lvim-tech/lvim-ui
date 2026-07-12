@@ -42,6 +42,7 @@ ui.input({ title = "Name" }, function(ok, value) end)
 ui.confirm({ title = "Delete?" }, function(yes) end)
 ui.tabs({ title = "Settings", tabs = {} }, function(ok, result) end)
 local win = ui.info({ "read-only", "text" }, { title = "Info" })
+local tree = ui.tree({ root = nodes }) -- shared tree content layer (see below)
 ```
 
 `ui.tabs` can additionally host a PREVIEW panel beside the tab content: pass `preview = <provider>` (a
@@ -51,6 +52,28 @@ surface content provider, typically built on `require("lvim-ui.preview").new({ i
 
 The low-level chassis is `require("lvim-ui.surface")` (framed floating/docked windows) with
 `require("lvim-ui.button")` / `require("lvim-ui.bar")` for navigable button bars.
+
+### Mouse
+
+Every keyboard-activated element is also a **left-click** target — a click does exactly what pressing its key
+does, and the keyboard behaviour is unchanged (click is purely additive; it is a no-op while `'mouse'` is
+empty). This is built into the primitives, so it applies to every consumer automatically:
+
+- **Header / footer / tab / filter bars** — click a button to fire it; click a tab header to switch to it;
+  click a filter chip to apply it. Hit-testing uses the bar's own rendered spans, so a click that misses every
+  button is ignored (it never steals the click).
+- **`select` / `multiselect` lists** — click a row to focus it and confirm (`select`) or toggle its checkbox
+  (`multiselect`), exactly as `<CR>` / `<Space>` do on the focused row.
+- **`tabs` / form rows** — click a settings row to activate it per its type: toggle a boolean, cycle a
+  select, expand an accordion section, run an action / menu item, or open the value editor for a text/number
+  field. Click a toolbar-row button to run it.
+- **`tree` rows** — click a row to select + activate it (open the file / jump to the symbol; a collapsed
+  foldable node expands first); click the fold chevron — or double-click anywhere on the row — to toggle the
+  fold.
+
+The only element WITHOUT click support is the `menu` primitive (see below): it is a non-focusable, passive
+overlay driven from insert mode, so it has no window to route a click to — accepting a completion stays a
+keyboard action, by design.
 
 ### The `menu` primitive (cursor-anchored, non-focusable)
 
@@ -114,6 +137,76 @@ sibling docks FLUSH beside the menu (east, flipping/shrinking west near the edge
 inter-panel divider (`config.separator`, the same `│` rule the surface chassis draws between side-by-side
 panels — no see-through gutter between the two panels). Groups: `LvimUiMenuNormal` / `Sel` / `Match` /
 `Detail` / `Thumb` / `Track` (palette-bound; the selection bar and scrollbar tint over the PANEL shade).
+
+### The `tree` primitive (shared tree panels)
+
+`ui.tree(opts)` creates the generic node-provider TREE — the ONE content layer every lvim-tech tree panel
+renders through (the lvim-files file tree, the lvim-lsp outline, and any future drawer/scopes panel), instead
+of each hand-rolling fold state + indent guides + markers + extmarks on the surface. The tree is ONLY the
+content: the handle's `tree.provider` is a surface content provider you plug into your own `surface.open`
+(a persistent native split, a modal float, a provider tab) — the chassis keeps owning the window, dock,
+cursor hiding, footer and teardown.
+
+```lua
+local tree = require("lvim-ui").tree({
+    -- the node contract (lazy or eager children):
+    root = {
+        {
+            id = "src", -- STABLE id: fold state / focus / mark are keyed by it
+            label = "src",
+            icon = "",
+            icon_hl = "Directory",
+            expandable = true, -- chevron before children are known (a lazy dir)
+            children = function(node) -- called only while EXPANDED, per render
+                return load_children(node)
+            end,
+            badges = { { "M ", "DiffAdd" } }, -- right-aligned virt-text cells
+            data = anything, -- your payload, returned by selected()
+        },
+        { id = "file", label = "init.lua", detail = "1.2k", actions = { d = delete_node } },
+    },
+    default_expanded = false, -- true = an outline (nodes start unfolded)
+    connectors = false, -- ├/└ on leaf rows (the outline look)
+    elide_guides = true, -- stop the │ guide below a last child (false = solid)
+    margin = 0, -- lead spaces
+    icons = { fold_open = "", fold_closed = "", guide = "│", branch = "├", branch_last = "└" },
+    hl = { guide = "…", fold = "…", detail = "…", mark = "…", empty = "…", thumb = "…", track = "…" },
+    empty = " No entries",
+    header = function(width) -- static rows ABOVE the tree (e.g. a root band);
+        return { " ~/project" }, { { 0, 0, -1, "Title" } } -- the cursor is kept off them
+    end,
+    filetype = "my-panel", -- stamped on the buffer (cursor panel_ft registration)
+    scrollbar = true, -- right-edge thumb when the tree overflows
+    keys = { activate = { "l", "<CR>" }, collapse = "h" }, -- the canonical defaults (false = none)
+    on_activate = function(node, t) end, -- l/<CR>/click on a leaf or an expanded node
+    on_expand = function(node, t) end, -- lazy loads / watchers go here
+    on_collapse = function(node, t) end,
+    on_keys = function(map, pan, st, t) end, -- your own buffer keymaps (override on clashes)
+    on_render = function(t) end, -- after every repaint (live footers/counters)
+})
+
+require("lvim-ui.surface").open({
+    mode = "split",
+    native = true,
+    dock = "left",
+    persistent = true,
+    content = { blocks = { { id = "tree", provider = tree.provider } } },
+})
+```
+
+The handle: `set_root(nodes | node | fun(): nodes)` (a FACTORY root is re-run per render — live
+re-decoration), `render()` (sync), `refresh()` (coalesced), `selected()`, `node_at(line)`, `row_of(id)`,
+`visible()`, `focus(id)`, `expanded(id)`, `expand(id)` / `collapse(id)` / `toggle(id)`, `expand_all()` /
+`collapse_all()` / `all_expanded()`, `set_expanded(map)` (bulk fold replace — accordion/auto-fold),
+`expanded_state()`, `get(id)`, `mark(id, { move_cursor })` (the follow-row tint), `expand_or_activate()` /
+`collapse_or_parent()` (the canonical `l`/`h`, exposed for consumer keymaps), `buf()`, `win()`, `valid()`.
+
+Built in, identically for every consumer: the canonical keys (`l`/`<CR>` expand-or-activate, `h`
+collapse-or-parent), per-node `actions` bound lazily as they appear (a consumer's own key wins), the mouse
+canon (row click = select + activate, chevron click / double-click = fold toggle; through the chassis
+`on_click` seam in hide-cursor modals), a right-edge scrollbar (the menu's ephemeral decoration-provider
+canon), and the `mark` row an outline uses to follow the source cursor. Groups: `LvimUiTreeGuide` / `Fold` /
+`Detail` / `Mark` / `Empty` / `Thumb` / `Track` (palette-bound; per-tree overrides via `hl`).
 
 ## Configuration
 

@@ -20,10 +20,12 @@
 --   M.info(content, opts) – read-only markdown/text info window
 --   M.close_info(win)     – programmatically close an info window
 --   M.menu(opts)          – cursor-anchored NON-FOCUSABLE popup handle (completion menus)
+--   M.tree(opts)          – generic node-provider TREE content layer for a surface panel
 ---@module "lvim-ui"
 
 local frame = require("lvim-ui.surface")
 local menu = require("lvim-ui.menu")
+local tree = require("lvim-ui.tree")
 local form = require("lvim-ui.form")
 local rows = require("lvim-ui.rows")
 local util = require("lvim-ui.util")
@@ -264,6 +266,11 @@ function M.select(opts)
     local provider = {
         hide_cursor = true,
         cursorline = true,
+        -- A left-click on a row picks it (the chassis moves the hidden selection onto the clicked row first,
+        -- so `pick` reads it) — exactly what <CR>/<Space> do on the focused row.
+        on_click = function(_, st)
+            pick(st)
+        end,
         size = function()
             local w = util.dw(opts.title or "Select") + 4
             for i, it in ipairs(items) do
@@ -402,6 +409,11 @@ function M.multiselect(opts)
     local provider = {
         hide_cursor = true,
         cursorline = true,
+        -- A left-click on a row toggles its checkbox (the chassis moves the hidden selection there first) —
+        -- exactly what <Space> does on the focused row. Confirm stays on <CR> / the footer button.
+        on_click = function()
+            toggle_current()
+        end,
         size = function()
             local w = util.dw(opts.title or "Select") + 6
             for _, it in ipairs(items) do
@@ -1555,6 +1567,18 @@ end
 ---@return table handle
 function M.menu(opts)
     return menu.new(opts)
+end
+
+--- Create a generic node-provider TREE handle — the shared content layer for every tree panel
+--- (file tree / symbol outline / db drawer / dap scopes). The handle's `t.provider` plugs into a
+--- surface (`surface.open{ content.blocks }` / a tabs provider tab); the consumer supplies nodes
+--- (`{ id, label, icon?, children = nodes|fun, … }`, lazy or eager) and the tree owns fold state,
+--- guides/markers, badges, the follow mark, the scrollbar, the canonical keys and the mouse. See
+--- lvim-ui.tree for the node contract and the full handle API.
+---@param opts? LvimUiTreeOpts
+---@return table handle
+function M.tree(opts)
+    return tree.new(opts)
 end
 
 --- Create an independent UI instance with its own config overrides.

@@ -61,6 +61,31 @@ The low-level chassis is `require("lvim-ui.surface")` (framed floating / docked
 windows) with `require("lvim-ui.button")` / `require("lvim-ui.bar")` for
 navigable button bars.
 
+                                                                    *lvim-ui-mouse*
+Mouse ~
+
+Every keyboard-activated element is also a left-click target — a click does
+exactly what pressing its key does, and the keyboard behaviour is unchanged
+(click is additive; a no-op while 'mouse' is empty). It is built into the
+primitives, so every consumer gets it for free:
+
+- Header / footer / tab / filter bars — click a button to fire it, a tab header
+  to switch to it, a filter chip to apply it. Hit-testing uses the bar's own
+  rendered spans, so a click that hits no button is ignored.
+- select / multiselect lists — click a row to focus it and confirm (select) or
+  toggle its checkbox (multiselect), as <CR> / <Space> do on the focused row.
+- tabs / form rows — click a settings row to activate it per its type (toggle a
+  boolean, cycle a select, expand an accordion, run an action / menu item, open
+  a text/number editor); click a toolbar-row button to run it.
+
+- |lvim-ui.tree()| rows — click a row to select + activate it (a collapsed
+  foldable node expands first); click the fold chevron — or double-click the
+  row — to toggle the fold.
+
+The |lvim-ui.menu()| primitive has NO click support: it is a non-focusable,
+passive insert-mode overlay with no window to route a click to, so accepting a
+completion stays a keyboard action by design.
+
                                                                  *lvim-ui.menu()*
 require("lvim-ui").menu({opts})                        → handle
 
@@ -102,6 +127,72 @@ Handle: `show({ items, anchor, selected })`, `update(items, selected)`,
 Groups: `LvimUiMenuNormal`, `LvimUiMenuSel`, `LvimUiMenuMatch`,
 `LvimUiMenuDetail`, `LvimUiMenuThumb`, `LvimUiMenuTrack` — palette-bound; the
 selection bar and the scrollbar tint over the PANEL shade.
+
+                                                                 *lvim-ui.tree()*
+require("lvim-ui").tree({opts})                        → handle
+
+The generic node-provider TREE — the shared content layer every lvim-tech tree
+panel renders through (the lvim-files file tree, the lvim-lsp outline), instead
+of each hand-rolling fold state + indent guides + markers + extmarks. The tree
+is ONLY the content: the handle's `provider` is a surface content provider the
+consumer plugs into its OWN `surface.open` (a persistent native split, a modal
+float, a provider tab) — the chassis keeps owning the window, dock, cursor
+hiding, footer and teardown.
+
+Node contract (lazy or eager): >lua
+    {
+        id = "stable-id",       -- fold state / focus / mark are keyed by it
+        label = "name",
+        icon = "",             -- lead kind icon (Nerd Font)
+        icon_hl = "Directory",  -- or `hl` = ONE group for icon AND label
+        label_hl = "Normal",    --   (source-colour mode; wins over both)
+        kind = "dir",           -- free-form consumer tag
+        expandable = true,      -- chevron before children are known (lazy)
+        children = function(node) return nodes end, -- or an eager list;
+                                --   a function runs only while EXPANDED,
+                                --   once per render (live re-decoration)
+        detail = "signature",   -- dim eol virtual text
+        badges = { { "M ", "DiffAdd" } }, -- right-aligned virt-text cells
+        actions = { d = function(node, t) end }, -- per-node extra keys
+        data = anything,        -- consumer payload (selected()/callbacks)
+    }
+<
+Options: `root` (nodes | one node | a FACTORY re-run per render),
+`default_expanded` (false; true = an outline), `connectors` (false; ├/└ on leaf
+rows), `elide_guides` (true; false = a solid │ per level, the file-tree style),
+`margin` (0), `icons` ({ fold_open, fold_closed, guide, branch, branch_last }),
+`hl` ({ guide, fold, detail, mark, empty, thumb, track } group overrides),
+`empty` (" No entries"), `header` (fun(width) → lines, spans — static rows
+above the tree, e.g. a root band; the cursor is kept off them), `filetype`
+(stamped on the buffer — the cursor `panel_ft` registration), `cursorline`
+(true), `hide_cursor` (false; modal usage), `scrollbar` (true — a right-edge
+thumb when the tree overflows), `size` (fun() → w, h override), `keys`
+({ activate = { "l", "<CR>" }, collapse = "h" }; false = none), and the hooks
+`on_activate(node, t)`, `on_expand(node, t)`, `on_collapse(node, t)`,
+`on_move(node|nil, t)`, `on_keys(map, pan, st, t)` (the consumer's own keymaps,
+bound AFTER the canonical ones so a config key overrides on a clash),
+`on_render(t)`, `on_close(pan)`.
+
+Handle: `provider` (plug into `surface.open{ content.blocks }`),
+`set_root(nodes|node|fun)`, `render()` (sync), `refresh()` (coalesced),
+`selected()`, `node_at(line)`, `row_of(id)`, `visible()`, `focus(id)`,
+`expanded(id)`, `expand(id)`, `collapse(id)`, `toggle(id)`, `expand_all()`,
+`collapse_all()`, `all_expanded()`, `set_expanded(map)` (bulk fold replace —
+the accordion/auto-fold seam; no hooks, no render), `expanded_state()`,
+`get(id)`, `mark(id, { move_cursor })` (the follow-row tint an outline uses to
+track the source cursor), `expand_or_activate()`, `collapse_or_parent()` (the
+canonical `l`/`h`, exposed for consumer keymaps), `buf()`, `win()`, `valid()`.
+
+Built in, identically for every consumer: the canonical keys, per-node
+`actions` (bound lazily as they appear; a consumer's own key wins), the mouse
+canon (row click = select + activate; chevron click / double-click = fold
+toggle; hide-cursor modals route through the chassis `on_click` seam), and a
+right-edge scrollbar painted as EPHEMERAL decoration-provider extmarks on
+visible rows only (the menu canon).
+
+Groups: `LvimUiTreeGuide`, `LvimUiTreeFold`, `LvimUiTreeDetail`,
+`LvimUiTreeMark`, `LvimUiTreeEmpty`, `LvimUiTreeThumb`, `LvimUiTreeTrack` —
+palette-bound; per-tree overrides via `hl`.
 
 ==============================================================================
 5. CONFIGURATION                                          *lvim-ui-configuration*

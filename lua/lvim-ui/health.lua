@@ -32,8 +32,8 @@ function M.check()
     end
 
     -- The toolkit itself.
-    if has("lvim-ui.surface") and has("lvim-ui.config") then
-        health.ok("lvim-ui toolkit loaded (surface / frame / button / bar / rows)")
+    if has("lvim-ui.surface") and has("lvim-ui.config") and has("lvim-ui.tree") then
+        health.ok("lvim-ui toolkit loaded (surface / frame / button / bar / rows / menu / tree)")
     else
         health.error("lvim-ui modules failed to load")
     end

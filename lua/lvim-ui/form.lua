@@ -484,16 +484,11 @@ function M.new(opts)
                 end
                 if r and rows.is_selectable(r) and p.win and api.nvim_win_is_valid(p.win) then
                     pcall(api.nvim_win_set_cursor, p.win, { mp.line, math.max(0, mp.column - 1) })
-                    -- Clicking an accordion HEADER toggles its fold (its whole line is the affordance),
-                    -- matching <CR>; a consumer is notified via on_change (re-count / persist collapse).
-                    if r.children and not is_disabled(r) then
-                        r.expanded = not r.expanded
-                        invalidate_flat()
-                        refresh()
-                        if on_change then
-                            on_change(r)
-                        end
-                    end
+                    -- Click = focus the row AND do exactly what <CR> does on it: `activate` reads the row now
+                    -- under the cursor and dispatches by type — accordion fold, checkbox toggle, select cycle,
+                    -- action run (a menu item / footer-less button), numeric/string edit. It self-guards a
+                    -- disabled or non-actionable row (a display-only detail field), so a stray click is inert.
+                    activate(st)
                 end
             end)
             -- On a `bar` row, suppress the full-row cursorline (only the button HOVER should read) and

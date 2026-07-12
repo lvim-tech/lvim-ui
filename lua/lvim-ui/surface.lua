@@ -1747,6 +1747,40 @@ local function menu_confirm(state)
     end
 end
 
+--- Activate a bar button by a MOUSE CLICK — the exact equivalent of navigating the focused bar's selection
+--- onto button `i` (menu_move, which fires a live bar's `on_change` — e.g. a tab switch) and then confirming
+--- it (menu_confirm — a footer/affordance button's `run`, or `band.on_select`). Reuses the SAME dispatch as
+--- the keyboard, so a click does exactly what the keys do; a separator is a no-op. `entry` is a `state.bands`
+--- record (`{ band, buttons, row }`).
+---@param state table
+---@param entry table
+---@param i integer
+local function bar_click_activate(state, entry, i)
+    local band = entry.band
+    local spec = (band.buttons or {})[i]
+    if not spec or spec.type == "separator" then
+        return
+    end
+    -- Focus this bar's sector (matches h/l landing on it): correct hover styling + subsequent key nav start here.
+    for si, sec in ipairs(state.sectors) do
+        if sec.kind == "bar" and sec.band == band then
+            band._sel = i
+            focus_sector(state, si) -- re-renders the chrome with `i` selected
+            break
+        end
+    end
+    -- A "live" bar reacts to the selection landing on `i` (the tab bar switches tabs) — mirror menu_move.
+    if band.on_change then
+        band.on_change(spec, state)
+    end
+    -- …then confirm the button (a footer / affordance `run`, or the band's `on_select`) — mirror menu_confirm.
+    if spec.run then
+        spec.run(state)
+    elseif band.on_select then
+        band.on_select(spec, state)
+    end
+end
+
 --- The item the focused selection points at — the first center panel whose provider exposes `selection()`
 --- (the list; the preview has none). Drives the default `open`.
 ---@param state table
@@ -1963,6 +1997,28 @@ local function set_keys(state)
             map(pan.buf, plus_arrow(K.up, "<Up>"), function()
                 list_move(-1)
             end)
+            -- MOUSE: a left-click on a hide-cursor list row MOVES the (hidden) selection onto that row, then
+            -- runs the provider's `on_click(pan, state, line)` — the SAME action its confirm key runs (select →
+            -- pick, multiselect → toggle). A provider without `on_click` just gets the selection moved (a plain
+            -- help/ops list). Bound BEFORE `provider.keys`, so a provider that binds its OWN `<LeftMouse>` (the
+            -- form's per-button hit-testing) overrides this. No-op while `mouse` is disabled.
+            map(pan.buf, "<LeftMouse>", function()
+                if vim.o.mouse == "" then
+                    return
+                end
+                local m = vim.fn.getmousepos()
+                if m.winid ~= pan.win or m.line < 1 or not (pan.win and api.nvim_win_is_valid(pan.win)) then
+                    return
+                end
+                local line = math.min(m.line, api.nvim_buf_line_count(pan.buf))
+                local col0 = math.max(0, m.column - 1)
+                pcall(api.nvim_win_set_cursor, pan.win, { line, col0 })
+                if pan.provider and pan.provider.on_click then
+                    -- `line` is the 1-based clicked buffer row; `col0` the 0-based byte column — a provider
+                    -- with column-addressable content (e.g. a calendar day grid) hit-tests with both.
+                    pan.provider.on_click(pan, state, line, col0)
+                end
+            end)
         end
         if pan.provider and pan.provider.keys then
             pcall(pan.provider.keys, function(lhs, fn)
@@ -1987,6 +2043,30 @@ local function set_keys(state)
     end)
     map(state.container_buf, K.sector_prev, function()
         sector_cycle(state, -1)
+    end)
+    -- MOUSE: a left-click on any header/footer bar button acts exactly like navigating the selection onto it
+    -- and confirming (tab switch / filter / footer action). Hit-test the click's row+column against the live
+    -- `state.bands` render metadata (each button's byte range `c0..c1`), so it is pixel-accurate and never
+    -- steals a click that misses every button. No-op when `mouse` is disabled. Additive — the keys are intact.
+    map(state.container_buf, "<LeftMouse>", function()
+        if vim.o.mouse == "" then
+            return
+        end
+        local m = vim.fn.getmousepos()
+        if m.winid ~= state.container_win then
+            return
+        end
+        local col0 = m.column - 1
+        for _, entry in ipairs(state.bands or {}) do
+            if entry.row == m.line then
+                for i, b in ipairs(entry.buttons or {}) do
+                    if not b.sep and b.c0 and col0 >= b.c0 and col0 < b.c1 then
+                        bar_click_activate(state, entry, i)
+                        return
+                    end
+                end
+            end
+        end
     end)
     for _, ck in ipairs(state.cfg.close_keys or {}) do
         map(state.container_buf, ck, state.close)
