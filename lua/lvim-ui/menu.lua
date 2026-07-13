@@ -26,13 +26,11 @@
 --   • A sibling DOCS slot: a second non-focusable window docked FLUSH beside the menu
 --     (east, flipping/shrinking west near the edge) behind the canonical inter-panel
 --     divider (`config.separator`), kept aligned through every reposition.
---   • Own HL NAMESPACE: both windows are pinned to a private highlight namespace (via
---     nvim_win_set_hl_ns) that defines ONLY Normal (= the panel group) and lets every other
---     group fall back to the live GLOBAL definitions. A float otherwise INHERITS whatever hl
---     namespace is active, and under a colorscheme's `dim_inactive` that namespace holds
---     EMPTY group defs (nvim_set_hl(ns, name, {})) which BLOCK the fall-back, so the menu's
---     groups (selection bar, kind chips) would resolve to nothing and vanish. Pinning our own
---     namespace is immune to that.
+--   • Panel background via `winhighlight`, like every other lvim-ui window. (It used to be pinned
+--     to a private hl namespace to survive the colorscheme's dim namespace, whose EMPTY group defs
+--     blocked the fall-back to the global groups and made the selection bar / kind chips vanish.
+--     That is fixed at the source now — `lvim-utils.dim` writes no blank defs — so the workaround
+--     is gone, and with it its cost: nvim BYPASSES `winhighlight` under a window-local namespace.)
 -- Theming: the standard pipeline — a highlight.bind factory over the live palette; no
 -- cursor hiding needed (focus never enters the menu).
 --
@@ -136,12 +134,10 @@ local seq = 0
 function M.new(opts)
     opts = opts or {}
     seq = seq + 1
+    -- The selection bar is a PERSISTENT `line_hl_group` extmark in this namespace — not an ephemeral one from a
+    -- decoration provider: the menu is a NON-FOCUSABLE float, so it is not redrawn on every keystroke of the
+    -- buffer the user is actually typing in, and an ephemeral mark would simply not be re-emitted.
     local ns = api.nvim_create_namespace("lvim_ui_menu_" .. seq)
-    -- The selection bar is a PERSISTENT `line_hl_group` extmark in its OWN namespace. Why not
-    -- The window's OWN highlight namespace (see place()): pins the menu OUT of any inherited
-    -- namespace (e.g. the colorscheme's dim_inactive namespace, whose empty group defs would
-    -- otherwise block our groups from resolving). Defines only Normal; the rest fall back global.
-    local ns_win = api.nvim_create_namespace("lvim_ui_menu_hl_" .. seq)
 
     local max_height = opts.max_height or 12
     local max_width = opts.max_width or 60
@@ -507,19 +503,18 @@ function M.new(opts)
             cfg.zindex = zindex
             state.win = api.nvim_open_win(ensure_buf(), false, cfg)
             local win = state.win
-            -- Pin the window to our OWN highlight namespace (not `winhighlight`). A new float
-            -- INHERITS whatever hl namespace is active, and under `dim_inactive` that is the
-            -- colorscheme's DIM namespace — which writes EMPTY group defs (`nvim_set_hl(ns, n,
-            -- {})`) that block the fall-back to the global groups, so our LvimUiMenu*/consumer
-            -- groups resolve to nothing and the selection bar / chips vanish. Our own namespace
-            -- defines ONLY Normal/NormalFloat (= the panel group; winhighlight is bypassed under
-            -- a window-local ns, so it must be set here) and clears Search; every other group
-            -- (LvimUiMenuSel, the consumer's kind chips, …) is left UNDEFINED so it falls back
-            -- to the live global definition. dim leaves us alone (a float is never dimmed).
-            api.nvim_set_hl(ns_win, "Normal", { link = groups.normal })
-            api.nvim_set_hl(ns_win, "NormalFloat", { link = groups.normal })
-            api.nvim_set_hl(ns_win, "Search", {})
-            api.nvim_win_set_hl_ns(win, ns_win)
+            -- The panel background, through the ORDINARY mechanism (`winhighlight`). This used to be pinned to a
+            -- private highlight namespace instead, because the colorscheme's dim namespace wrote EMPTY group
+            -- defs (`nvim_set_hl(ns, name, {})`) which BLOCK the fall-back to the global groups — the menu's own
+            -- groups (selection bar, kind chips) then resolved to nothing and vanished. That was a workaround for
+            -- a bug now fixed at its source: `lvim-utils.dim` no longer writes blank defs, so an undefined group
+            -- in a namespace falls back to its live global definition, exactly as it should. And a window-local
+            -- namespace has a real cost — nvim BYPASSES `winhighlight` under one — so it is gone.
+            vim.wo[win].winhighlight = ("Normal:%s,NormalFloat:%s,Search:%s"):format(
+                groups.normal,
+                groups.normal,
+                groups.normal
+            )
             vim.wo[win].wrap = false
             vim.wo[win].scrolloff = 0
             vim.wo[win].sidescrolloff = 0
@@ -736,9 +731,12 @@ function M.new(opts)
                 noautocmd = true,
                 zindex = zindex - 1,
             })
-            -- Pin the docs sibling to our own namespace too (same reason as the menu window:
-            -- a float inherits the dim namespace, which would strip its panel bg).
-            api.nvim_win_set_hl_ns(state.docs_win, ns_win)
+            -- Same panel background as the menu window, via `winhighlight` (see there).
+            vim.wo[state.docs_win].winhighlight = ("Normal:%s,NormalFloat:%s,Search:%s"):format(
+                groups.normal,
+                groups.normal,
+                groups.normal
+            )
             vim.wo[state.docs_win].wrap = true
         end
         if o.filetype then
