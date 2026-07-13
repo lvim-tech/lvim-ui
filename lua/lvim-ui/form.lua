@@ -10,6 +10,7 @@
 ---@module "lvim-ui.form"
 
 local rows = require("lvim-ui.rows")
+local config = require("lvim-ui.config")
 local util = require("lvim-ui.util")
 local bar = require("lvim-ui.bar")
 
@@ -154,23 +155,29 @@ function M.new(opts)
         if not row then
             return {}
         end
+        -- The key glyphs and the labels are PRESENTATION (`config.form_hints`), not logic — the user sees
+        -- them, so they belong in the config with everything else the panel shows.
+        local H = config.form_hints or {}
+        local K_ACT, K_NEXT, K_PREV = H.activate or "↵", H.next or "↵/→", H.prev or "⌫/←"
+        local L = H.labels or {}
         if row.children then
-            return { { key = "↵", label = row.expanded and "Collapse" or "Expand", act = "activate" } }
+            local label = row.expanded and (L.collapse or "Collapse") or (L.expand or "Expand")
+            return { { key = K_ACT, label = label, act = "activate" } }
         end
         local t = row.type
         if t == "select" or t == "segmented" then
             return {
-                { key = "↵/→", label = "Next", act = "next" },
-                { key = "⌫/←", label = "Prev", act = "prev" },
+                { key = K_NEXT, label = L.next or "Next", act = "next" },
+                { key = K_PREV, label = L.prev or "Prev", act = "prev" },
             }
         elseif t == "bool" or t == "boolean" then
-            return { { key = "↵", label = "Toggle", act = "activate" } }
+            return { { key = K_ACT, label = L.toggle or "Toggle", act = "activate" } }
         elseif t == "action" then
-            -- only a RUNNABLE action advertises ↵ Run; display-only action rows (e.g. a package's State /
+            -- only a RUNNABLE action advertises its key; display-only action rows (e.g. a package's State /
             -- Status / Version detail fields carry `type = "action"` for styling but no `run`) advertise nothing.
-            return row.run and { { key = "↵", label = "Run", act = "activate" } } or {}
+            return row.run and { { key = K_ACT, label = L.run or "Run", act = "activate" } } or {}
         elseif t == "int" or t == "integer" or t == "float" or t == "number" or t == "string" or t == "text" then
-            return { { key = "↵", label = "Edit", act = "activate" } }
+            return { { key = K_ACT, label = L.edit or "Edit", act = "activate" } }
         end
         return {}
     end

@@ -73,7 +73,8 @@ function M.truncate(s, width)
     if M.dw(s) <= width then
         return s
     end
-    local ell = "…"
+    local ok_cfg, cfg = pcall(require, "lvim-ui.config")
+    local ell = (ok_cfg and cfg.text and cfg.text.ellipsis) or "…"
     local budget = width - M.dw(ell) -- reserve room for the ellipsis
     if budget <= 0 then
         return M.dw(ell) <= width and ell or ""
@@ -172,12 +173,20 @@ end
 
 -- ─── border helpers ───────────────────────────────────────────────────────────
 
-M.BORDERS = {
-    rounded = { "╭", "─", "╮", "│", "╯", "─", "╰", "│" },
-    single = { "┌", "─", "┐", "│", "┘", "─", "└", "│" },
-    double = { "╔", "═", "╗", "║", "╝", "═", "╚", "║" },
-    none = { "", "", "", "", "", "", "", "" },
-}
+-- The border PRESETS live in the config (`lvim-ui.config.borders`) — a user may retune or add one, and every
+-- surface that names a preset follows. Read lazily (the config requires util, so a top-level require here
+-- would be circular) and cached per call.
+---@return table<string, string[]>
+local function border_presets()
+    local ok, cfg = pcall(require, "lvim-ui.config")
+    return (ok and cfg.borders) or {}
+end
+
+M.BORDERS = setmetatable({}, {
+    __index = function(_, k)
+        return border_presets()[k]
+    end,
+})
 
 --- Resolve a border spec to a concrete 8-element table.
 --- Normalizes custom tables: corners between non-empty edges cannot be "".

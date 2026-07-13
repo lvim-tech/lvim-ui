@@ -63,17 +63,35 @@ hl.bind(function(c)
     -- scrollbar that surface is the menu PANEL, never the editor bg (which may be lighter
     -- or darker than the panel and makes the cells read as foreign patches).
     local sel_base = c.bg_float or c.bg_dark
+    -- Accent + strength per role, from `config.menu.colors` — nothing here is decided in code.
+    local roles = (config.menu or {}).colors or {}
+    ---@param role string
+    ---@param fb string
+    ---@return string
+    local function mc(role, fb)
+        local v = (roles[role] or {}).accent or fb
+        if type(v) == "string" and v:sub(1, 1) == "#" then
+            return v
+        end
+        return c[v] or c[fb] or c.blue
+    end
+    ---@param role string
+    ---@param fb number
+    ---@return number
+    local function mt(role, fb)
+        return (roles[role] or {}).tint or fb
+    end
     return {
         LvimUiMenuNormal = { bg = panel_bg, fg = c.fg },
         -- Selection is BG-ONLY so each row's own fg colours (kind boxes, match chars) survive
         -- it. Blended over the PANEL shade at a STRONG tint — the tint canon's active level —
         -- so the selected row is unmistakable on the float, including on matched rows where
         -- the bold match fg would otherwise pull the eye off a faint bg.
-        LvimUiMenuSel = { bg = hl.blend(c.blue, sel_base, 0.4) },
-        LvimUiMenuMatch = { fg = c.red, bold = true },
-        LvimUiMenuDetail = { fg = c.comment },
-        LvimUiMenuThumb = { bg = hl.blend(c.blue, sel_base, 0.5) },
-        LvimUiMenuTrack = { bg = hl.blend(c.blue, sel_base, 0.1) },
+        LvimUiMenuSel = { bg = hl.blend(mc("selection", "blue"), sel_base, mt("selection", 0.4)) },
+        LvimUiMenuMatch = { fg = mc("match", "red"), bold = true },
+        LvimUiMenuDetail = { fg = mc("detail", "comment") },
+        LvimUiMenuThumb = { bg = hl.blend(mc("thumb", "blue"), sel_base, mt("thumb", 0.5)) },
+        LvimUiMenuTrack = { bg = hl.blend(mc("track", "blue"), sel_base, mt("track", 0.1)) },
     }
 end)
 
@@ -542,7 +560,7 @@ function M.new(opts)
         if sep == false or sep == "" then
             return nil, ""
         end
-        local glyph = "│"
+        local glyph = (config.menu or {}).separator or "│"
         if type(sep) == "string" then
             glyph = sep
         elseif type(sep) == "table" then

@@ -315,6 +315,66 @@ require("lvim-ui").setup({
 })
 ```
 
+### Chrome that used to be hardcoded
+
+Everything the UI *shows* is now config, not code — the primitives read their glyphs, colours and
+strengths from `lvim-ui.config` (and the shared scale from `lvim-utils`'s `ui` spec):
+
+```lua
+require("lvim-ui").setup({
+    -- The TREE primitive (the file tree, the LSP outline, the db drawer, the debug scopes)
+    tree = {
+        padding = { left = 1, right = 1 },
+        scrollbar = false,
+        icons = { fold_open = "", fold_closed = "", guide = "│", branch = "├", branch_last = "└" },
+        -- each role: `accent` (a palette key or "#rrggbb") + `tint` (blended toward the panel)
+        colors = {
+            guide = { accent = "fg_dark", tint = 0.6 },
+            fold = { accent = "blue" },
+            detail = { accent = "comment" },
+            mark = { accent = "blue", tint = 0.16 }, -- the "follow" row (an outline's current symbol)
+            empty = { accent = "comment" },
+            thumb = { accent = "blue", tint = 0.5 }, -- the scrollbar
+            track = { accent = "blue", tint = 0.1 },
+        },
+    },
+    -- The MENU primitive (the completion / candidate list)
+    menu = {
+        colors = {
+            selection = { accent = "blue", tint = 0.4 }, -- bg-only, so each row keeps its own fg colours
+            match = { accent = "red" },
+            detail = { accent = "comment" },
+            thumb = { accent = "blue", tint = 0.5 },
+            track = { accent = "blue", tint = 0.1 },
+        },
+        separator = "│",
+    },
+    -- The 8 border characters nvim wants, clockwise from the top-left. A surface names a preset.
+    borders = {
+        rounded = { "╭", "─", "╮", "│", "╯", "─", "╰", "│" },
+        single = { "┌", "─", "┐", "│", "┘", "─", "└", "│" },
+        double = { "╔", "═", "╗", "║", "╝", "═", "╚", "║" },
+        none = { "", "", "", "", "", "", "", "" },
+    },
+    text = { ellipsis = "…" }, -- what a clipped row ends with
+    -- The form's key-hint legend: the KEYS as the user sees them + their labels
+    form_hints = {
+        activate = "↵",
+        next = "↵/→",
+        prev = "⌫/←",
+        labels = {
+            expand = "Expand",
+            collapse = "Collapse",
+            next = "Next",
+            prev = "Prev",
+            toggle = "Toggle",
+            run = "Run",
+            edit = "Edit",
+        },
+    },
+})
+```
+
 ## License
 
 BSD-3-Clause.

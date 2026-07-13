@@ -1407,6 +1407,28 @@ local function render_chrome(state, L)
     end
 end
 
+--- Pull a panel's VIEW back onto its content. A re-render can SHRINK the buffer (the message zone drops its
+--- title row the moment it loses focus, so 3 lines become 2) while the window keeps the topline it had —
+--- which then points past the new content: the top row scrolls out of sight and a blank row appears at the
+--- bottom. Nvim does not fix this for a window that is not current, so the frame must: clamp the topline to
+--- the last position from which the content still fills the window.
+---@param pan table
+local function clamp_view(pan)
+    if not (pan and pan.win and api.nvim_win_is_valid(pan.win) and pan.buf and api.nvim_buf_is_valid(pan.buf)) then
+        return
+    end
+    local info = vim.fn.getwininfo(pan.win)[1]
+    if not info then
+        return
+    end
+    local max_top = math.max(1, api.nvim_buf_line_count(pan.buf) - api.nvim_win_get_height(pan.win) + 1)
+    if info.topline > max_top then
+        api.nvim_win_call(pan.win, function()
+            vim.fn.winrestview({ topline = max_top, lnum = math.min(vim.fn.line("."), max_top) })
+        end)
+    end
+end
+
 --- Render a panel's provider content into its buffer.
 ---@param state table
 ---@param idx integer
@@ -1420,6 +1442,7 @@ local function render_panel(state, idx)
     -- showing the real file buffer with its own syntax). The frame does not write lines for it.
     if pan.provider and pan.provider.update then
         pcall(pan.provider.update, pan, L)
+        clamp_view(pan)
         return
     end
     local lines, hls = {}, {}
@@ -1429,12 +1452,27 @@ local function render_panel(state, idx)
             lines, hls = rl or {}, rh or {}
         end
     end
+    M.paint(pan, lines, hls)
+    clamp_view(pan)
+end
+
+--- Paint `lines` + `hls` into a panel's buffer. Extracted from `render_panel` and PUBLIC because a
+--- consumer that owns the `update` seam (the tabs delegate, which must host `render`-only providers as
+--- tabs) has to paint exactly the way the frame does — same read-only handling, same namespace, same
+--- full-row span semantics — instead of hand-rolling a second, subtly different painter.
+---@param pan table
+---@param lines string[]
+---@param hls table[]  { row, col, end_col|-1, hl, priority? }
+function M.paint(pan, lines, hls)
+    if not (pan and pan.buf and api.nvim_buf_is_valid(pan.buf)) then
+        return
+    end
     vim.bo[pan.buf].modifiable = true
     api.nvim_buf_set_lines(pan.buf, 0, -1, false, lines)
     -- An `editable` provider (the input field) keeps its buffer writable; all others are read-only.
     vim.bo[pan.buf].modifiable = (pan.provider and pan.provider.editable) or false
     api.nvim_buf_clear_namespace(pan.buf, NS, 0, -1)
-    for _, h in ipairs(hls) do
+    for _, h in ipairs(hls or {}) do
         if h[3] == -1 then -- a FULL-ROW span: the bg reaches the window edge (hl_eol), for row striping
             pcall(api.nvim_buf_set_extmark, pan.buf, NS, h[1], 0, {
                 end_row = h[1] + 1,
@@ -1891,16 +1929,42 @@ local function set_keys(state)
     end
     -- `lock_panel`: a MODAL panel — only the keys we bound act; every other normal-mode key (motions,
     -- scrolls, edits, search) is `<Nop>`-ed so a stray press can't move the cursor / scroll / edit the panel.
-    -- This is the DEFAULT for every surface (opt out per-open with `cfg.lock_keys = false`) — an unmapped key
-    -- must do nothing, so only the actions the bars/provider registered are live.
+    -- The DEFAULT for every surface. Per-open: `cfg.lock_keys = false` (no lock) or `"light"` (a READABLE
+    -- panel — chrome locked, content keyboard free; see the call site). A key the USER bound globally as a
+    -- CHORD is never nopped in any mode (see `global_chords`).
     -- The cmdline `:` is kept as an escape hatch. Run AFTER the panel binds (so `used` is populated) and BEFORE
     -- map_hotkeys (so a button hotkey re-maps OVER the `<Nop>`).
+    -- The keys the USER has bound GLOBALLY as CHORDS (`<C-c>`, `<A-l>`, …). A modal panel must never nop
+    -- these: they are the user's own commands — quit, window nav, their leader chords — and swallowing them
+    -- means a focused panel can trap the editor (the lock took `<C-c>` and even `<C-w>`). Plain letters are
+    -- NOT exempted even when globally mapped: those are the panel's own alphabet (its actions, its rows), and
+    -- letting a global `s`/`f` fire inside a picker is exactly the collision the lock exists to prevent.
+    --- The exempt set is keyed by the chord's FIRST key, not the whole lhs: a user chord is often a SEQUENCE
+    --- (`<C-c>e` = quit), and nopping its PREFIX (`<C-c>`) kills it just as dead as nopping the whole thing —
+    --- the sequence can never start.
+    ---@return table<string, boolean>
+    local function global_chords()
+        local out = {}
+        for _, m in ipairs(api.nvim_get_keymap("n")) do
+            -- `m.lhs` is ALREADY textual here ("<C-C>e"); running it through `keytrans` would escape its
+            -- leading `<` into `<lt>` and the match would never fire.
+            local first = m.lhs:match("^(<[^>]+>)") or m.lhs:sub(1, 1)
+            if first:match("^<[CAMSDcamsd]%-") then
+                out[first:lower()] = true
+            end
+        end
+        return out
+    end
+
+    local chords = global_chords()
+
     local function lock_panel(buf)
         local u = used[buf] or {}
         local function nop(lhs)
-            if not u[lhs] then
-                pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
+            if u[lhs] or chords[lhs:lower()] then
+                return
             end
+            pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
         end
         for i = 33, 126 do
             local ch = string.char(i)
@@ -2096,7 +2160,13 @@ local function set_keys(state)
     end
     nop_mouse(state.container_buf, used[state.container_buf], true)
 
-    if state.cfg.lock_keys ~= false then -- modal by DEFAULT (opt out per-open with lock_keys = false): every unbound key is a no-op — the PANELS and the chrome CONTAINER
+    -- `lock_keys`: true/nil = MODAL (default — every unbound key is a no-op on the panels AND the chrome
+    -- container) · "light" = a READABLE panel (the message zone's scrollback, a console): the CHROME stays
+    -- locked but the CONTENT keeps its keyboard, so the text can be navigated, selected and yanked — the
+    -- mouse lock above still stops a drag from starting a Visual selection, which was the actual problem the
+    -- modal lock was introduced for · false = no lock at all.
+    local light = state.cfg.lock_keys == "light"
+    if state.cfg.lock_keys ~= false then
         for _, pan in ipairs(state.panels) do
             local prov = pan.provider or {}
             -- Lock a CONTENT panel only when its cursor is HIDDEN: there the cursor is NOT the interaction — the
@@ -2104,7 +2174,7 @@ local function set_keys(state)
             -- a `/`, a `dd`). A VISIBLE-cursor panel navigates / scrolls by the NATIVE cursor (j/k/arrows, C-d/C-u
             -- on a scrollable float or a cursor-driven list) — locking would freeze it — so it keeps its keys (it
             -- may still bind its own maps AFTER open, e.g. lvim-space's `enable_base_maps`).
-            if prov.hide_cursor and not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
+            if not light and prov.hide_cursor and not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
                 lock_panel(pan.buf)
                 state._locked[pan.buf] = true -- map_hotkeys restores <Nop> (not a bare del) on a stale hotkey here
             end
@@ -2962,6 +3032,14 @@ local function open_windows(state)
     ---@param dir integer  +1 (down) / -1 (up)
     state.sector = function(dir)
         sector_cycle(state, dir)
+    end
+    --- Toggle the focused CENTER panel (list ⇄ preview) — the `panel_toggle` (Tab) action, exposed for the
+    --- same reason `panel`/`sector` are: a panel showing an EXTERNAL buffer (a terminal — lvim-tasks' live
+    --- output, lvim-term) carries none of the chassis' own keymaps, so it must be able to bind the toggle
+    --- itself. `panel(dir)` is NOT a substitute: it CLAMPS at the ends, so from the last panel (the preview)
+    --- `panel(1)` is a no-op — the key that walked IN would not walk back OUT, stranding the user there.
+    state.panel_toggle = function()
+        panel_toggle(state)
     end
     --- Focus the frame's FIRST sector (its header — e.g. a tab bar) — the landing point when DESCENDING
     --- into the frame from an OUTSIDE editor window (the dock's global descend). A further `<C-j>` then

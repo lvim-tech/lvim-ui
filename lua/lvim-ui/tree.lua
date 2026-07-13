@@ -191,6 +191,7 @@ function M.new(opts)
     local state = {
         roots = nil, ---@type LvimUiTreeNode[]|fun(): LvimUiTreeNode[]|nil  the top level (list or factory)
         override = {}, ---@type table<string, boolean>  per-id fold override (absent = `default_expanded`)
+        lazy = {}, ---@type table<string, boolean>  per-id: this node's children are a FUNCTION (see is_expanded)
         rows = {}, ---@type table<integer, table>  buffer line → row entry { node, parent, c0, c1 }
         order = {}, ---@type table[]               row entries in display order (visible walk order)
         header_rows = 0, ---@type integer          lines the `header` rows take at the top
@@ -220,13 +221,25 @@ function M.new(opts)
         return type(ch) == "function" or (type(ch) == "table" and #ch > 0)
     end
 
-    --- The node's CURRENT fold state (override, else the instance default).
+    --- Is node `id` expanded? An EXPLICIT fold (the user toggled it) always wins. Otherwise the tree's
+    --- `default_expanded` applies — EXCEPT to a node whose children are LAZY (a function): those are only
+    --- expanded on demand.
+    ---
+    --- Auto-expanding a lazy node is unbounded by construction: materializing its children hands back more
+    --- lazy nodes, which `default_expanded` also considers expanded, so the tree walks — and FETCHES — the
+    --- entire graph. In the debug view that meant every `stopped` re-entered Python's `__builtins__` and
+    --- fired ~21k `variables` requests at the adapter, which then had no capacity left to answer a step:
+    --- the debugger looked frozen. A lazy child is a promise, not content; it must be asked for.
     ---@param id string
+    ---@param lazy? boolean  the node's children are a function
     ---@return boolean
-    local function is_expanded(id)
+    local function is_expanded(id, lazy)
         local o = state.override[id]
         if o ~= nil then
             return o
+        end
+        if lazy then
+            return false
         end
         return default_expanded
     end
@@ -258,10 +271,11 @@ function M.new(opts)
     ---@param fn fun(node: LvimUiTreeNode)
     local function walk_known(nodes, fn)
         for _, n in ipairs(nodes) do
+            state.lazy[n.id] = (type(n.children) == "function") or nil
             fn(n)
             if type(n.children) == "table" then
                 walk_known(n.children --[[@as LvimUiTreeNode[] ]], fn)
-            elseif type(n.children) == "function" and expandable(n) and is_expanded(n.id) then
+            elseif type(n.children) == "function" and expandable(n) and is_expanded(n.id, true) then
                 walk_known(kids(n), fn)
             end
         end
@@ -325,7 +339,9 @@ function M.new(opts)
             for i, n in ipairs(nodes) do
                 local is_last = i == count
                 local can_fold = expandable(n)
-                local open = can_fold and is_expanded(n.id)
+                local lazy = type(n.children) == "function"
+                state.lazy[n.id] = lazy or nil -- the registry `t.expanded` consults (it must NOT walk the tree)
+                local open = can_fold and is_expanded(n.id, lazy)
 
                 -- Marker: a fold chevron for a foldable node; a ├/└ connector for a leaf that has a
                 -- parent (connectors mode); two blanks otherwise.
@@ -476,6 +492,15 @@ function M.new(opts)
     local function render()
         local pan = state.pan
         if state.destroyed or not (pan and pan.buf and api.nvim_buf_is_valid(pan.buf)) then
+            return
+        end
+        -- Paint ONLY the panel this tree currently OWNS. In a tabs dock (provider mode) every tab shares
+        -- ONE panel window + buffer, and each tree keeps its own decoration provider / autocmds bound to
+        -- it — so a hidden tree repainting on a redraw, a scroll or a width change would write its rows
+        -- over whatever tab the user is actually looking at. (That is how every tab of the debug dock came
+        -- to show the same content.) `update` stamps ownership as a tab becomes active; a tree that no
+        -- longer owns the panel simply does not draw.
+        if pan.tree_owner ~= nil and pan.tree_owner ~= state then
             return
         end
         state.dirty = false -- this render satisfies any queued refresh (its callback checks the flag)
@@ -640,7 +665,7 @@ function M.new(opts)
         if not e then
             return
         end
-        if expandable(e.node) and not is_expanded(e.node.id) then
+        if expandable(e.node) and not is_expanded(e.node.id, type(e.node.children) == "function") then
             t.expand(e.node.id)
         elseif opts.on_activate then
             opts.on_activate(e.node, t)
@@ -653,7 +678,7 @@ function M.new(opts)
         if not e then
             return
         end
-        if expandable(e.node) and is_expanded(e.node.id) then
+        if expandable(e.node) and is_expanded(e.node.id, type(e.node.children) == "function") then
             t.collapse(e.node.id)
             return
         end
@@ -719,6 +744,7 @@ function M.new(opts)
             else
                 state.pan = pan
             end
+            pan.tree_owner = state -- this tree now owns the panel (see render's ownership guard)
             render()
         end,
         --- Chassis click seam (hide-cursor modal panels): the selection was already moved to `line`.
@@ -897,22 +923,22 @@ function M.new(opts)
     ---@param id string
     ---@return boolean
     function t.expanded(id)
-        return is_expanded(id)
+        -- Read the LAZY flag from the registry — never by looking the node up: `t.get` re-runs the root
+        -- factory, and a consumer whose factory consults `t.expanded` (the file tree does) would recurse
+        -- into a stack overflow.
+        return is_expanded(id, state.lazy[id])
     end
 
     --- Expand the node `id` (fires `on_expand`, repaints coalesced). No-op when already expanded.
     ---@param id string
     function t.expand(id)
-        if is_expanded(id) then
+        if t.expanded(id) then
             return
         end
-        -- Explicit if/else: an `and nil or …` / `and false or …` chain silently falls through to the
-        -- other branch (nil/false are falsy operands) and corrupts the fold state.
-        if default_expanded then
-            state.override[id] = nil -- back to the default (expanded)
-        else
-            state.override[id] = true
-        end
+        -- An explicit user fold is ALWAYS stored explicitly (never "back to the default"): the default is
+        -- not uniform any more — a LAZY node defaults to collapsed even under `default_expanded`, so
+        -- clearing the override here would leave the node the user just opened… closed.
+        state.override[id] = true
         if opts.on_expand then
             local n = t.get(id)
             if n then
@@ -925,14 +951,10 @@ function M.new(opts)
     --- Collapse the node `id` (fires `on_collapse`, repaints coalesced). No-op when already collapsed.
     ---@param id string
     function t.collapse(id)
-        if not is_expanded(id) then
+        if not t.expanded(id) then
             return
         end
-        if default_expanded then
-            state.override[id] = false
-        else
-            state.override[id] = nil -- back to the default (collapsed)
-        end
+        state.override[id] = false
         if opts.on_collapse then
             local n = t.get(id)
             if n then
@@ -945,7 +967,7 @@ function M.new(opts)
     --- Toggle the node `id`'s fold.
     ---@param id string
     function t.toggle(id)
-        if is_expanded(id) then
+        if t.expanded(id) then
             t.collapse(id)
         else
             t.expand(id)
@@ -985,7 +1007,7 @@ function M.new(opts)
     function t.all_expanded()
         local all = true
         walk_known(top(), function(n)
-            if expandable(n) and not is_expanded(n.id) then
+            if expandable(n) and not is_expanded(n.id, type(n.children) == "function") then
                 all = false
             end
         end)

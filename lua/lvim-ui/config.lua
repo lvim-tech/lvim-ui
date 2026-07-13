@@ -216,5 +216,75 @@ return {
         padding = { left = 1, right = 1 },
         -- Right-edge thumb while the content overflows the window.
         scrollbar = false,
+        -- The tree's chrome glyphs (Nerd Font carets + box-drawing guides). A consumer may still override
+        -- them per-tree; these are what it gets when it does not.
+        icons = {
+            fold_open = "\u{f0d7}", --  nf-fa-caret_down
+            fold_closed = "\u{f0da}", --  nf-fa-caret_right
+            guide = "│", -- the ancestor indent column
+            branch = "├", -- a leaf with siblings below it (connectors mode)
+            branch_last = "└", -- the last leaf
+        },
+        -- The tree's OWN highlight roles. `accent` = the palette key (or "#rrggbb"); `tint` = how far it is
+        -- blended toward the panel it sits on (the same scale as the shared chrome — see lvim-utils ui.tint).
+        -- The guide is a fg blend, not a background.
+        colors = {
+            guide = { accent = "fg_dark", tint = 0.6 }, -- the │ indent guides + ├/└ connectors
+            fold = { accent = "blue" }, -- the open/closed chevron (fg only)
+            detail = { accent = "comment" }, -- the dim eol detail text
+            mark = { accent = "blue", tint = 0.16 }, -- the MARKED (follow) row — an outline's current symbol
+            empty = { accent = "comment" }, -- the "no entries" placeholder
+            thumb = { accent = "blue", tint = 0.5 }, -- the scrollbar thumb
+            track = { accent = "blue", tint = 0.1 }, -- its track
+        },
+    },
+
+    -- ── The MENU primitive (the completion / candidate list) ─────────────────────────────────────────────
+    -- A coloured cell is its own accent tinted toward the surface it SITS ON — for the menu that surface is
+    -- the PANEL, never the editor bg (which may be lighter or darker and would make the cell read as a
+    -- foreign patch). The selection is BG-ONLY, so each row's own fg colours (kind boxes, match chars)
+    -- survive it.
+    menu = {
+        colors = {
+            selection = { accent = "blue", tint = 0.4 }, -- the selected row (bg only)
+            match = { accent = "red" }, -- the matched characters (bold)
+            detail = { accent = "comment" }, -- an item's dim detail column
+            thumb = { accent = "blue", tint = 0.5 }, -- the scrollbar thumb
+            track = { accent = "blue", tint = 0.1 }, -- its track
+        },
+        separator = "│", -- the default glyph between menu groups (a consumer may pass its own)
+    },
+
+    -- ── Border presets ──────────────────────────────────────────────────────────────────────────────────
+    -- The 8 characters nvim wants, clockwise from the top-left. A surface names one of these (`border =
+    -- "rounded"`) or passes its own 8-element table.
+    borders = {
+        rounded = { "╭", "─", "╮", "│", "╯", "─", "╰", "│" },
+        single = { "┌", "─", "┐", "│", "┘", "─", "└", "│" },
+        double = { "╔", "═", "╗", "║", "╝", "═", "╚", "║" },
+        none = { "", "", "", "", "", "", "", "" },
+    },
+
+    -- ── Text chrome ─────────────────────────────────────────────────────────────────────────────────────
+    text = {
+        ellipsis = "…", -- what a clipped row ends with (its width is reserved before clipping)
+    },
+
+    -- ── The FORM's key-hint legend (the footer line that follows the focused row) ────────────────────────
+    -- Each row TYPE advertises what its keys do. The glyphs are the KEYS themselves as the user sees them,
+    -- so they belong to the presentation, not to the logic.
+    form_hints = {
+        activate = "↵", -- <CR> on the focused row
+        next = "↵/→", -- cycle a select/segmented row forward
+        prev = "⌫/←", -- and back
+        labels = {
+            expand = "Expand",
+            collapse = "Collapse",
+            next = "Next",
+            prev = "Prev",
+            toggle = "Toggle",
+            run = "Run",
+            edit = "Edit",
+        },
     },
 }

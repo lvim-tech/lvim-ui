@@ -793,12 +793,31 @@ function M.tabs(opts)
                 return 40, 10
             end,
             --- Realise the ACTIVE tab's content in the (re)laid-out shared panel window.
+            ---
+            --- A tab may be an `update` provider (it owns the window — a tree, a swapped-in buffer) OR a
+            --- plain `render` provider (it just returns lines — a text panel). The frame's own render path
+            --- is bypassed here, because THIS delegate owns `update` (render_panel returns as soon as an
+            --- update provider exists) — so a `render`-only tab would never be drawn at all, and its tab
+            --- would show whatever the previously-active tab left in the shared buffer. Painting it here,
+            --- through the frame's own painter, is what makes such a tab render its OWN content.
             ---@param pan table
             ---@param L table?
             update = function(pan, L)
                 local pr = active_provider()
-                if pr and pr.update then
+                if not pr then
+                    return
+                end
+                if pr.update then
                     pr.update(pan, L)
+                    return
+                end
+                if pr.render then
+                    local w = (L and L.width)
+                        or (pan.win and vim.api.nvim_win_is_valid(pan.win) and vim.api.nvim_win_get_width(pan.win))
+                        or 80
+                    local h = (L and L.height) or 0
+                    local ok, lines, hls = pcall(pr.render, w, h)
+                    frame.paint(pan, ok and lines or {}, ok and hls or {})
                 end
             end,
             --- Fired once at open (chassis key wiring) — forwarded to the tab active THEN (see above).
@@ -1343,28 +1362,34 @@ function M.tabs(opts)
         end)
     end
 
-    -- `l` / `h` switch tabs from the content body too (multi-tab) — not only while the tab bar is focused,
-    -- matching the project panel. (Plain h/l are free on the body; the form owns j/k/<CR>.)
+    -- Switch tabs from the content BODY (not only while the tab bar is focused).
+    --
+    -- The key depends on who owns the body. In FORM mode the rows own j/k/<CR> and h/l are free, so h/l
+    -- switch tabs (and first serve a focused toolbar bar / an accordion header). In PROVIDER mode the body
+    -- belongs to the provider — and a TREE provider owns `l`/`h` as its expand/collapse keys. Stealing them
+    -- for the tab switch left a lazy node impossible to open (in the debug view that went unnoticed only
+    -- because everything auto-expanded — see tree.lua). So provider tabs switch on `L`/`H` instead, leaving
+    -- `l`/`h` to the content.
     if set_active_tab then
         local body = content_pan()
         local body_buf = body and body.buf
         if body_buf and vim.api.nvim_buf_is_valid(body_buf) then
-            -- On a toolbar `bar` row, h/l move the focused button; on a COLLAPSED/EXPANDED accordion header
-            -- they unfold/fold it; otherwise they switch tabs. `l` = unfold-then-next-tab, `h` =
-            -- fold-then-prev-tab (a header already at the target fold state falls through to the tab switch,
-            -- so tabs stay reachable from a header too).
-            vim.keymap.set("n", "l", function()
-                if form_p.bar_nav(1) or (form_p.fold and form_p.fold(true)) then
+            local next_key, prev_key = "l", "h"
+            if provider_mode then
+                next_key, prev_key = "L", "H"
+            end
+            vim.keymap.set("n", next_key, function()
+                if form_p and (form_p.bar_nav(1) or (form_p.fold and form_p.fold(true))) then
                     return
                 end
                 set_active_tab(st, active + 1)
-            end, { buffer = body_buf, nowait = true, silent = true })
-            vim.keymap.set("n", "h", function()
-                if form_p.bar_nav(-1) or (form_p.fold and form_p.fold(false)) then
+            end, { buffer = body_buf, nowait = true, silent = true, desc = "lvim-ui: next tab" })
+            vim.keymap.set("n", prev_key, function()
+                if form_p and (form_p.bar_nav(-1) or (form_p.fold and form_p.fold(false))) then
                     return
                 end
                 set_active_tab(st, active - 1)
-            end, { buffer = body_buf, nowait = true, silent = true })
+            end, { buffer = body_buf, nowait = true, silent = true, desc = "lvim-ui: previous tab" })
         end
     end
 
@@ -1381,6 +1406,19 @@ function M.tabs(opts)
             local w = panel_win()
             return w ~= nil and vim.api.nvim_win_is_valid(w)
         end,
+        --- The content panel's WINDOW (nil when closed) — what a DOCK consumer needs to answer "is this
+        --- mine?" and to focus itself.
+        ---@return integer?
+        win = panel_win,
+        --- DESCEND into the frame from an outside editor window, landing on its first sector (the header /
+        --- tab bar) — the mirror of the `<C-k>` escape-up, and what `lvim-utils.dock`'s global descend calls
+        --- on a docked consumer. Without it a tabs-based panel could be docked but never entered from the code.
+        ---@return nil
+        enter = function()
+            if st and st.enter then
+                st.enter()
+            end
+        end,
         --- Close the panel programmatically (full frame teardown — fires the close `callback`),
         --- as if the user pressed the close key. Lets a host tear the panel down on its own events.
         ---@return nil
@@ -1389,14 +1427,20 @@ function M.tabs(opts)
                 st.close()
             end
         end,
-        --- Re-paint the active tab's rows in place (after the consumer mutated row values).
+        --- Re-paint the active tab's rows in place (after the consumer mutated row values). The row API
+        --- below is FORM-only: in provider-tab mode the tab owns its buffer, so each of these is a no-op
+        --- rather than a crash on a nil `form_p` (a provider consumer repaints through its own provider).
         render = function()
-            form_p.rerender()
+            if form_p then
+                form_p.rerender()
+            end
         end,
         --- Re-read the active tab's (mutated) row set + rebuild its toolbar header bands, and re-fit — for a
         --- content/filter rebuild (e.g. the installer applying a filter). set_header relayouts.
         recalc = function()
-            form_p.set_rows((split(active)))
+            if form_p then
+                form_p.set_rows((split(active)))
+            end
             if st and st.set_header then
                 st.set_header(header_spec())
             elseif st and st.relayout then
@@ -1409,24 +1453,24 @@ function M.tabs(opts)
         --- The `name` of the row under the cursor.
         ---@return string?
         cursor_name = function()
-            return form_p.cursor_name()
+            return form_p and form_p.cursor_name() or nil
         end,
         --- The 1-based window line of the cursor.
         ---@return integer
         cursor_index = function()
-            return form_p.cursor_index()
+            return form_p and form_p.cursor_index() or 0
         end,
         --- Move the cursor to the first row whose `name` matches (expanding its ancestors).
         ---@param name string
         ---@return boolean
         focus = function(name)
-            return form_p.focus_name(name)
+            return form_p ~= nil and form_p.focus_name(name)
         end,
         --- Move the cursor to (a clamped) window line `i`.
         ---@param i integer
         ---@return boolean
         focus_index = function(i)
-            return form_p.focus_index(i)
+            return form_p ~= nil and form_p.focus_index(i)
         end,
     }
 end
