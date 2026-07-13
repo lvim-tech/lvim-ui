@@ -22,6 +22,7 @@
 
 local util = require("lvim-ui.util")
 local hl = require("lvim-utils.highlight")
+local mouse = require("lvim-utils.mouse")
 
 local api = vim.api
 
@@ -76,13 +77,23 @@ end)
 ---@field activate? string|string[]     expand a collapsed node / activate (default { "l", "<CR>" })
 ---@field collapse? string|string[]     collapse an expanded node / jump to the parent row (default "h")
 
+---@class LvimUiTreePadding
+---@field left? integer   blank columns before every CONTENT row (default 1)
+---@field right? integer  blank columns kept free on the RIGHT (default 2). The scrollbar thumb is painted on the
+---                       LAST window column, so ONE MORE column is reserved on top of this whenever the bar is
+---                       on — i.e. the default leaves 2 blanks and then the bar. Everything that would otherwise
+---                       run into it is constrained: the row text is clipped, the `detail` virtual text is
+---                       clipped to the space actually left, and right-aligned badges are pushed in.
+---                       The header (a title band) is NOT padded — it spans the full width.
+
 ---@class LvimUiTreeOpts
 ---@field root? LvimUiTreeNode|LvimUiTreeNode[]|fun(): LvimUiTreeNode[]  initial top level (see `set_root`)
 ---@field default_expanded? boolean     nodes start EXPANDED (an outline) or COLLAPSED (a file tree); default false
 ---@field connectors? boolean           ├/└ connectors on leaf rows that have a parent (default false)
 ---@field elide_guides? boolean         drop the ancestor guide column below a LAST child (default true);
 ---                                     false keeps a solid │ for every level (the file-tree style)
----@field margin? integer               lead spaces before the tree (default 0)
+---@field margin? integer               DEPRECATED alias for `padding.left` (kept for existing consumers)
+---@field padding? LvimUiTreePadding    breathing room around the CONTENT rows (not the header) — default { left = 1, right = 2 }
 ---@field icons? LvimUiTreeIcons        chrome glyph overrides
 ---@field hl? { guide?: string, fold?: string, detail?: string, mark?: string, empty?: string, thumb?: string, track?: string }
 ---@field empty? string                 placeholder row when there are no nodes (default " No entries")
@@ -93,7 +104,9 @@ end)
 ---@field filetype? string              stamped on the panel buffer (drives the user's cursor `panel_ft`)
 ---@field cursorline? boolean           selection bar via cursorline (default true)
 ---@field hide_cursor? boolean          modal usage: hide the hardware cursor (chassis list-move + click seam)
----@field scrollbar? boolean            right-edge thumb when the tree overflows the window (default true)
+---@field scrollbar? boolean            right-edge thumb when the tree overflows the window (default FALSE — opt in
+---                                     with `true`). When on, ONE extra right column is reserved for it on top of
+---                                     `padding.right`, so the bar never sits on the content.
 ---@field size? fun(): integer, integer natural content size override (a docked panel passes its width)
 ---@field keys? LvimUiTreeKeys|false    canonical keymap overrides; `false` binds none (consumer owns all)
 ---@field on_activate? fun(node: LvimUiTreeNode, t: table)  `l`/`<CR>`/click on a leaf or an expanded node
@@ -154,8 +167,14 @@ function M.new(opts)
     local default_expanded = opts.default_expanded == true
     local connectors = opts.connectors == true
     local elide_guides = opts.elide_guides ~= false
-    local margin = opts.margin or 0
-    local scrollbar = opts.scrollbar ~= false
+    local scrollbar = opts.scrollbar == true
+    -- Content padding — breathing room around the tree ROWS only; the HEADER (a title band) is never padded and
+    -- keeps the full width. Symmetric 1/1 by default. `margin` is the old left-only option, kept as an alias.
+    ---@type integer
+    local pad_left = (opts.padding and opts.padding.left) or opts.margin or 1
+    ---@type integer
+    local pad_right = (opts.padding and opts.padding.right) or 2
+    local margin = pad_left
 
     ---@class LvimUiTreeState
     local state = {
@@ -238,13 +257,38 @@ function M.new(opts)
 
     -- ─── rendering ─────────────────────────────────────────────────────────────
 
+    --- Clip `s` to at most `w` DISPLAY columns (never mid-codepoint). Used so a long row cannot run under the
+    --- scrollbar / into the right padding. Returns `s` untouched when it already fits.
+    ---@param s string
+    ---@param w integer
+    ---@return string
+    local function clip(s, w)
+        if w <= 0 or util.dw(s) <= w then
+            return s
+        end
+        local n = vim.fn.strchars(s)
+        while n > 0 do
+            local cut = vim.fn.strcharpart(s, 0, n)
+            if util.dw(cut) <= w then
+                return cut
+            end
+            n = n - 1
+        end
+        return ""
+    end
+
     --- Build the visible rows: lines, hl spans, virt texts and the row registry. Each line is
-    --- `<margin><guides><marker><icon> <label>`; the marker is a fixed 2-display-column cell (a fold
-    --- chevron, a ├/└ connector, or blanks), so children align under their parents. Pure — the caller
-    --- commits the returned registries (a `size` measurement pass must not clobber the live ones).
+    --- `<padding><guides><marker><icon> <label>`, CLIPPED to the content width (panel minus the right padding +
+    --- scrollbar column); the marker is a fixed 2-display-column cell (a fold chevron, a ├/└ connector, or
+    --- blanks), so children align under their parents. Pure — the caller commits the returned registries (a
+    --- `size` measurement pass must not clobber the live ones).
     ---@param width integer  the panel width (passed to `header` and available to consumers via it)
+    ---@param bar_reserve integer  extra right columns kept free for the scrollbar thumb — 1 only when the bar is
+    ---       ACTUALLY shown (the content overflows), 0 otherwise. Reserving it whenever the OPTION is on would
+    ---       waste a column on every panel that happens to fit.
     ---@return string[] lines, table[] hls, table[] virts, table<integer, table> rows, table[] order, integer header_rows
-    local function build(width)
+    local function build(width, bar_reserve)
+        local pad_right_eff = pad_right + (bar_reserve or 0)
         local lines, hls, virts = {}, {}, {}
         local rows, order = {}, {}
 
@@ -283,7 +327,10 @@ function M.new(opts)
                 local prefix = lead .. guide
                 local icon = n.icon or ""
                 local gap = icon ~= "" and " " or ""
-                lines[#lines + 1] = prefix .. fold_cell .. icon .. gap .. (n.label or "")
+                -- Cut the row to the CONTENT width (the panel minus the right padding + scrollbar column).
+                -- Without this a long label runs under the bar — the bar is painted ON the last column, so it
+                -- would sit on top of the text instead of beside it.
+                lines[#lines + 1] = clip(prefix .. fold_cell .. icon .. gap .. (n.label or ""), width - pad_right_eff)
                 local row = #lines
 
                 if #prefix > 0 then
@@ -308,10 +355,26 @@ function M.new(opts)
                 end
 
                 if n.detail and n.detail ~= "" then
-                    virts[#virts + 1] = { row - 1, { { " " .. n.detail, groups.detail } }, "eol" }
+                    -- `detail` is VIRTUAL text (`eol`), not part of the line — so clipping the line does NOT
+                    -- constrain it: it keeps flowing right, straight under the scrollbar. Clip it to the space
+                    -- that is actually left on the row (content width minus what the row already uses).
+                    local avail = (width - pad_right_eff) - util.dw(lines[row])
+                    if avail > 1 then
+                        local d = clip(" " .. n.detail, avail)
+                        if d ~= "" then
+                            virts[#virts + 1] = { row - 1, { { d, groups.detail } }, "eol" }
+                        end
+                    end
                 end
                 if n.badges and #n.badges > 0 then
-                    virts[#virts + 1] = { row - 1, n.badges, "right_align" }
+                    -- `right_align` pins the badges to the LAST window column — exactly where the scrollbar
+                    -- thumb is painted. Push them left by the effective right padding so the two never overlap.
+                    local badges = n.badges
+                    if pad_right_eff > 0 then
+                        badges = vim.list_extend({}, n.badges)
+                        badges[#badges + 1] = { string.rep(" ", pad_right_eff), groups.detail }
+                    end
+                    virts[#virts + 1] = { row - 1, badges, "right_align" }
                 end
 
                 -- The row registry: the node, its parent (for `h` → parent) and the marker's byte
@@ -405,20 +468,38 @@ function M.new(opts)
         end
         state.dirty = false -- this render satisfies any queued refresh (its callback checks the flag)
         local width = (pan.win and api.nvim_win_is_valid(pan.win)) and api.nvim_win_get_width(pan.win) or 80
-        local lines, hls, virts, rows, order, header_rows = build(width)
+        -- The scrollbar only appears when the content OVERFLOWS, and only then does it need a column reserved.
+        -- Whether it overflows depends on the row count, which is what `build` produces — so build once assuming
+        -- the bar (the common case for a panel worth scrolling), and rebuild without the reserve only if it
+        -- turns out everything fits. Otherwise a panel that fits would waste a column on a bar it never shows.
+        local info = (pan.win and api.nvim_win_is_valid(pan.win)) and vim.fn.getwininfo(pan.win)[1] or nil
+        local height = (info and info.height) or (pan.win and api.nvim_win_get_height(pan.win)) or 0
+        local reserve = scrollbar and 1 or 0
+        local lines, hls, virts, rows, order, header_rows = build(width, reserve)
+        if reserve == 1 and height > 0 and #lines <= height then
+            lines, hls, virts, rows, order, header_rows = build(width, 0) -- fits: no bar, no reserved column
+        end
         state.rows, state.order, state.header_rows = rows, order, header_rows
         vim.bo[pan.buf].modifiable = true
         api.nvim_buf_set_lines(pan.buf, 0, -1, false, lines)
         vim.bo[pan.buf].modifiable = false
         api.nvim_buf_clear_namespace(pan.buf, ns, 0, -1)
         for _, h in ipairs(hls) do
-            pcall(api.nvim_buf_set_extmark, pan.buf, ns, h[1], h[2], {
-                end_col = h[3] >= 0 and h[3] or nil,
-                end_row = h[3] < 0 and h[1] + 1 or nil,
-                hl_eol = h[3] < 0 or nil,
-                hl_group = h[4],
-                priority = 200,
-            })
+            -- Clamp to the row's real length: `build` CLIPS long rows to the content width (so they cannot run
+            -- under the scrollbar), which can leave a span pointing past the end — an out-of-range `end_col`
+            -- throws and kills the whole render.
+            local len = #(lines[h[1] + 1] or "")
+            local c0 = math.min(h[2], len)
+            local c1 = h[3] >= 0 and math.min(h[3], len) or nil
+            if not (c1 and c1 <= c0) then
+                pcall(api.nvim_buf_set_extmark, pan.buf, ns, h[1], c0, {
+                    end_col = c1,
+                    end_row = h[3] < 0 and h[1] + 1 or nil,
+                    hl_eol = h[3] < 0 or nil,
+                    hl_group = h[4],
+                    priority = 200,
+                })
+            end
         end
         for _, v in ipairs(virts) do
             pcall(api.nvim_buf_set_extmark, pan.buf, ns, v[1], 0, {
@@ -439,6 +520,29 @@ function M.new(opts)
     -- VISIBLE rows only, per redraw, and only while the content overflows the window.
     if scrollbar then
         local bar = { from = 0, to = 0, col = 0 } -- thumb range (1-based rows) + window column, per on_win
+
+        -- The thumb is drawn ON BUFFER ROWS, but it belongs to the SCREEN. On a j/k scroll nvim optimises the
+        -- repaint: it SHIFTS the already-drawn rows up/down and only redraws the ones that newly came into view.
+        -- The painted thumb therefore travels with the text, while the fresh rows get it at the correct place —
+        -- so it appears at wrong Y positions, and can even show as TWO pieces far apart. Forcing a full (invalid)
+        -- repaint of the panel on every scroll makes every visible row go through `on_line` again, so the thumb
+        -- is always re-derived from the CURRENT topline.
+        api.nvim_create_autocmd("WinScrolled", {
+            group = api.nvim_create_augroup("LvimUiTreeBar" .. seq, { clear = true }),
+            callback = function()
+                local pan = state.pan
+                if state.destroyed or not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
+                    return
+                end
+                -- only when THIS panel scrolled (`v:event` is keyed by window id)
+                local ev = vim.v.event or {}
+                if ev[tostring(pan.win)] == nil then
+                    return
+                end
+                pcall(api.nvim__redraw, { win = pan.win, valid = false })
+            end,
+        })
+
         api.nvim_set_decoration_provider(ns_bar, {
             on_win = function(_, winid, bufnr, topline, _)
                 local pan = state.pan
@@ -517,6 +621,14 @@ function M.new(opts)
 
     --- The shared click handler (the chassis `on_click` seam AND the panel's own `<LeftMouse>`):
     --- a click on a fold chevron toggles it; anywhere else on the row selects + activates.
+    ---
+    --- The ACTIVATION is deferred to the mouse RELEASE (`lvim-utils.mouse`). A consumer's activate may leave the
+    --- panel — the LSP outline jumps to the symbol (`nvim_set_current_win`), and even its `peek`/`follow` runs
+    --- `zz` in the source via `nvim_win_call`, which switches the current window transiently. Doing that while
+    --- the button is STILL DOWN points CURRENT at the (unlocked) source buffer, so the pending drag/release miss
+    --- this panel's Nops, fall through to nvim's native mouse handler, and start a Visual selection over the row
+    --- label under the pointer. Folding stays immediate (it never leaves the panel), and the row selection has
+    --- already been moved by the caller — so the click still feels instant.
     ---@param line integer  1-based clicked buffer row
     ---@param col0 integer  0-based byte column
     local function click(line, col0)
@@ -525,10 +637,10 @@ function M.new(opts)
             return
         end
         if e.c0 and col0 >= e.c0 and col0 < e.c1 then
-            t.toggle(e.node.id)
+            t.toggle(e.node.id) -- a fold toggle never leaves the panel — safe to run now
             return
         end
-        expand_or_activate()
+        mouse.defer_activation(expand_or_activate)
     end
 
     -- ─── the surface content provider ──────────────────────────────────────────
@@ -544,10 +656,14 @@ function M.new(opts)
             if opts.size then
                 return opts.size()
             end
-            local lines = build(80)
+            -- Measure with the bar reserved: the natural width must leave room for it, since a panel sized to
+            -- its content is exactly the one that may then overflow vertically and grow a scrollbar.
+            local reserve = scrollbar and 1 or 0
+            local lines = build(80, reserve)
             local w = 20
             for _, l in ipairs(lines) do
-                w = math.max(w, util.dw(l) + 2)
+                -- the rows already carry `pad_left`; reserve the right side (padding + the scrollbar column)
+                w = math.max(w, util.dw(l) + pad_right + reserve)
             end
             return w, math.max(1, #lines)
         end,
@@ -582,22 +698,20 @@ function M.new(opts)
                 map(keys.activate or { "l", "<CR>" }, expand_or_activate)
                 map(keys.collapse or "h", collapse_or_parent)
             end
-            -- Mouse (non-modal panels — a hide-cursor modal gets the chassis `on_click` seam instead):
-            -- a click selects the row, then routes through the shared handler; a double-click toggles.
+            -- Mouse: the row-click is registered with the GLOBAL mouse layer (`lvim-utils.mouse`), NOT bound as a
+            -- buffer-local `<LeftMouse>`. A buffer-local map only fires when the panel is ALREADY current — but
+            -- the everyday case is clicking INTO the panel from the editor, where nvim runs its native click
+            -- instead (moving focus AND parking the cursor on the clicked column, which is what let
+            -- word-highlighters paint the row's label). The global layer decides by the window under the pointer,
+            -- focuses the panel, parks the cursor at column 0, and calls this handler with the clicked (line,
+            -- col0) — so chevron hit-testing still works. Registered for EVERY tree panel (modal or not).
+            require("lvim-utils.mouse").register_click(pan.buf, function(line, col0)
+                if vim.o.mouse == "" then
+                    return
+                end
+                click(line, col0)
+            end)
             if not t.provider.hide_cursor then
-                map("<LeftMouse>", function()
-                    if vim.o.mouse == "" then
-                        return
-                    end
-                    local m = vim.fn.getmousepos()
-                    if m.winid ~= pan.win or m.line < 1 or not api.nvim_win_is_valid(pan.win) then
-                        return
-                    end
-                    local line = math.min(m.line, api.nvim_buf_line_count(pan.buf))
-                    local col0 = math.max(0, m.column - 1)
-                    pcall(api.nvim_win_set_cursor, pan.win, { line, col0 })
-                    click(line, col0)
-                end)
                 map("<2-LeftMouse>", function()
                     local m = vim.fn.getmousepos()
                     if m.winid ~= pan.win then

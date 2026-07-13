@@ -1858,6 +1858,17 @@ local function apply_dock_height(state, side)
     state.cfg.max_height = rows
 end
 
+--- Nop the mouse events that would SELECT in a panel (and, for a fit-to-window modal, the wheel too). The rule
+--- and the event list are the ecosystem's — `lvim-utils.mouse` — so every panel behaves identically, whether it
+--- comes from this chassis or a plugin's own window. See that module for WHY (a fast click emits
+--- `<2-/<3-/<4-LeftMouse>`, which natively select the word / line / block and start Visual).
+---@param buf integer
+---@param used_lhs? table<string, true>  lhs already bound by the panel/provider — never overwrite those
+---@param scroll? boolean  also nop the wheel (a fit-to-window float); omit on a docked, scrollable panel
+local function nop_mouse(buf, used_lhs, scroll)
+    require("lvim-utils.mouse").lock(buf, { used = used_lhs, scroll = scroll })
+end
+
 --- Install the chassis keymaps. Panel buffers get sector cycling + the provider's own keys; the
 --- container buffer (bar-menu mode) gets selection move / confirm + sector cycling. `cfg.close_keys`
 --- close a modal frame from anywhere.
@@ -1903,28 +1914,9 @@ local function set_keys(state)
         for _, sk in ipairs({ "<Up>", "<Down>", "<Left>", "<Right>", "<PageUp>", "<PageDown>", "<Home>", "<End>" }) do
             nop(sk)
         end
-        -- Mouse: the wheel AND a click-drag pull the VIEW directly (even with scrolloff=0), scrolling a
-        -- fit-to-window panel's top rows off the top. Nop the SCROLL + DRAG events across every mode a drag
-        -- can pass through (a normal-mode `<LeftDrag>` starts Visual, so bind there too). `<LeftMouse>` (a
-        -- plain click) is DELIBERATELY kept — a footer/header bar button must stay mouse-clickable.
-        local mouse = {
-            "<ScrollWheelUp>",
-            "<ScrollWheelDown>",
-            "<ScrollWheelLeft>",
-            "<ScrollWheelRight>",
-            "<LeftDrag>",
-            "<LeftRelease>",
-            "<2-LeftMouse>",
-            "<2-LeftDrag>",
-            "<RightMouse>",
-            "<RightDrag>",
-            "<MiddleMouse>",
-        }
-        for _, mk in ipairs(mouse) do
-            if not u[mk] then
-                pcall(vim.keymap.set, { "n", "v", "i" }, mk, "<Nop>", { buffer = buf, nowait = true, silent = true })
-            end
-        end
+        -- Mouse scroll/drag (the shared rule — see `nop_mouse`): a drag must never start Visual, and on a
+        -- fit-to-window float the wheel must not pull the view. `<LeftMouse>` stays live (rows/bar buttons).
+        nop_mouse(buf, u, true)
     end
     for _, pan in ipairs(state.panels) do
         -- Panels: vertical sector cycling (header·center·footer) AND horizontal panel nav (left/right);
@@ -2012,7 +2004,13 @@ local function set_keys(state)
                 end
                 local line = math.min(m.line, api.nvim_buf_line_count(pan.buf))
                 local col0 = math.max(0, m.column - 1)
-                pcall(api.nvim_win_set_cursor, pan.win, { line, col0 })
+                -- Column 0, ALWAYS — never the clicked column. A panel row is a rendered widget, not text: the
+                -- column carries no meaning, and parking the cursor ON A WORD makes every word-based highlighter
+                -- (LSP document-highlight, cursorword) paint that word — so a click on "dir" left a selection
+                -- patch over the label on top of the row bar. Keyboard nav already lands on column 0, which is
+                -- exactly why j/k never showed it. `col0` is still passed to `on_click` below, so a
+                -- column-addressable provider (a calendar day grid, a fold chevron) can still hit-test it.
+                pcall(api.nvim_win_set_cursor, pan.win, { line, 0 })
                 if pan.provider and pan.provider.on_click then
                     -- `line` is the 1-based clicked buffer row; `col0` the 0-based byte column — a provider
                     -- with column-addressable content (e.g. a calendar day grid) hit-tests with both.
@@ -2083,6 +2081,20 @@ local function set_keys(state)
         end
         map(state.container_buf, km.key, fn)
     end
+
+    -- MOUSE SELECTION is never wanted on ANY panel — independent of `lock_keys` and of `hide_cursor`. A
+    -- cursor-VISIBLE panel (the LSP outline, a scrollable list) is still a rendered surface: a click there must
+    -- move the row selection, never start a Visual selection over the label. `lock_panel` below only covers
+    -- hide-cursor panels, which is exactly why the outline stayed selectable. Run AFTER the provider's keys are
+    -- bound, so a provider's own `<2-LeftMouse>` (the tree's fold toggle) is preserved; the wheel is nopped only
+    -- for a fit-to-window modal (hide_cursor), never on a scrollable panel.
+    for _, pan in ipairs(state.panels) do
+        local prov = pan.provider or {}
+        if not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
+            nop_mouse(pan.buf, used[pan.buf], prov.hide_cursor == true)
+        end
+    end
+    nop_mouse(state.container_buf, used[state.container_buf], true)
 
     if state.cfg.lock_keys ~= false then -- modal by DEFAULT (opt out per-open with lock_keys = false): every unbound key is a no-op — the PANELS and the chrome CONTAINER
         for _, pan in ipairs(state.panels) do
@@ -3785,6 +3797,11 @@ local function open_native_split(state)
             vim.keymap.set("n", l, fn, { buffer = pan.buf, nowait = true, silent = true })
         end
     end
+    -- A docked panel is a REAL window, so it never goes through `set_keys`/`lock_panel` (the float path) — but
+    -- it is still a rendered UI surface, not a text buffer. Without this, a real mouse click (which jitters a
+    -- pixel → `<LeftDrag>`) starts VISUAL and "selects" the row's label, replacing the full-width cursorline bar
+    -- with a `Visual` bg over the text only. Bound BEFORE the provider's keys, so a provider may override.
+    nop_mouse(pan.buf)
     if pan.provider and pan.provider.keys then
         pcall(pan.provider.keys, map, pan, state)
     end
