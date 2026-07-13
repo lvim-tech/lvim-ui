@@ -30,6 +30,14 @@
 ---@field icons              table                Glyphs for the popup (booleans, select, kinds, markers, current pointer)
 ---@field labels             table                Footer-legend action labels (navigate / confirm / cancel / …)
 ---@field keys               table                Popup + chassis navigation keys (vim notation; strings or lists)
+---@field tree               LvimUiTreeConfig     Defaults for the shared `lvim-ui.tree` primitive (padding / scrollbar)
+
+---@class LvimUiTreeConfig
+---@field padding   { left?: integer, right?: integer }  Blank columns around the tree ROWS (the header/title band
+---                 spans the full width and is never padded). When the scrollbar is shown, ONE more right column
+---                 is reserved for the thumb, so it never sits on the content — and the reserve disappears again
+---                 when the content fits. Consumers (the file tree, the LSP outline, …) may override per-tree.
+---@field scrollbar boolean  Right-edge thumb while the content overflows the window (opt-in).
 
 ---@type LvimUiConfig
 return {
@@ -197,5 +205,16 @@ return {
             next_option = "<Tab>",
             prev_option = "<BS>",
         },
+    },
+
+    -- Defaults for the shared `lvim-ui.tree` primitive (the file tree, the LSP outline, any future tree panel).
+    -- A consumer may override either per-tree; when it does not, THESE are what it gets.
+    tree = {
+        -- Blank columns around the tree ROWS. The header (a title band) is never padded — it spans the full
+        -- width. When `scrollbar` is on, ONE more right column is reserved for the thumb, so the bar never sits
+        -- on the content; the reserve disappears again when the content fits and no bar is drawn.
+        padding = { left = 1, right = 1 },
+        -- Right-edge thumb while the content overflows the window.
+        scrollbar = false,
     },
 }

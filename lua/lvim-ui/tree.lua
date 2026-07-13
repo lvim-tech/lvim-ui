@@ -20,6 +20,7 @@
 --
 ---@module "lvim-ui.tree"
 
+local config = require("lvim-ui.config")
 local util = require("lvim-ui.util")
 local hl = require("lvim-utils.highlight")
 local mouse = require("lvim-utils.mouse")
@@ -79,11 +80,12 @@ end)
 
 ---@class LvimUiTreePadding
 ---@field left? integer   blank columns before every CONTENT row (default 1)
----@field right? integer  blank columns kept free on the RIGHT (default 2). The scrollbar thumb is painted on the
+---@field right? integer  blank columns kept free on the RIGHT (default 1). The scrollbar thumb is painted on the
 ---                       LAST window column, so ONE MORE column is reserved on top of this whenever the bar is
----                       on — i.e. the default leaves 2 blanks and then the bar. Everything that would otherwise
----                       run into it is constrained: the row text is clipped, the `detail` virtual text is
----                       clipped to the space actually left, and right-aligned badges are pushed in.
+---                       actually shown — i.e. the bar never eats into this padding, and the reserve disappears
+---                       when the content fits (no bar). Everything that would otherwise run into it is
+---                       constrained: the row text is clipped, the `detail` virtual text is clipped to the space
+---                       actually left, and right-aligned badges are pushed in.
 ---                       The header (a title band) is NOT padded — it spans the full width.
 
 ---@class LvimUiTreeOpts
@@ -153,6 +155,7 @@ function M.new(opts)
     local ns = api.nvim_create_namespace("lvim_ui_tree_" .. seq) -- content spans + virt text
     local ns_mark = api.nvim_create_namespace("lvim_ui_tree_mark_" .. seq) -- the follow-mark row
     local ns_bar = api.nvim_create_namespace("lvim_ui_tree_bar_" .. seq) -- scrollbar decoration provider
+    local ns_width = api.nvim_create_namespace("lvim_ui_tree_width_" .. seq) -- width-change watcher (see below)
 
     local icons = vim.tbl_extend("force", default_icons(), opts.icons or {})
     local groups = vim.tbl_extend("force", {
@@ -167,13 +170,21 @@ function M.new(opts)
     local default_expanded = opts.default_expanded == true
     local connectors = opts.connectors == true
     local elide_guides = opts.elide_guides ~= false
-    local scrollbar = opts.scrollbar == true
+    -- Resolution order for every tree default: the CONSUMER's own opts win; otherwise the shared `config.tree`
+    -- settings apply (so a user can retune every tree panel from one place); a literal is only the last resort.
+    local tcfg = config.tree or {}
+    local tpad = tcfg.padding or {}
+    local scrollbar = opts.scrollbar
+    if scrollbar == nil then
+        scrollbar = tcfg.scrollbar
+    end
+    scrollbar = scrollbar == true
     -- Content padding — breathing room around the tree ROWS only; the HEADER (a title band) is never padded and
-    -- keeps the full width. Symmetric 1/1 by default. `margin` is the old left-only option, kept as an alias.
+    -- keeps the full width. `margin` is the old left-only option, kept as an alias.
     ---@type integer
-    local pad_left = (opts.padding and opts.padding.left) or opts.margin or 1
+    local pad_left = (opts.padding and opts.padding.left) or opts.margin or tpad.left or 1
     ---@type integer
-    local pad_right = (opts.padding and opts.padding.right) or 2
+    local pad_right = (opts.padding and opts.padding.right) or tpad.right or 1
     local margin = pad_left
 
     ---@class LvimUiTreeState
@@ -183,6 +194,7 @@ function M.new(opts)
         rows = {}, ---@type table<integer, table>  buffer line → row entry { node, parent, c0, c1 }
         order = {}, ---@type table[]               row entries in display order (visible walk order)
         header_rows = 0, ---@type integer          lines the `header` rows take at the top
+        last_width = 0, ---@type integer           width the last render CLIPPED against (a resize re-renders)
         marked = nil, ---@type string|nil          the marked (follow) node id
         pan = nil, ---@type table|nil              the surface panel (buf/win/refresh)
         st = nil, ---@type table|nil               the surface state
@@ -468,6 +480,7 @@ function M.new(opts)
         end
         state.dirty = false -- this render satisfies any queued refresh (its callback checks the flag)
         local width = (pan.win and api.nvim_win_is_valid(pan.win)) and api.nvim_win_get_width(pan.win) or 80
+        state.last_width = width -- the width this render's clipping was derived from (see the resize autocmd)
         -- The scrollbar only appears when the content OVERFLOWS, and only then does it need a column reserved.
         -- Whether it overflows depends on the row count, which is what `build` produces — so build once assuming
         -- the bar (the common case for a panel worth scrolling), and rebuild without the reserve only if it
@@ -514,6 +527,36 @@ function M.new(opts)
             opts.on_render(t)
         end
     end
+
+    -- ─── re-render when the WIDTH changes ──────────────────────────────────────
+    -- Every width-dependent decision is baked into the buffer at `build` time: rows are CLIPPED to the content
+    -- width, and `detail` (eol virtual text) is clipped to the space actually left on its row. So a panel whose
+    -- width changes AFTER its render keeps content sized for the OLD width — and a docked panel is laid out and
+    -- THEN adjusted, so the very first render is routinely one column off. Its detail then runs to the very edge,
+    -- eating the right padding entirely.
+    --
+    -- This is checked from a decoration provider, NOT from `WinResized`: that autocmd simply does not fire for
+    -- the panel here (verified — `build` was never re-entered), whereas `on_win` runs on every single redraw of
+    -- the window, which is exactly when a stale width would become visible. The re-render is SCHEDULED: `on_win`
+    -- runs inside the redraw and must not mutate the buffer.
+    api.nvim_set_decoration_provider(ns_width, {
+        on_win = function(_, winid, bufnr, _, _)
+            local pan = state.pan
+            if state.destroyed or not (pan and winid == pan.win and bufnr == pan.buf) then
+                return false
+            end
+            local w = api.nvim_win_get_width(winid)
+            if w ~= state.last_width and w > 0 then
+                state.last_width = w
+                vim.schedule(function()
+                    if not state.destroyed then
+                        render()
+                    end
+                end)
+            end
+            return false
+        end,
+    })
 
     -- ─── scrollbar (the menu's ephemeral decoration-provider canon) ────────────
     -- The buffer text is untouched: a thumb/track cell is painted on the LAST window column of the
