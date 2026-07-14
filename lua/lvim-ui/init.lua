@@ -72,7 +72,7 @@ function M.section(opts)
 end
 
 ---@class UiOpts
----@field title? string|false        -- border-title (false hides it for M.info)
+---@field title? string|table|false  -- border-title (a plain string, or a `{ icon?, text }` box spec; false hides it for M.info)
 ---@field items? any[]               -- select / multiselect items
 ---@field current_item? any          -- select: focus this item on open (e.g. the installed version)
 ---@field mark_current? boolean      -- select: default true → the focused current_item also gets a "  (current)" suffix; false = focus only (caller owns the marker)
@@ -116,6 +116,7 @@ end
 ---@field on_item_change? fun(item: table?) -- tabs item-list mode: live preview callback on focused item (nil on a row with no item — a section header / empty row — so the consumer can clear its preview)
 ---@field preview? table                -- tabs: a surface content PROVIDER shown as a second `id="preview"` block beside the tab content (e.g. built on lvim-ui.preview); plugs into the chassis preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> rotation)
 ---@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "above" | "below"
+---@field content_width? number         -- tabs+preview: the CONTENT block's fixed share of the stack axis (fraction ≤ 1; default 0.4 — the preview takes the rest)
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
 ---@field hide_cursor? boolean       -- info: hide the hardware cursor (read-only viewer)
 ---@field wrap? boolean              -- info: enable line wrap in the window (default off)
@@ -499,10 +500,12 @@ function M.input(opts)
     local confirmed = false
     local buf
 
-    -- A 2-space LEFT gutter is baked into the editable line (`PAD .. value`) instead of a side border, so the
-    -- text never butts the popup edge; it is stripped back off on confirm. `size` reserves PAD on the left AND
-    -- right, so a value narrower than the popup shows 2 spaces on both sides.
-    local PAD = "  "
+    -- The side gutter is the block's own BORDER — a blank " " left and right (see `border` below) — so it is
+    -- neither content nor decoration: it is the window's geometry, and the value's column 0 is the value's
+    -- first character. Baking it into the line as text (`"  " .. value`) is what a naive input does, and it
+    -- makes the padding EDITABLE: backspace at the head of the value eats the gutter, walks the cursor left
+    -- of where the value starts, and every consumer has to strip it back off on confirm.
+    local PAD = 2
 
     --- @param st table
     local function confirm(st)
@@ -511,7 +514,7 @@ function M.input(opts)
         if buf and vim.api.nvim_buf_is_valid(buf) then
             val = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
         end
-        val = val:match("^%s*(.-)%s*$") or "" -- drop the padding gutter (and any stray edge whitespace)
+        val = val:match("^%s*(.-)%s*$") or "" -- the value IS the line now; only stray edge whitespace goes
         st.close()
         vim.schedule(function()
             cb(true, val)
@@ -520,18 +523,28 @@ function M.input(opts)
 
     local provider = {
         editable = true,
+        -- The FIELD's wash: the whole input window (its blank side border included) wears LvimUiInput, whose
+        -- accent / text colour / tint strength all come from the shared spec (lvim-utils config.ui:
+        -- `accent.input`, `tint.input`) — never named here.
+        normal_hl = "LvimUiInput",
         size = function()
-            return math.max(util.dw(default) + 4, util.dw(opts.title or opts.prompt or "Input") + 4, 30), 1
+            -- The content's own width — the side gutters are the block's border, added around this by the frame.
+            -- The TITLE needs room of its own: it is drawn on the container's border row as ` <title> `, so the
+            -- window must be WIDER than that, or it fills the row edge to edge (no trailing air, and centring
+            -- becomes a no-op because there is nothing left to centre in).
+            local title = util.dw(opts.title or opts.prompt or "Input") + 2 -- the spaces the frame wraps it in
+            return math.max(util.dw(default), title + PAD * 2, 30), 1
         end,
         render = function()
-            return { PAD .. default }, {}
+            return { default }, {}
         end,
         keys = function(map, p, st)
             buf = p.buf
-            -- Land the cursor at the END of the value (past the 2-space gutter), not inside the padding.
+            -- Land the cursor at the END of the value. Column 0 is the value's first character, so backspace
+            -- there has nothing left to delete — the gutter is the block's border, not text.
             vim.schedule(function()
                 if p.win and vim.api.nvim_win_is_valid(p.win) then
-                    pcall(vim.api.nvim_win_set_cursor, p.win, { 1, #(PAD .. default) })
+                    pcall(vim.api.nvim_win_set_cursor, p.win, { 1, #default })
                 end
             end)
             vim.keymap.set("i", "<CR>", function()
@@ -550,19 +563,28 @@ function M.input(opts)
 
     frame.open({
         mode = "float",
-        -- A top-only " " border (ct=1) so the CENTRED native border-title has a row to sit on even when the
-        -- global `config.border` is "none" — else `title_line="border"` has nowhere to draw and the title
-        -- vanishes. No side borders: the input line runs flush left/right (no horizontal gutter).
-        border = { "", " ", "", "", "", "", "", "" },
+        -- No container border: the top " " row existed only to give a native border-title somewhere to sit,
+        -- and the title is a CONTENT ROW now (see below). The frame's own `config.border` applies.
         title = opts.title or opts.prompt or "Input",
-        -- CENTRED border-title, with the canon air rows kept: 1 blank row under the title (above the input) and
-        -- 1 above the footer (below the input), so the input line breathes.
+        -- The title is a CONTENT ROW (`title_line = "row"`, the frame's default), exactly like every other
+        -- popup — NOT a native border-title. It is not a cosmetic choice: Neovim places a centred BORDER-title
+        -- at `floor(free/2) + 1`, i.e. always one cell right of true centre (measured on a bare `-u NONE`
+        -- float: a 44-wide window with a 38-wide title gets 4 cells of air left and 2 right, and the same with
+        -- a full border ring). A title ROW is drawn by us, so it centres exactly — and the input looks like the
+        -- rest of the set instead of being the one primitive with its own title mechanism.
         title_pos = opts.title_pos or "center",
-        title_line = "border",
-        -- No content ring — the 2-space gutter is baked into the rendered value (see PAD above), not a border.
-        panel_border = "none",
         size = { width = { auto = true, max = opts.width or 0.6 }, height = { auto = true } },
-        content = { blocks = { { id = "input", provider = provider } } },
+        -- The gutter is the CONTENT BLOCK's border: blank " " cells left and right (no ring — top/bottom stay
+        -- empty), so the value never butts the popup edge and the padding cannot be typed into or deleted.
+        content = {
+            blocks = {
+                {
+                    id = "input",
+                    provider = provider,
+                    border = { "", "", "", " ", "", "", "", " " },
+                },
+            },
+        },
         footer = {
             bars = {
                 {
@@ -780,8 +802,22 @@ function M.tabs(opts)
                 break
             end
         end
+        -- The selection bar is a WINDOW option on the shared panel, and the surface reads it off THIS
+        -- delegate (never off the tab behind it) once, at panel creation. Declaring it when ANY tab wants
+        -- one installs the CursorLine winhighlight mapping on the shared window; `update` below then turns
+        -- the bar on or off per the ACTIVE tab, so a list tab shows its selection and a plain text tab does
+        -- not. Without this a tree in provider-tab mode has no selection bar at all — and with `hide_cursor`
+        -- there is then nothing on screen marking the row the hidden cursor is on.
+        local any_cursorline = false
+        for _, t in ipairs(tabset) do
+            if t.provider and t.provider.cursorline then
+                any_cursorline = true
+                break
+            end
+        end
         content_p = {
             hide_cursor = all_hide,
+            cursorline = any_cursorline,
             filetype = tabset[active].provider.filetype,
             --- Content-size hint — the active tab's, used only when an axis resolves to AUTO sizing.
             ---@return integer width, integer height
@@ -806,6 +842,10 @@ function M.tabs(opts)
                 local pr = active_provider()
                 if not pr then
                     return
+                end
+                -- Keep the shared window's selection bar with the ACTIVE tab (see `any_cursorline` above).
+                if any_cursorline and pan.win and vim.api.nvim_win_is_valid(pan.win) then
+                    vim.wo[pan.win].cursorline = pr.cursorline == true
                 end
                 if pr.update then
                     pr.update(pan, L)
@@ -1193,7 +1233,9 @@ function M.tabs(opts)
         if not opts.preview then
             return { list_block }
         end
-        list_block.size = { width = { fixed = 0.4 } }
+        -- The content block's share of the stack axis when a preview sits beside it — per-call
+        -- `content_width` (a consumer whose preview is the star, e.g. a diff, gives the list less).
+        list_block.size = { width = { fixed = opts.content_width or 0.4 } }
         list_block.shrink_first = true
         local preview_block = { id = "preview", provider = opts.preview, border = CONTENT_BORDER }
         local side = opts.preview_side or "right"

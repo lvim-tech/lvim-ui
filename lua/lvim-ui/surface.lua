@@ -2434,15 +2434,21 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     -- (a picker's preview swatch, its mode/output header) off the top under the user's global `scrolloff`.
     vim.wo[pan.win].scrolloff = 0
     vim.wo[pan.win].sidescrolloff = 0
+    -- A provider may name the group its window wears as Normal (`normal_hl`) — the input FIELD does, so the
+    -- field itself carries its own wash. The BORDER keeps the frame's group: a block whose blank " " side
+    -- border is its gutter must show the POPUP's background there, else the tinted field bleeds to the popup
+    -- edge and the gutter disappears.
+    local normal = (pan.provider and pan.provider.normal_hl) or "LvimUiPeekNormal"
+    local fbord = "LvimUiPeekBorder"
     if pan.provider and pan.provider.cursorline then
         local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline)
             or ((#state.panels > 1) and "LvimUiCursorLine" or "LvimUiPeekCursorLine")
-        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder,CursorLine:" .. cl
+        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s,CursorLine:%s"):format(normal, fbord, cl)
         vim.wo[pan.win].cursorline = true
     else
         -- FloatBorder → LvimUiPeekBorder so a content-panel ring (config.content_border) paints with the same
         -- bg/fg as the container ring, reading as one nested frame instead of the unthemed default FloatBorder.
-        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder"
+        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s"):format(normal, fbord)
     end
     pan.refresh = function() -- a provider re-renders its own panel after a state change (toggle, …)
         -- find the panel's CURRENT index by identity — `state.panels` is reordered/shrunk by the preview
