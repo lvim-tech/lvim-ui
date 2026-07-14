@@ -65,7 +65,11 @@ return {
     -- the common `group_border` frames the two panels as a group and the `separator` divides them, so a second
     -- per-panel ring would just double the lines. Set to an 8-element ring to give each panel its own frame too.
     --   { topleft, top, topright, right, botright, bot, botleft, left }
-    content_border = "none",
+    -- A blank `" "` RING (no glyphs — a 1-cell inset on every side): the data never butts the panel edge, and
+    -- the ring is GEOMETRY the frame draws, not padding baked into the rendered rows. The frame DERIVES its air
+    -- rows from this (see surface.lua) — a side the ring spaces gets no extra blank row — so changing this key
+    -- to "none" or a glyph border keeps the spacing correct on its own.
+    content_border = { " ", " ", " ", " ", " ", " ", " ", " " },
     -- THE single configurable source for the INTER-PANEL divider — the rule drawn BETWEEN adjacent content
     -- panels (a picker's list ↔ preview). The chassis reads it as the per-surface default, so changing it here
     -- re-divides every multi-panel surface on the next open. AUTO-ORIENTED: `h` is the glyph between side-by-side
@@ -90,6 +94,12 @@ return {
     -- SAME glyphs; each consumer keeps its own chevron COLOUR (its own highlight group). Consumers pair the glyphs
     -- with their colour via `surface.chevrons(hl)`. Set e.g. `{ left = "‹", right = "›" }` to restyle them all.
     chevrons = { left = "❮", right = "❯" },
+    -- The `dynamic` preview — the PEEK FLOAT above the list (the position `<C-n>`/`<C-p>` rotate into). May the
+    -- user ENTER it? Default false: the float is there to be READ while you move through the list, so `<C-k>`
+    -- from the top sector steps straight out to the real buffer instead of parking the cursor in a preview.
+    -- Set true to make it a focusable stop in the sector chain (the lvim-lsp peek's behaviour, where the float
+    -- shows the file's real buffer and is meant to be edited).
+    peek_enter = false,
     -- Surface GEOMETRY and BACKDROP per layout (float / area / bottom) are NOT defined here — they live in the
     -- SINGLE central authority `lvim-utils.config.dock.geometry`, read live at open time by `lvim-ui.surface`
     -- through `lvim-ui.surface.size_spec(layout)` (size) and `lvim-utils.dock.slot(layout)` (backdrop). That is the

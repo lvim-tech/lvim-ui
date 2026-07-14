@@ -118,7 +118,7 @@ end
 ---@field pad? integer               -- tabs/form: body row left padding
 ---@field on_item_change? fun(item: table?) -- tabs item-list mode: live preview callback on focused item (nil on a row with no item — a section header / empty row — so the consumer can clear its preview)
 ---@field preview? table                -- tabs: a surface content PROVIDER shown as a second `id="preview"` block beside the tab content (e.g. built on lvim-ui.preview); plugs into the chassis preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> rotation)
----@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "above" | "below"
+---@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "dynamic"
 ---@field content_width? number         -- tabs+preview: the CONTENT block's fixed share of the stack axis (fraction ≤ 1; default 0.4 — the preview takes the rest)
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
 ---@field hide_cursor? boolean       -- info: hide the hardware cursor (read-only viewer)
@@ -1189,9 +1189,14 @@ function M.tabs(opts)
         end
         if want_tab_bar() then
             hb[#hb + 1] = tab_bar
-            hb[#hb + 1] = { text = "" } -- 1 blank "air" row between the tab bar and the toolbars/content
         end
         local _, _, tbars = split(active)
+        -- 1 blank "air" row between the tab bar and the TOOLBAR bands only. The air ABOVE THE CONTENT is not the
+        -- consumer's to add: the content panel's ring (`config.content_border`) draws it, and the frame derives
+        -- its own air rows from that ring — a band here would stack a SECOND blank row over the content.
+        if want_tab_bar() and #tbars > 0 then
+            hb[#hb + 1] = { text = "" }
+        end
         for _, br in ipairs(tbars) do
             hb[#hb + 1] = { items = br.items, align = br.align or "center" }
         end
@@ -1248,7 +1253,7 @@ function M.tabs(opts)
         list_block.shrink_first = true
         local preview_block = { id = "preview", provider = opts.preview, border = CONTENT_BORDER }
         local side = opts.preview_side or "right"
-        if side == "left" or side == "above" then
+        if side == "left" then
             return { preview_block, list_block }
         end
         return { list_block, preview_block }

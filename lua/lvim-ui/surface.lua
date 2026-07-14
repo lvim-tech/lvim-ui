@@ -493,6 +493,34 @@ local function bar_items(items, footer)
     return out
 end
 
+--- Drop a blank "air" band that ENDS UP ADJACENT to a ringed content panel. The air row and the content
+--- panel's border row do the same job (detach the data from the chrome), so whichever consumer supplied the
+--- air — the frame itself (`header_air` / `footer_air`), the row-title's own air, or a hand-written
+--- `{ text = "" }` band — a second blank row would stack on the ring's. Air BETWEEN bands (title ↔ tab bar,
+--- filter ↔ prompt) is untouched: only the band touching the content goes. Enforced HERE, in the chassis, so
+--- no panel can reintroduce the mismatch and turning the ring off restores the air by itself.
+---@param bands table[]
+---@param ringed boolean  the content panel's border already spaces this side
+---@param footer boolean  footer bands touch the content at their FIRST row, headers at their LAST
+local function trim_air(bands, ringed, footer)
+    if not ringed or #bands <= 1 then
+        -- A LONE band is the bar itself, not padding: lvim-space opens with an empty info footer
+        -- (`{ bars = { { text = "" } } }`) and fills it right after, so trimming it away sized the container one
+        -- row short and the action bar was drawn onto a row the window did not have.
+        return
+    end
+    -- A `scope_panel` / `scope_id` input band takes NO row of its own (it overlays its panel's top row — the
+    -- picker's prompt), so it is not what touches the content: step over it to reach the band that does.
+    local i = footer and 1 or #bands
+    while bands[i] and (bands[i].scope_panel or bands[i].scope_id) do
+        i = i + (footer and 1 or -1)
+    end
+    local b = bands[i]
+    if b and b.meta == "" and not b.buttons and not b.input and not b.title_counter then
+        table.remove(bands, i)
+    end
+end
+
 --- Build a band stack from `cfg.header` / `cfg.footer`. Each `bar` is a ui.bar `{ items, align, chevrons,
 --- on_change, on_select }` OR a meta line `{ text = "...", hl }`. Internally a bar band keeps its element
 --- list in `band.buttons` (the field name the machinery uses — it already holds buttons + separators).
@@ -1067,6 +1095,7 @@ local function compute_geom(state, place)
     -- its natural size); the cross axis is the full center extent. `dividers` are column offsets when
     -- horizontal, row offsets when vertical (render_chrome draws them per `L.vertical`).
     local out, dividers = {}, {}
+    local sep_top, sep_bot -- the divider's row span (container buffer lines) — the panels' content rows
     --- Share `avail` across the panels by weight / auto-natural / flex (the common allocation for both axes).
     ---@param avail integer
     ---@param natural fun(i: integer): integer
@@ -1173,6 +1202,14 @@ local function compute_geom(state, place)
                 col = x,
                 border = pi.b,
             }
+            -- The rows the divider may occupy: the panels' CONTENT rows ONLY (as container buffer lines). A
+            -- panel's ring rows are chrome, not data — a divider drawn through them pokes one row above and one
+            -- below the content and fills the blank ring row under the panels, so the air reads as missing.
+            -- Intersected across the panels, so a shorter neighbour clips it.
+            local ct0 = out[i].row + pi.t - cc_row
+            local cb0 = ct0 + out[i].height - 1
+            sep_top = (sep_top == nil) and ct0 or math.max(sep_top, ct0)
+            sep_bot = (sep_bot == nil) and cb0 or math.min(sep_bot, cb0)
             x = x + pi.l + widths[i] + pi.r
             if i < n and sep_w > 0 then
                 dividers[#dividers + 1] = x - cc_col
@@ -1193,6 +1230,8 @@ local function compute_geom(state, place)
         header_h = header_h,
         footer_h = footer_h,
         center_h = center_h,
+        sep_top = sep_top,
+        sep_bot = sep_bot,
         panels = out,
         dividers = dividers,
         vertical = vertical, -- dividers are ROW offsets (a horizontal rule) when true, else column offsets
@@ -1260,8 +1299,13 @@ local function render_chrome(state, L)
                     end
                 end
             else
-                -- only on the PANEL rows (a grouped ring's top/bottom rows are NOT panel rows)
+                -- only on the panels' CONTENT rows — a grouped ring's top/bottom rows are not panel rows, and
+                -- (L.sep_top/sep_bot) a panel's OWN ring rows are chrome too: a divider through them sticks out
+                -- one row above and below the data and blots out the blank ring row under the panels.
                 local in_panel = not grp or (i0 >= grp.line0 + grp.ptop and i0 <= grp.line0 + grp.lines - 1 - grp.pbot)
+                if L.sep_top and (i0 < L.sep_top or i0 > L.sep_bot) then
+                    in_panel = false
+                end
                 if in_panel then
                     for c = 0, W - 1 do
                         if divider_set[c] then
@@ -1332,7 +1376,11 @@ local function render_chrome(state, L)
             -- CENTER / RIGHT place the title by hand (ui.bar's title is prefix-only), with the counter still
             -- flush-right. UPPERCASE in every case (the title-bar canon).
             local cnt = band.count and tostring((type(band.count) == "function" and band.count()) or band.count) or ""
-            local tpos = band.title_pos or "left"
+            -- A COUNTER forces the title LEFT: the pair reads as one bar (title anchored left, count anchored
+            -- right — the message-bar canon), and only the left path renders through ui.bar, whose count is a
+            -- real padded BUTTON box (a blank cell each side of the digits) instead of a bare string glued to the
+            -- right edge. `title_pos` still places a COUNTER-LESS title (centered by default).
+            local tpos = (cnt ~= "" and "left") or band.title_pos or "left"
             if tpos == "left" then
                 local items = {}
                 if cnt ~= "" then
@@ -1722,10 +1770,17 @@ local function sector_cycle(state, dir)
         return
     end
     local cur = current_sector(state)
-    -- DYNAMIC peek: the float sits ABOVE everything, so `<C-k>` enters it only from the TOP sector — from the
-    -- list you first reach the header (the filter bar), then one more `<C-k>` steps up into the float to edit.
+    -- DYNAMIC peek: the float sits ABOVE everything, so `<C-k>` from the TOP sector would step INTO it. Whether
+    -- it is a stop at all is the CHASSIS-WIDE `config.peek_enter` (default false — the float is there to be read
+    -- while you move through the list, so the cursor goes straight out to the real buffer); a surface may
+    -- override it with `cfg.peek_enter`. When it IS enterable, one more `<C-k>` from the top sector lands in it.
+    local peek_enter = state.cfg.peek_enter
+    if peek_enter == nil then
+        peek_enter = config.peek_enter == true
+    end
     if
-        state.preview_side == "dynamic"
+        peek_enter
+        and state.preview_side == "dynamic"
         and dir < 0
         and cur == 1
         and state.dyn
@@ -1734,17 +1789,6 @@ local function sector_cycle(state, dir)
     then
         api.nvim_set_current_win(state.dyn.win)
         return
-    end
-    -- VERTICAL stack: the center panels are stacked top↔bottom, so `<C-j>`/`<C-k>` step THROUGH them (the
-    -- preview is reachable up/down, not only via panel-nav) before continuing to the next sector.
-    if state.cfg.direction == "vertical" and state.sectors[cur] and state.sectors[cur].kind == "center" then
-        local np = #state.panels
-        local cp = state.center_panel or 1
-        if (dir > 0 and cp < np) or (dir < 0 and cp > 1) then
-            state.center_panel = cp + dir
-            focus_sector(state, cur)
-            return
-        end
     end
     if (dir < 0 and cur == 1) or (dir > 0 and cur == n) then
         -- Top/bottom edge of a docked split → step VERTICALLY out to the editor (matches a below/above dock).
@@ -1779,11 +1823,9 @@ local function sector_cycle(state, dir)
         return -- at an edge with no escape handler → STOP (never WRAP around to the opposite end)
     end
     local target = ((cur - 1 + dir) % n) + 1
-    -- Entering the CENTER: horizontal lands on the PRIMARY panel (1; the preview is reached by panel-nav). A
-    -- VERTICAL stack lands on the panel at the edge we entered from — top (1) coming DOWN, bottom (last) coming
-    -- UP — so the next `<C-j>`/`<C-k>` keeps walking through the stack.
+    -- Entering the CENTER lands on the PRIMARY panel (1); the preview beside it is reached by panel-nav.
     if state.sectors[target] and state.sectors[target].kind == "center" then
-        state.center_panel = (state.cfg.direction == "vertical" and dir < 0) and #state.panels or 1
+        state.center_panel = 1
     end
     focus_sector(state, target)
 end
@@ -1936,30 +1978,63 @@ local function default_open(state, mode)
     pcall(vim.cmd, "normal! zz")
 end
 
---- Set the DOCKED container height from `cfg.preview_heights` ( `{ horizontal, vertical }` — a value ≤ 1 is a
---- fraction of the screen, > 1 an absolute row count) for the side's stack direction: `horizontal` when the
---- preview sits left/right, `vertical` when it sits above/below. No-op for a float or when the consumer didn't
---- ask for managed heights.
+--- The dock LAYOUT a surface belongs to — the key its geometry (height / width / backdrop) is read under in the
+--- central `lvim-utils.config.dock.geometry`. Declared here because both the height resolver below and the
+--- backdrop resolver further down need it.
+---@param cfg table
+---@return "area"|"bottom"|"float"
+local function backdrop_layout(cfg)
+    if cfg.position == "cmdline" then
+        return "area"
+    elseif cfg.position == "bottom" then
+        return "bottom"
+    end
+    return "float"
+end
+
+--- Set the DOCKED container height from `cfg.preview_heights.horizontal` (a value ≤ 1 is a fraction of the
+--- screen, > 1 an absolute row count) — the height of the dock itself, whose panels always sit side by side.
+--- (`preview_heights.vertical` is a different thing: the cap of the `dynamic` peek FLOAT — see `dyn_geom`.)
+--- No-op for a float or when the consumer didn't ask for managed heights.
 ---@param state table
----@param side string
+---@param side string  the preview's current side (kept for the call sites; the docked height is one number now)
 local function apply_dock_height(state, side)
+    local _ = side
     if not (state.cfg.host or state.cfg.mode == "split") then
         return -- only the DOCKED layouts (hosted msgarea zone, or a non-hosted bottom/area split) have a height
     end
     local hs = state.cfg.preview_heights
-    local v = hs and ((side == "above" or side == "below") and hs.vertical or hs.horizontal)
+    local v = hs and hs.horizontal
     if type(v) ~= "number" then
         return
     end
     local rows = math.max(1, v <= 1 and math.floor(vim.o.lines * v) or math.floor(v))
-    -- AUTO-fit the docked area to its content (each panel fits ITS OWN content, capped at `max_rows`), bounded
-    -- by the configured value. When the room (or this cap) can't hold the stack, the overflow shrink in
-    -- compute_geom keeps the LIST at its content and shrinks the PREVIEW first (it scrolls) — so the list height
-    -- never jumps as you navigate files of different lengths. (cfg.size is only normalised once at open, so we
-    -- set the fields compute_geom reads directly; relayout re-reserves the host.)
-    state.cfg.auto_height = true
-    state.cfg.height = nil
-    state.cfg.max_height = rows
+    -- FIT or FIXED — the user's own choice, not ours. `height_auto` (the control center's "height auto (fit)"
+    -- row, living in the central `dock.geometry.<layout>`) says whether the configured height is a MAXIMUM the
+    -- panel content-fits up to, or an EXACT height. This used to force `auto_height = true` unconditionally,
+    -- which silently overrode a user who had turned the fit OFF (their fixed panel re-sized itself anyway).
+    --   auto  → content-fit up to `rows`; when the pair does not fit, the shrink in compute_geom takes the rows
+    --           from the PREVIEW (`shrink_first`), so the list's height never jumps as you scroll files.
+    --   fixed → exactly `rows`, always; nothing re-fits.
+    -- (cfg.size is normalised once at open, so we set the fields compute_geom reads directly; relayout
+    -- re-reserves the host.)
+    local auto = true
+    local ok_c, uconf = pcall(require, "lvim-utils.config")
+    if ok_c then
+        local g = (((uconf or {}).dock or {}).geometry or {})[backdrop_layout(state.cfg)]
+        if g and g.height_auto ~= nil then
+            auto = g.height_auto == true
+        end
+    end
+    if auto then
+        state.cfg.auto_height = true
+        state.cfg.height = nil
+        state.cfg.max_height = rows
+    else
+        state.cfg.auto_height = false
+        state.cfg.height = rows
+        state.cfg.max_height = nil
+    end
 end
 
 --- Nop the mouse events that would SELECT in a panel (and, for a fit-to-window modal, the wheel too). The rule
@@ -2557,19 +2632,6 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     render_panel(state, i)
 end
 
---- Which size layout a surface is — derived from its anchor `position` (the same signal the sizing uses):
---- "cmdline" → the area dock, "bottom" → the bottom dock, anything else (centred) → a float.
----@param cfg table
----@return "float"|"area"|"bottom"
-local function backdrop_layout(cfg)
-    if cfg.position == "cmdline" then
-        return "area"
-    elseif cfg.position == "bottom" then
-        return "bottom"
-    end
-    return "float"
-end
-
 --- The effective backdrop veil for this surface, sourced from the CENTRAL `lvim-utils.dock` geometry authority:
 --- `dock.slot(layout, { backdrop = cfg.backdrop }).backdrop` resolves the layout default AND applies the
 --- consumer's per-open `cfg.backdrop` anchored override (a `{ enabled?, mode, dim, darken }` table merged over
@@ -2651,10 +2713,14 @@ local function open_windows(state)
     if state.cfg.zindex then
         state.zindex = state.cfg.zindex
     else
+        -- Z-ORDER only: stack above whatever frames are live, so a modal is never covered by its opener.
+        -- This used to ALSO mean "skip my backdrop" (`zindex > 50`), which conflated two different questions.
+        -- Stacking above a frame says nothing about veils: the msgarea ZONE is a frame and is open all session,
+        -- so every float opened over it — a picker, a modal — silently dropped its own backdrop and the editor
+        -- behind stayed bright. The real rule is the one below in `open_backdrop`: skip only when ANOTHER
+        -- surface's backdrop is already covering the editor (`active_surface_bd`), which is the case the "opened
+        -- FROM a browser" comment was actually about.
         state.zindex = auto_float_base()
-        -- >50 ⇒ we stacked above an existing frame → skip our own backdrop (see open_backdrop) so the panel below
-        -- stays visible; a lone float over the editor stays at 50 and keeps its veil.
-        state.skip_backdrop = state.zindex > 50
     end
     open_backdrop(state) -- the dim/darken veil BEHIND everything (no-op when this layout's backdrop is off)
     state.container_buf = api.nvim_create_buf(false, true)
@@ -2805,6 +2871,12 @@ local function open_windows(state)
                     focusable = true,
                     zindex = state.zindex + 2, -- above the container (z) and the panels (z+1)
                 })
+                -- This window belongs to the FRAME: mark it like the container and the panels. The backdrop
+                -- applier reads this mark to know which windows are the surface's own — it must not mute them,
+                -- and it drops the veil in when one of them is focused. Unmarked, a picker (which opens ON its
+                -- prompt) looked to the applier like the editor still had focus: the veil never came down, so a
+                -- float picker showed NO backdrop at all.
+                vim.w[band.win].lvim_frame = true
                 -- The typed area uses `input_hl` (the row's Normal bg); the prompt badge uses `prompt_hl`.
                 vim.wo[band.win].winhighlight = "Normal:" .. (band.input_hl or "LvimUiPeekNormal")
                 -- No wrap/continuation chrome on the 1-row prompt (a long query scrolls horizontally; a
@@ -2868,15 +2940,25 @@ local function open_windows(state)
         end
     end
     apply_dock_height(state, state.preview_side) -- the configured docked height for the INITIAL stack direction
-    --- Rotate the preview through FIVE positions (right → below → left → above → dynamic → …), LIVE. The four
-    --- docked sides reflow the floats in place; `dynamic` drops the docked preview to a full-width list + a
-    --- transient peek float (`apply_preview_side` handles both). No-op without a "preview" panel.
+    --- Rotate the preview through its THREE positions (right → left → dynamic → …), LIVE. The two docked sides
+    --- reflow the floats in place; `dynamic` drops the docked preview to a full-width list + a transient peek
+    --- float ABOVE it (`apply_preview_side` handles both). No-op without a "preview" panel.
+    ---
+    --- Vertical DOCKED stacking (above/below) is deliberately NOT in the rotation: the two panels then split the
+    --- dock's rows, so a preview worth reading leaves the list a few rows — and with the dock anchored to the
+    --- screen bottom, re-fitting it to each file moved the list up and down while you merely scrolled. The float
+    --- ("dynamic") is the answer for a tall preview: the list keeps the dock, the file gets the screen.
     ---@param dir integer  +1 next position, -1 previous
     state.rotate_preview = function(dir)
         if not state.preview_panel then
             return
         end
-        local order = { "right", "below", "left", "above", "dynamic" }
+        -- `dynamic` (the peek FLOAT above the list) is a DOCKED-surface position only: it lives in the editor's
+        -- space above the dock. A centred FLOAT has no such space — it sits in the middle of the screen, so the
+        -- peek would be squeezed against its top edge (and, holding the file's real buffer, would take the file's
+        -- own autocmds down with it: `E36: Not enough room`). A float rotates between the two docked sides.
+        local docked = state.cfg.host ~= nil or state.cfg.position ~= nil or state.cfg.mode == "split"
+        local order = docked and { "right", "left", "dynamic" } or { "right", "left" }
         local ci = 1
         for i, s in ipairs(order) do
             if s == (state.preview_side or "right") then
@@ -2941,6 +3023,7 @@ local function open_windows(state)
                 table.insert(state.header_bands, 1, tb[i])
             end
         end
+        trim_air(state.header_bands, state.cfg._ring_top == true, false)
         state.sectors = build_sectors(state)
         if on_bar then
             local fi = math.max(1, math.min(state.focus_idx or 1, #state.sectors))
@@ -3014,12 +3097,19 @@ local function open_windows(state)
     ---@param spec table
     state.set_footer = function(spec)
         state.cfg.footer = spec
+        local before = #state.footer_bands
         state.footer_bands = build_bands(spec, true, state.cfg.footer_air)
+        trim_air(state.footer_bands, state.cfg._ring_bottom == true, true)
         state.sectors = build_sectors(state)
         -- the swapped footer carries its own button hotkeys (per-tab clear actions) — re-derive the mapped
         -- set so a stale key can't fire a dropped band's action, same as set_header
         state.remap_hotkeys()
-        if state._geom then
+        -- A footer with a DIFFERENT number of rows changes the frame's height: repainting alone would draw the
+        -- new band onto a row the container does not have (it is clipped, and the bar simply never appears).
+        -- Re-fit instead — the same path an auto-sized frame takes when its content grows.
+        if before ~= #state.footer_bands then
+            relayout(state)
+        elseif state._geom then
             render_chrome(state, state._geom)
         end
     end
@@ -3134,9 +3224,6 @@ local function open_windows(state)
     --- preview was focused without going through `focus_panel` (e.g. its own buffer keymaps).
     ---@param dir integer  +1 (right) / -1 (left)
     state.panel = function(dir)
-        if state.cfg.direction == "vertical" then
-            return -- vertical stack: panels are top↔bottom, walked with the sector nav (<C-j>/<C-k>), not <C-l>/<C-h>
-        end
         local w = api.nvim_get_current_win()
         local base = state.center_panel or 1
         for i, pan in ipairs(state.panels) do
@@ -3423,8 +3510,22 @@ function dyn_geom(state)
     local capf = (hs and hs.vertical) or 0.5
     local cfgcap = math.max(3, capf <= 1 and math.floor(vim.o.lines * capf) or math.floor(capf))
     local top = L.row -- the container's top screen row (the editor statusline sits at top-1)
+    -- The peek floats ABOVE the DOCK, in the editor's own space (that is the whole point: the list keeps the
+    -- dock, the file gets the screen). It needs REAL room — it shows the file's own buffer, so every plugin
+    -- hooked on that buffer (LSP, breadcrumbs, the lightbulb) runs in this window, and a 1–2 row slit makes them
+    -- throw `E36: Not enough room` on each cursor move. Under MIN_PEEK rows the peek is not shown at all.
+    local MIN_PEEK = 5
     local keep_top = math.floor(vim.o.lines * 0.4) -- leave the top ~40% of the editor visible
-    return { col = L.col, width = L.W, top = top, cap = math.max(1, math.min(cfgcap, top - 2 - keep_top)) }
+    local cap = math.min(cfgcap, top - 2 - keep_top)
+    return {
+        col = L.col,
+        width = L.W,
+        top = top,
+        cap = cap,
+        min = MIN_PEEK, -- the peek never shrinks below this, however short the file is
+        row = top - cap - 2, -- its bottom rule lands at top-2, so the editor statusline (top-1) stays visible
+        fits = cap >= MIN_PEEK,
+    }
 end
 
 --- Render the preview provider into the dynamic float for the current list selection (no-op while the float
@@ -3449,22 +3550,36 @@ function dyn_show(state)
         return
     end
     local g = dyn_geom(state)
+    if not g.fits then
+        -- No honest room for a peek (a small window, or a float with little space around it). Showing it anyway
+        -- meant a 1-row window holding a REAL file buffer, where that buffer's own autocmds (LSP, breadcrumbs,
+        -- the lightbulb) throw `E36: Not enough room` on every cursor move.
+        dyn_hide(state)
+        return
+    end
     if not (d.win and api.nvim_win_is_valid(d.win)) then
         if not (d.buf and api.nvim_buf_is_valid(d.buf)) then
             d.buf = api.nvim_create_buf(false, true)
             vim.bo[d.buf].bufhidden = "hide"
         end
+        local peek_enter = state.cfg.peek_enter
+        if peek_enter == nil then
+            peek_enter = config.peek_enter == true
+        end
         d.win = api.nvim_open_win(d.buf, false, {
             relative = "editor",
-            row = g.top - g.cap - 2, -- bottom rule lands at top-2 (editor statusline at top-1 stays visible)
+            row = g.row, -- above the container (its bottom rule at top-2), or under it when the room is there
             col = g.col,
             width = g.width,
             height = g.cap,
             style = "minimal",
             border = DYN_BORDER,
-            focusable = true,
+            -- Not focusable unless the peek is an enterable stop (`config.peek_enter`) — a read-only peek must
+            -- not swallow a click or a window-nav key either.
+            focusable = peek_enter,
             zindex = (state.zindex or 50) + 1,
         })
+        vim.w[d.win].lvim_frame = true -- a frame window (see the input band): never muted, and it holds the veil
         vim.wo[d.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPickerSeparator"
         vim.wo[d.win].wrap = false
         -- a FRESH window has no winbar; make the provider re-assert the file title bar on the next update
@@ -3479,7 +3594,10 @@ function dyn_show(state)
     if d.win and api.nvim_win_is_valid(d.win) then
         local lines = api.nvim_buf_line_count(api.nvim_win_get_buf(d.win))
         local wb = vim.wo[d.win].winbar
-        local h = math.max(1, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
+        -- Fit the file, but never below `g.min`: this window holds the file's REAL buffer, so a 1–2 row slit is
+        -- where its own autocmds (LSP, breadcrumbs, the lightbulb) throw `E36: Not enough room` on every cursor
+        -- move. A short file simply shows blank rows under it.
+        local h = math.max(g.min, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
         pcall(api.nvim_win_set_config, d.win, {
             relative = "editor",
             row = g.top - h - 2,
@@ -3622,16 +3740,14 @@ function restack_panels(state)
     if not (pv and list) then
         return
     end
+    -- The docked preview sits BESIDE the list — `left` puts it first, anything else second. Vertical stacking
+    -- (above/below) is gone: the two panels then split the dock's rows, so neither is readable; a preview that
+    -- needs the screen is the `dynamic` peek FLOAT instead.
     local undocked = state.preview_hidden or state.preview_side == "dynamic"
-    local vert = (state.preview_side == "above" or state.preview_side == "below") and not undocked
-    local preview_first = state.preview_side == "above" or state.preview_side == "left"
-    local docked = undocked and { list } or (preview_first and { pv, list } or { list, pv })
+    local docked = undocked and { list } or ((state.preview_side == "left") and { pv, list } or { list, pv })
     state.panels = docked
-    state.cfg.direction = vert and "vertical" or nil
-    -- (the divider glyph is oriented at render time per L.vertical — no need to rewrite state.cfg.separator here)
-    local stack_axis = vert and "height" or "width"
     for _, pan in ipairs(docked) do
-        pan.weight = pan.size and (pan.size[stack_axis] or {}).fixed or nil
+        pan.weight = pan.size and (pan.size.width or {}).fixed or nil
     end
     apply_dock_height(state, state.preview_side)
     state.sectors = build_sectors(state)
@@ -4198,6 +4314,26 @@ function M.open(cfg)
             end
         end
     end
+    -- PREVIEW HEIGHTS, from the ONE central authority — no consumer passes these. `dock.geometry.<layout>` carries
+    -- `height` (the DOCK's own height — the preview sits beside the list and they share it) and `height_peek` (the
+    -- cap of the `dynamic` PEEK FLOAT, which floats ABOVE the list instead of sharing the dock). `apply_dock_height`
+    -- re-derives the row count from the CURRENT window height on every rotation / resize; a consumer may still pass
+    -- its own `preview_heights` to override.
+    -- ONLY for a surface that HAS a preview: these numbers exist to size the preview pair. Deriving them for
+    -- every frame made `apply_dock_height` re-assert auto/max height on panels that never asked for it (the
+    -- installer, the control center …) — they opened, then re-fitted a row later, which reads as a flicker.
+    if cfg.preview_heights == nil and cfg.preview_side ~= nil then
+        local ok_c, uconf = pcall(require, "lvim-utils.config")
+        local g = (ok_c and uconf and uconf.dock and uconf.dock.geometry and uconf.dock.geometry[backdrop_layout(cfg)])
+            or {}
+        if type(g.height) == "number" or type(g.height_peek) == "number" then
+            cfg.preview_heights = {
+                horizontal = g.height, -- the DOCKED preview (beside the list) — the dock's own height
+                vertical = g.height_peek or g.height, -- the `dynamic` PEEK FLOAT above the list (dyn_geom's cap)
+            }
+        end
+    end
+
     -- `cfg.size = { width/height = { auto, min, max, fixed } }` → the per-axis fields the geometry uses. `auto`
     -- fits the content (within max); else `fixed`; each a screen fraction ≤1 or an absolute count. `height.min` =
     -- minimum VISIBLE content rows; `width.min` clamps the float width.
@@ -4230,6 +4366,29 @@ function M.open(cfg)
             shrink_first = blk.shrink_first, -- give up rows before protected panels when the stack overflows
         }
     end
+
+    -- AIR IS DERIVED FROM THE RING, never added on top of it. A content panel's border (the canon `" "` ring —
+    -- `config.content_border`) ALREADY draws a blank row above and below the data. The frame's own air rows exist
+    -- to give that same breathing room when a panel has NO ring; adding both stacks TWO blank rows on that side
+    -- (the calendar's grid sat 1 row under the nav band but 2 above the footer). So: a side the ring already
+    -- spaces gets no air row from the frame. Only the UNSET (nil) case is derived — an explicit
+    -- `header_air` / `footer_air` from the consumer still wins — and it re-derives whenever the ring changes, so
+    -- turning the border on or off can never reintroduce the mismatch.
+    local ring_top, ring_bottom = false, false
+    for _, p in ipairs(panels) do
+        local it, _, ib = util.insets(util.resolve_border(p.border or cfg.panel_border))
+        ring_top = ring_top or it > 0
+        ring_bottom = ring_bottom or ib > 0
+    end
+    if cfg.header_air == nil and ring_top then
+        cfg.header_air = false
+    end
+    if cfg.footer_air == nil and ring_bottom then
+        cfg.footer_air = false
+    end
+    -- Remembered on the cfg: `set_header` / `set_footer` rebuild their bands from the spec alone (a tab switch),
+    -- and must trim the content-adjacent air exactly like the open path does.
+    cfg._ring_top, cfg._ring_bottom = ring_top, ring_bottom
 
     -- A FLOAT carries the brand as its border title (built in open_windows). A SPLIT has no border, so the
     -- title becomes the top CONTENT row of the chrome instead (the icon + text, flattened).
@@ -4269,6 +4428,10 @@ function M.open(cfg)
         end
     end
 
+    -- An explicit `header_air = true`, the row title's OWN air row, or a consumer's `{ text = "" }` band can all
+    -- leave a blank band touching the (ringed) content — trim_air drops exactly that one.
+    trim_air(hbands, ring_top, false)
+
     local state = {
         cfg = cfg,
         -- Where focus RETURNS when the frame closes. Normally the window that was current at open — but a
@@ -4279,7 +4442,11 @@ function M.open(cfg)
         origin = cfg.origin or api.nvim_get_current_win(),
         panels = panels,
         header_bands = hbands,
-        footer_bands = build_bands(cfg.footer, true, cfg.footer_air),
+        footer_bands = (function()
+            local fb = build_bands(cfg.footer, true, cfg.footer_air)
+            trim_air(fb, ring_bottom, true)
+            return fb
+        end)(),
         -- hotkey bookkeeping (map_hotkeys / remap_hotkeys): the (buf, reserved) targets, the keys each
         -- buffer currently carries, and which buffers are <Nop>-locked (a stale hotkey restores the <Nop>)
         _hotkey_targets = {},
@@ -4328,6 +4495,16 @@ function M.open(cfg)
     -- panel; everything else (modal float, docked-modal peek) uses the float chassis.
     if cfg.mode == "split" and cfg.native then
         open_native_split(state)
+    elseif cfg.host then
+        -- HOSTED in the zone: open inside the zone's reflow-coalescing handoff, so the whole open — the segment
+        -- reserve, the cmdheight growth it causes, every window placement — paints as ONE frame. Without it the
+        -- editor watched the zone climb through the intermediate heights of a half-built frame (measured: 1 → 2
+        -- → 7 → 31 rows), which is the flicker on opening a docked panel. The pickers did this by hand around
+        -- their own open; doing it HERE gives it to every hosted surface, and a consumer that already wraps its
+        -- open in a handoff just nests (the zone counts the batch depth).
+        M.zone_handoff(function()
+            open_windows(state)
+        end)
     else
         open_windows(state)
     end
