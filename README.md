@@ -138,6 +138,33 @@ inter-panel divider (`config.separator`, the same `│` rule the surface chassis
 panels — no see-through gutter between the two panels). Groups: `LvimUiMenuNormal` / `Sel` / `Match` /
 `Detail` / `Thumb` / `Track` (palette-bound; the selection bar and scrollbar tint over the PANEL shade).
 
+### The `hint` primitive (a sub-mode's live keys, non-focusable)
+
+`ui.hint(opts)` creates the NON-FOCUSABLE key-hint BAR — one full-width row pinned above the statusline that
+announces what the keys do while a modal SUB-MODE owns the keyboard (an interactive resize / move loop). It
+is the sanctioned surface for "show the live keys" — never an `echo`, never a hand-rolled float.
+
+```lua
+local hint = require("lvim-ui").hint({ fill_hl = "MyPluginHintFill" })
+
+hint:show({
+    { name = "RESIZE", icon = "󰩨", style = "tab" },
+    { key = "h", name = "left" },
+    { key = "l", name = "right" },
+    { type = "separator", text = "➤" },
+    { name = "80 x 24", style = "plain" },
+})
+hint:update(items) -- same window, re-rendered (no flicker) — call on every state change
+hint:hide() -- keep the handle
+hint:close() -- destroy it
+```
+
+Focus never leaves the user's real window (the sub-mode's keys act ON it, and it repaints under an explicit
+`redraw` inside a blocking `getcharstr`), so — like `menu` — this is a passive projection, not a chassis
+modal. Its items are ordinary bar records rendered through `ui.surface.button` + `ui.bar`, so a hint key badge
+is byte-identical to a footer one and the overflow chevrons come for free. Defaults (align, the button kind, the
+fill strip, zindex, filetype) live in `config.hint`.
+
 ### The `tree` primitive (shared tree panels)
 
 `ui.tree(opts)` creates the generic node-provider TREE — the ONE content layer every lvim-tech tree panel

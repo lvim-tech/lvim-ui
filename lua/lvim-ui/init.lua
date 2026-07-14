@@ -20,11 +20,13 @@
 --   M.info(content, opts) – read-only markdown/text info window
 --   M.close_info(win)     – programmatically close an info window
 --   M.menu(opts)          – cursor-anchored NON-FOCUSABLE popup handle (completion menus)
+--   M.hint(opts)          – NON-FOCUSABLE key-hint BAR handle (a sub-mode's live keys, above the statusline)
 --   M.tree(opts)          – generic node-provider TREE content layer for a surface panel
 ---@module "lvim-ui"
 
 local frame = require("lvim-ui.surface")
 local menu = require("lvim-ui.menu")
+local hint = require("lvim-ui.hint")
 local tree = require("lvim-ui.tree")
 local form = require("lvim-ui.form")
 local rows = require("lvim-ui.rows")
@@ -1517,6 +1519,106 @@ function M.tabs(opts)
     }
 end
 
+--- The keymap CHEATSHEET — the canonical `?` window of the whole set, in ONE place.
+---
+--- Every plugin used to hand-roll this: the same row builder, the same striping, the same hidden cursor, and
+--- its own `nvim_set_hl` calls with literal tints. Five copies, and four of them padded the row boxes by BYTE
+--- length while measuring the columns in display CELLS — so any row carrying a multi-byte glyph (an `…`, a
+--- Nerd icon) came up short and the right edge went ragged. It is a component now: the rows, the colours
+--- (from the shared spec — `accent.help` + the tint scale) and the window all live here.
+---
+--- Each row is a KEY box (a fixed, aligned column) + a DESCRIPTION box filling the rest of the width. Rows
+--- stripe odd/even by accent; the row under the (hidden) cursor raises its description to the key's tint, so
+--- the active row reads as one solid block and follows the cursor with no hardware caret.
+---
+---@param opts { title?: string, items: table[], close_keys?: string[], width?: number, height?: number, footer?: table }
+---   items: `{ { key, description }, … }` — already resolved to the plugin's LIVE keys (unmapped rows omitted)
+---   footer: a full frame footer spec, for a consumer whose action bar is config-driven; else a `q close` bar
+function M.help(opts)
+    opts = opts or {}
+    local items = opts.items or {}
+    if #items == 0 then
+        return
+    end
+    local dw = util.dw
+    local kw, dwid = 0, 0
+    for _, r in ipairs(items) do
+        kw = math.max(kw, dw(tostring(r[1])))
+        dwid = math.max(dwid, dw(tostring(r[2])))
+    end
+    local keybox = kw + 4 -- 2 spaces left of the key + the key + ≥2 right — the aligned KEY column
+
+    local pan
+    local provider = {
+        hide_cursor = true,
+        size = function()
+            return keybox + dwid + 4, #items
+        end,
+        render = function(width)
+            local cur = (pan and pan.win and vim.api.nvim_win_is_valid(pan.win))
+                    and vim.api.nvim_win_get_cursor(pan.win)[1]
+                or 1
+            local lines, hls = {}, {}
+            for i, r in ipairs(items) do
+                local s = (i % 2 == 1) and "Odd" or "Even"
+                -- Pad by DISPLAY WIDTH, never by byte length: a `…` is 3 bytes and one cell, and padding by
+                -- bytes leaves the box two cells short — the ragged right edge this component was born from.
+                local kcell = "  " .. tostring(r[1])
+                kcell = kcell .. string.rep(" ", math.max(0, keybox - dw(kcell)))
+                local dcell = "  " .. tostring(r[2])
+                dcell = dcell .. string.rep(" ", math.max(0, width - keybox - dw(dcell)))
+                lines[i] = kcell .. dcell
+                -- The spans are BYTE offsets (extmark columns are bytes) — the one place `#` is right.
+                hls[#hls + 1] = { i - 1, 0, #kcell, "LvimUiHelpKey" .. s }
+                hls[#hls + 1] =
+                    { i - 1, #kcell, #lines[i], (i == cur) and ("LvimUiHelpActive" .. s) or ("LvimUiHelpDesc" .. s) }
+            end
+            return lines, hls
+        end,
+        keys = function(_, p)
+            pan = p
+            -- Repaint so the bright ACTIVE row follows the (hidden) cursor.
+            vim.api.nvim_create_autocmd("CursorMoved", {
+                buffer = p.buf,
+                callback = function()
+                    if p.refresh then
+                        p.refresh()
+                    end
+                end,
+            })
+        end,
+    }
+
+    frame.open({
+        mode = "float",
+        border = frame.FRAME_BORDER,
+        title = opts.title or "Keymaps",
+        panel_border = "none",
+        size = {
+            width = { auto = true, max = opts.width or 0.7 },
+            height = { auto = true, max = opts.height or 0.7 },
+        },
+        close_keys = opts.close_keys or { "q", "<Esc>" },
+        content = { blocks = { { id = "help", provider = provider } } },
+        footer = opts.footer or {
+            bars = {
+                {
+                    align = "center",
+                    items = {
+                        {
+                            key = "q",
+                            name = "close",
+                            run = function(st)
+                                st.close()
+                            end,
+                        },
+                    },
+                },
+            },
+        },
+    })
+end
+
 --- Read-only info viewer — a 1-panel `frame` that scrolls the content, with a `q close` footer.
 --- Returns the panel buffer + window (close via M.close_info or the frame's own keys).
 --- NOTE: markview / syntax rendering is not yet ported (plain lines + optional `opts.highlights`).
@@ -1653,6 +1755,18 @@ end
 ---@return table handle
 function M.menu(opts)
     return menu.new(opts)
+end
+
+--- Create a NON-FOCUSABLE key-hint BAR handle — the full-width row a modal SUB-MODE (an interactive
+--- resize / move loop) pins above the statusline to announce its live keys. Focus never leaves the
+--- user's real window (the sub-mode's keys act ON it), so this is a passive projection like `M.menu`,
+--- not a chassis modal: the consumer drives it (show/update/hide/close) from its own keystroke loop.
+--- Items are ordinary bar records (`{ key, name, style?, hl? }` / a `separator`), rendered through the
+--- shared button + bar box model. See lvim-ui.hint.
+---@param opts? LvimUiHintOpts
+---@return LvimUiHintHandle handle
+function M.hint(opts)
+    return hint.new(opts)
 end
 
 --- Create a generic node-provider TREE handle — the shared content layer for every tree panel

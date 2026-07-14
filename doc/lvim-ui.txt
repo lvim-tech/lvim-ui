@@ -128,6 +128,27 @@ Groups: `LvimUiMenuNormal`, `LvimUiMenuSel`, `LvimUiMenuMatch`,
 `LvimUiMenuDetail`, `LvimUiMenuThumb`, `LvimUiMenuTrack` — palette-bound; the
 selection bar and the scrollbar tint over the PANEL shade.
 
+                                                                 *lvim-ui.hint()*
+require("lvim-ui").hint({opts})                        → handle
+
+The NON-FOCUSABLE key-hint BAR: one full-width row pinned above the statusline
+that announces the live keys while a modal SUB-MODE owns the keyboard (an
+interactive resize / move loop). The sanctioned surface for a key hint — never
+an `echo`, never a hand-rolled float.
+
+Focus never leaves the user's real window (the sub-mode's keys act ON it, and it
+repaints under an explicit `redraw` inside a blocking `getcharstr()`), so — like
+|lvim-ui.menu()| — it is a passive projection, not a chassis modal. Its items are
+ordinary bar records (`{ key, name, style?, hl? }`, or a `separator`) rendered
+through the shared `ui.surface.button` + `ui.bar` box model, so a hint key badge
+is byte-identical to a footer one and the overflow chevrons come for free.
+
+Options: `align`, `default_style`, `fill_hl`, `zindex`, `filetype` — each
+defaulting to `config.hint`.
+
+Handle: `show(items)`, `update(items)` (same window, no flicker), `hide()`,
+`close()`, `visible()`.
+
                                                                  *lvim-ui.tree()*
 require("lvim-ui").tree({opts})                        → handle
 

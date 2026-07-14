@@ -31,6 +31,14 @@
 ---@field labels             table                Footer-legend action labels (navigate / confirm / cancel / …)
 ---@field keys               table                Popup + chassis navigation keys (vim notation; strings or lists)
 ---@field tree               LvimUiTreeConfig     Defaults for the shared `lvim-ui.tree` primitive (padding / scrollbar)
+---@field hint               LvimUiHintConfig     Defaults for the shared `lvim-ui.hint` bar (a sub-mode's live key row)
+
+---@class LvimUiHintConfig
+---@field align         "left"|"center"|"right"  Item alignment inside the full-width row
+---@field default_style string                   The ui.surface button KIND a hint record with no `style` uses
+---@field fill_hl       string                   The continuous full-width strip under the items
+---@field zindex        integer                  Window stack position of the hint row
+---@field filetype      string                   Filetype set on the hint buffer
 
 ---@class LvimUiTreeConfig
 ---@field padding   { left?: integer, right?: integer }  Blank columns around the tree ROWS (the header/title band
@@ -121,10 +129,12 @@ return {
     title_line = "row",
     counter = "title",
     -- Title ALIGNMENT, shared by the content-row title (`title_line="row"`) AND the native border-title:
-    -- "left" (default — flush-left, counter flush-right), "center", or "right". A single `surface.open` may
-    -- override per-open with its own `title_pos`. Lets a panel (e.g. LvimControlCenter) center its title
-    -- consistently without needing a border.
-    title_pos = "left",
+    -- "center" (the default — every framed window in the set centres its title), "left" (flush-left, counter
+    -- flush-right) or "right". A single `surface.open` may override per-open with its own `title_pos`.
+    -- NOTE the mechanisms differ: a content-ROW title is drawn by us and centres exactly, while Neovim's
+    -- native BORDER-title rounds to `floor(free/2) + 1` — always a cell right of true centre. That is why the
+    -- set's windows use the title row.
+    title_pos = "center",
 
     -- Background tint strengths (blend factor toward c.bg) for the themed chrome cells,
     -- matching the notify/Messages look: `strong` paints prominent/active cells (title,
@@ -268,6 +278,17 @@ return {
     -- ── Text chrome ─────────────────────────────────────────────────────────────────────────────────────
     text = {
         ellipsis = "…", -- what a clipped row ends with (its width is reserved before clipping)
+    },
+
+    -- ── The NON-FOCUSABLE hint BAR (lvim-ui.hint) ───────────────────────────────────────────────────────
+    -- The full-width row a modal SUB-MODE (an interactive resize / move loop) pins above the statusline to
+    -- announce its live keys. Its items are ordinary bar records, so only the row's own chrome is set here.
+    hint = {
+        align = "center", -- item alignment inside the row
+        default_style = "action", -- the ui.surface button KIND a record with no `style` uses (key badge + label)
+        fill_hl = "LvimUiBarFill", -- the continuous strip under the items (the buttons paint over it)
+        zindex = 70, -- above the ordinary floats, below the message zone
+        filetype = "lvim-ui-hint", -- the hint buffer's filetype
     },
 
     -- ── The FORM's key-hint legend (the footer line that follows the focused row) ────────────────────────
