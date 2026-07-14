@@ -317,6 +317,7 @@ function M.select(opts)
     }
 
     return frame.open({
+        origin = opts.origin, -- return focus HERE on close (a popup opened from another frame)
         mode = "float",
         position = opts.position or config.position, -- nil/"editor" = centred; "cursor" anchors at the cursor
         border = FRAME_BORDER,
@@ -565,6 +566,7 @@ function M.input(opts)
     }
 
     frame.open({
+        origin = opts.origin, -- return focus HERE on close (a popup opened from another frame)
         mode = "float",
         -- No container border: the top " " row existed only to give a native border-title somewhere to sit,
         -- and the title is a CONTENT ROW now (see below). The frame's own `config.border` applies.
@@ -1039,7 +1041,6 @@ function M.tabs(opts)
                     align = "center",
                     -- the overflow chevrons borrow the separator's accent (same box as the ● divider), using the
                     -- SHARED glyphs (config.chevrons) in that colour.
-                    chevrons = frame.chevrons("LvimUiFooterSep"),
                 },
             },
         }
@@ -1077,7 +1078,6 @@ function M.tabs(opts)
                     items = footer_hint_specs(t.footer),
                     align = "center",
                     fill = opts.footer_fill ~= false,
-                    chevrons = frame.chevrons("LvimUiFooterSep"),
                 },
             },
         }
@@ -1140,7 +1140,6 @@ function M.tabs(opts)
     local tab_bar = {
         align = "center",
         _follow = true,
-        chevrons = frame.chevrons("LvimUiTabChevron"),
     }
 
     --- (Re)build the tab bar's element list from the LIVE tabset: a `tab`-kind button per tab (icon +
@@ -1354,7 +1353,6 @@ function M.tabs(opts)
                             align = "center",
                             fill = opts.footer_fill ~= false,
                             -- overflow chevrons in the footer accent (same box as the ● divider), shared glyphs
-                            chevrons = frame.chevrons("LvimUiFooterSep"),
                         },
                     },
                 }

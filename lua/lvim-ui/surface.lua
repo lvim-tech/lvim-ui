@@ -1767,6 +1767,15 @@ local function sector_cycle(state, dir)
             state.cfg.on_escape_above()
             return
         end
+        -- A DOCKED float (an `area` / `bottom` panel) sits UNDER the editor, so stepping off its TOP band walks
+        -- back into the window it was opened from — the same chain the user came down: buffer → bands → content
+        -- → footer, and back. A plain FLOAT is modal chrome hovering over everything: there is no "out", and it
+        -- must never hand focus away.
+        if dir < 0 and state.cfg.position and state.origin and api.nvim_win_is_valid(state.origin) then
+            api.nvim_set_current_win(state.origin)
+            cursor.update() -- a normal buffer is current again → the hardware cursor comes back
+            return
+        end
         return -- at an edge with no escape handler → STOP (never WRAP around to the opposite end)
     end
     local target = ((cur - 1 + dir) % n) + 1
@@ -2164,6 +2173,16 @@ local function set_keys(state)
     map(state.container_buf, K.sector_prev, function()
         sector_cycle(state, -1)
     end)
+    -- The panel-nav keys belong to the CONTAINER too, not only to the panels. The bands live on the container,
+    -- and leaving `<C-l>`/`<C-h>` unbound there lets them fall through to whatever the USER has them on
+    -- globally (window navigation) — so a bar focused inside the frame threw focus out to the editor. A frame
+    -- owns its keyboard on every one of its buffers.
+    map(state.container_buf, K.panel_next, function()
+        state.panel(1)
+    end)
+    map(state.container_buf, K.panel_prev, function()
+        state.panel(-1)
+    end)
     -- MOUSE: a left-click on any header/footer bar button acts exactly like navigating the selection onto it
     -- and confirming (tab switch / filter / footer action). Hit-test the click's row+column against the live
     -- `state.bands` render metadata (each button's byte range `c0..c1`), so it is pixel-accurate and never
@@ -2192,8 +2211,11 @@ local function set_keys(state)
         map(state.container_buf, ck, state.close)
     end
 
-    -- Extra consumer keymaps that fire from ANYWHERE in the frame (every panel + the container), each a
-    -- `{ key = lhs|lhs[], run = fn(state) }` — e.g. the Quit dialog's `q` = quit without saving.
+    -- Extra consumer keymaps, each a `{ key = lhs|lhs[], run = fn(state), scope? }`. By default they fire from
+    -- ANYWHERE in the frame (every panel + the container) — e.g. the Quit dialog's `q`. `scope = "panel"` binds
+    -- them on the PANELS ONLY: the container is where the BARS live, and a key that manipulates CONTENT (the
+    -- calendar's `h`/`l` = previous/next day) must not fire while a bar is focused — there `h`/`l` belong to
+    -- the bar's own button selection, and binding over them makes a focused bar unusable.
     for _, km in ipairs(state.cfg.keymaps or {}) do
         local fn = function()
             km.run(state)
@@ -2201,7 +2223,9 @@ local function set_keys(state)
         for _, pan in ipairs(state.panels) do
             map(pan.buf, km.key, fn)
         end
-        map(state.container_buf, km.key, fn)
+        if km.scope ~= "panel" then
+            map(state.container_buf, km.key, fn)
+        end
     end
 
     -- MOUSE SELECTION is never wanted on ANY panel — independent of `lock_keys` and of `hide_cursor`. A
@@ -2891,6 +2915,18 @@ local function open_windows(state)
     ---@param spec table  the new `header` spec ({ bars = { … } })
     state.set_header = function(spec)
         local on_bar = state.focus and state.focus.kind == "bar"
+        -- What the user had SELECTED before the rebuild — its identity, not its index: a rebuilt band may hold
+        -- a different button count (a nav label widens, a filter appears). Restoring the ACTIVE button instead
+        -- (the old behaviour) throws the cursor back to button 1 on every repaint, so pressing `›` (next month)
+        -- moved the month and then bounced the selection onto `‹` — the bar became unusable by keyboard.
+        local prev_id, prev_idx
+        if on_bar and state.focus.band then
+            prev_idx = state.focus.band._sel
+            local b = (state.focus.band.buttons or {})[prev_idx or 0]
+            if b then
+                prev_id = b.name or b.key or (type(b.text) == "string" and b.text) or nil
+            end
+        end
         -- Re-prepend the row title (a `title_line="row"` float): build_bands rebuilds from `spec` ONLY, so the
         -- title (inserted at open, outside `spec`) would vanish on the first tab switch. Mirror open's air:
         -- the row title supplies its own air row, so suppress build_bands' header air when it's present.
@@ -2910,10 +2946,28 @@ local function open_windows(state)
             local fi = math.max(1, math.min(state.focus_idx or 1, #state.sectors))
             local sec = state.sectors[fi]
             if sec and sec.kind == "bar" then
-                local as = 1
-                for bi, b in ipairs(sec.band.buttons or {}) do
-                    if b.active then
-                        as = bi
+                local btns = sec.band.buttons or {}
+                -- 1) the SAME button the user was on (matched by identity), 2) failing that its old index
+                -- (clamped), 3) failing that the active one, 4) else the first.
+                local as
+                if prev_id then
+                    for bi, b in ipairs(btns) do
+                        local id = b.name or b.key or (type(b.text) == "string" and b.text) or nil
+                        if id and id == prev_id then
+                            as = bi
+                            break
+                        end
+                    end
+                end
+                if not as and prev_idx and btns[prev_idx] then
+                    as = prev_idx
+                end
+                if not as then
+                    as = 1
+                    for bi, b in ipairs(btns) do
+                        if b.active then
+                            as = bi
+                        end
                     end
                 end
                 sec.band._sel = as
@@ -3115,6 +3169,12 @@ local function open_windows(state)
     --- steps down into the content, the mirror of the `<C-k>` escape-UP from the top sector.
     state.enter = function()
         focus_sector(state, 1)
+    end
+    --- How many SECTORS the frame has (the zone below asks, so it can enter the dock at its LAST one — its
+    --- footer — when the user walks UP out of the messages; the mirror of `enter`).
+    ---@return integer
+    state.sector_count = function()
+        return #state.sectors
     end
     --- Focus the window the frame was opened from (the editor), keeping the frame open. The WinEnter
     --- hook restores the cursor there.
@@ -3643,6 +3703,23 @@ local function close(state)
         return
     end
     state._closed = true
+    -- Whether WE hold focus must be decided BEFORE the windows go: closing a focused float makes Neovim pick a
+    -- fallback window on the spot (the editor), so a check made afterwards always answers "no" and the origin
+    -- restore below never runs. That is why a popup opened from a panel dropped the user into the buffer behind
+    -- it instead of back into the panel.
+    local held_focus = false
+    do
+        local cur = api.nvim_get_current_win()
+        held_focus = cur == state.container_win
+        if not held_focus then
+            for _, p in ipairs(state.panels or {}) do
+                if p.win == cur then
+                    held_focus = true
+                    break
+                end
+            end
+        end
+    end
     if state.augroup then
         pcall(api.nvim_del_augroup_by_id, state.augroup)
     end
@@ -3712,20 +3789,8 @@ local function close(state)
     -- moved on to ANOTHER float) must not yank focus to its own origin: that would steal it from whatever is
     -- focused now (reported: opening the installer stole its focus back to the editor via the msgarea zone's
     -- close). If focus is already elsewhere, leave it.
-    if state.origin and api.nvim_win_is_valid(state.origin) then
-        local cur = api.nvim_get_current_win()
-        local we_hold_focus = cur == state.container_win
-        if not we_hold_focus and state.panels then
-            for _, p in ipairs(state.panels) do
-                if p.win == cur then
-                    we_hold_focus = true
-                    break
-                end
-            end
-        end
-        if we_hold_focus then
-            pcall(api.nvim_set_current_win, state.origin)
-        end
+    if held_focus and state.origin and api.nvim_win_is_valid(state.origin) then
+        pcall(api.nvim_set_current_win, state.origin)
     end
     cursor.update() -- the frame's hide-cursor buffers are gone → show the cursor in the editor again
     if state._host_release then -- release our auto-hosted zone rows so it shrinks back (or closes)
@@ -4206,7 +4271,12 @@ function M.open(cfg)
 
     local state = {
         cfg = cfg,
-        origin = api.nvim_get_current_win(),
+        -- Where focus RETURNS when the frame closes. Normally the window that was current at open — but a
+        -- consumer may name it (`cfg.origin`), and it must: a popup opened from ANOTHER frame's callback (the
+        -- calendar's month picker → its year input) opens while the first frame is already tearing down, so
+        -- "the current window" is whatever the teardown happened to leave behind — the editor. The chain then
+        -- dumps the user out of the panel they were working in.
+        origin = cfg.origin or api.nvim_get_current_win(),
         panels = panels,
         header_bands = hbands,
         footer_bands = build_bands(cfg.footer, true, cfg.footer_air),

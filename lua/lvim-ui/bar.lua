@@ -25,17 +25,26 @@ local M = {}
 --- Default chevron boxes (a `separator`-shaped box each). The bar owns overflow, so these ship as
 --- defaults; a caller overrides `chevrons.left` / `chevrons.right` (glyph via `text`, spacing via
 --- `style.padding`, colour via `style.hl`) only when it wants something else.
-local DEFAULT_CHEVRONS = {
-    left = { type = "separator", text = "", style = { padding = { 1, 1 }, hl = "LvimUiBarChevron" } },
-    right = { type = "separator", text = "", style = { padding = { 1, 1 }, hl = "LvimUiBarChevron" } },
-}
+--- The default chevron BOXES, built from the shared glyph config (`config.chevrons`). They used to ship with
+--- `text = ""` — an EMPTY string — so every bar that did not pass its own chevrons drew INVISIBLE overflow
+--- markers: the buttons were silently cut off with nothing to say so. Only a consumer that explicitly passed
+--- `surface.chevrons(hl)` (the control center) ever showed them, which is why it looked like a per-panel quirk.
+---@return table left, table right
+local function default_chevrons()
+    local g = require("lvim-ui.config").chevrons or {}
+    local box = function(text)
+        return { type = "separator", text = text, style = { padding = { 1, 1 }, hl = "LvimUiBarChevron" } }
+    end
+    return box(g.left or "❮"), box(g.right or "❯")
+end
 
 ---@param c table|nil
 ---@return table left, table right
 local function resolve_chevrons(c)
     c = c or {}
-    local left = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CHEVRONS.left), c.left or {})
-    local right = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CHEVRONS.right), c.right or {})
+    local dl, dr = default_chevrons()
+    local left = vim.tbl_deep_extend("force", dl, c.left or {})
+    local right = vim.tbl_deep_extend("force", dr, c.right or {})
     return left, right
 end
 
