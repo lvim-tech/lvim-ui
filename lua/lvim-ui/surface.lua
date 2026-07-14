@@ -42,6 +42,44 @@ local NS = api.nvim_create_namespace("lvim_utils_ui_frame")
 
 local M = {}
 
+--- The single-character FIRST keys of the multi-key chords a panel bound itself (`g?` → `g`).
+---@param bound table<string, boolean>  the lhs set the panel actually mapped
+---@return table<string, boolean>
+local function chord_prefixes(bound)
+    local out = {}
+    for lhs in pairs(bound) do
+        local first = lhs:match("^(<[^>]+>)") or lhs:sub(1, 1)
+        if #lhs > #first and #first == 1 then -- a SEQUENCE whose prefix is a plain key (g, m, z…)
+            out[first] = true
+        end
+    end
+    return out
+end
+
+--- Own a panel's chord PREFIXES instead of leaving them to `timeoutlen`.
+---
+--- A chord like `g?` is otherwise a lottery: Neovim waits `timeoutlen` (500ms by default) for the second key
+--- and, if the user is slower than that, ABANDONS the mapping and runs the BUILTIN `g` — so `g?` typed fast
+--- opens the help while `g?` typed at human speed runs rot13. Binding the prefix to a resolver that BLOCKS for
+--- the next key takes the clock out of it: the chord is resolved by us, at any speed. An unknown continuation
+--- is replayed WITHOUT remapping, so `gg` in an unlocked panel still scrolls to the top.
+---@param buf integer
+---@param bound table<string, boolean>
+local function own_chord_prefixes(buf, bound)
+    for prefix in pairs(chord_prefixes(bound)) do
+        pcall(vim.keymap.set, "n", prefix, function()
+            local ok, ch = pcall(vim.fn.getcharstr)
+            if not ok or ch == "" then
+                return
+            end
+            local lhs = prefix .. ch
+            -- `m` = remap (our chord fires), `n` = no remap (the builtin does) — fed as ONE sequence, so
+            -- nothing waits on a timeout.
+            api.nvim_feedkeys(lhs, bound[lhs] and "m" or "n", false)
+        end, { buffer = buf, nowait = true, silent = true, desc = "lvim-ui: chord prefix" })
+    end
+end
+
 -- The ONE canonical popup border lives in a SINGLE place — `config.border` (config/ui.lua), a FULL " "
 -- ring on all four sides (top for the native border-title / brand, plus a " " gutter on the left, right AND
 -- bottom; the two top corners are filled by `resolve_border`; the " " edges draw no glyph, just a 1-cell
@@ -1960,8 +1998,9 @@ local function set_keys(state)
 
     local function lock_panel(buf)
         local u = used[buf] or {}
+        local own_prefix = chord_prefixes(u)
         local function nop(lhs)
-            if u[lhs] or chords[lhs:lower()] then
+            if u[lhs] or chords[lhs:lower()] or own_prefix[lhs] then
                 return
             end
             pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
@@ -2166,6 +2205,11 @@ local function set_keys(state)
     -- mouse lock above still stops a drag from starting a Visual selection, which was the actual problem the
     -- modal lock was introduced for · false = no lock at all.
     local light = state.cfg.lock_keys == "light"
+    -- EVERY panel owns its own chord prefixes (`g` for a `g?` help), locked or not — a chord must not depend
+    -- on how fast the user types. See `own_chord_prefixes`.
+    for _, pan in ipairs(state.panels) do
+        own_chord_prefixes(pan.buf, used[pan.buf] or {})
+    end
     if state.cfg.lock_keys ~= false then
         for _, pan in ipairs(state.panels) do
             local prov = pan.provider or {}
@@ -3876,8 +3920,11 @@ local function open_native_split(state)
 
     -- Keys: the provider's own keys + close_keys + consumer keymaps on the panel buffer. No sector/menu
     -- nav keys — the panel is a real window, so `<C-w>` already moves in and out of it.
+    -- Track what the panel binds: a docked panel owns its chord PREFIXES too (see `own_chord_prefixes`).
+    local bound = {}
     local function map(lhs, fn)
         for _, l in ipairs(type(lhs) == "table" and lhs or { lhs }) do
+            bound[l] = true
             vim.keymap.set("n", l, fn, { buffer = pan.buf, nowait = true, silent = true })
         end
     end
@@ -3897,6 +3944,9 @@ local function open_native_split(state)
             km.run(state)
         end)
     end
+    -- Bound LAST, once every key is known: the panel owns the prefixes of its own chords (a `g?` help), so the
+    -- chord no longer depends on how fast the user types (see `own_chord_prefixes`).
+    own_chord_prefixes(pan.buf, bound)
 
     -- Tear down when the window closes; re-render content on resize (the window itself resizes natively).
     state.augroup = api.nvim_create_augroup("LvimUiFrameNative_" .. pan.win, { clear = true })
