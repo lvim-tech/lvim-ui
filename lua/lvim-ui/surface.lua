@@ -80,6 +80,25 @@ local function own_chord_prefixes(buf, bound)
     end
 end
 
+--- PUBLIC seam — own the chord prefixes of keys a CONSUMER bound ITSELF on `buf`, outside the chassis.
+---
+--- The chassis owns the prefixes of every key IT binds (see `own_chord_prefixes`), but a hosted buffer the
+--- chassis never maps — a terminal swapped into a provider panel (lvim-term / lvim-shell), a native panel a
+--- plugin keys up on its own — is out of that reach: its `g?` would be back at the mercy of `timeoutlen`
+--- (typed fast it fires, typed at human speed the builtin `g` wins). Such a consumer passes the lhs list it
+--- bound and gets the same, clock-free resolution. Idempotent per buffer.
+---@param buf integer
+---@param lhs_list string[]  the keys the consumer bound on `buf` (only multi-key chords matter)
+function M.own_chords(buf, lhs_list)
+    local bound = {}
+    for _, l in ipairs(lhs_list or {}) do
+        if type(l) == "string" and l ~= "" then
+            bound[l] = true
+        end
+    end
+    own_chord_prefixes(buf, bound)
+end
+
 -- The ONE canonical popup border lives in a SINGLE place — `config.border` (config/ui.lua), a FULL " "
 -- ring on all four sides (top for the native border-title / brand, plus a " " gutter on the left, right AND
 -- bottom; the two top corners are filled by `resolve_border`; the " " edges draw no glyph, just a 1-cell

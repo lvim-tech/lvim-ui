@@ -112,6 +112,7 @@ end
 ---@field on_open? fun(buf: integer, win: integer)  -- info: after open
 ---@field footer? boolean            -- info: false → no footer
 ---@field footer_fill? boolean       -- tabs: false → no tinted strip under the footer action bar (buttons float on the panel bg)
+---@field footer_hints_extra? table[] -- tabs (with `footer_hints = true`): extra chips appended to the legend's PANEL-key group — the same `{ key, label, run?, no_hotkey? }` shape as the list form (e.g. a `g?  help` chip)
 ---@field footer_hints? boolean|table[] -- tabs: `true` → live key-hint LEGEND footer (panel keys • focused-row keys); a list `{ {key,label,run?,no_hotkey?} }` → footer hint BUTTONS (an item's own `run` wins, else `opts.keymaps[key].fn`; `no_hotkey` = label-only chip; a `type="separator"` item passes through as a divider)
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
 ---@field pad? integer               -- tabs/form: body row left padding
@@ -1001,6 +1002,13 @@ function M.tabs(opts)
                 end,
             },
         }
+        -- Consumer chips appended to the PANEL-key group of the legend (`footer_hints_extra`) — e.g. the
+        -- `g?  help` chip: a panel whose keys are not discoverable from its rows must still say where its
+        -- cheatsheet is, and the legend's own chips (h/l · j/k · q) are the chassis'. They go through the same
+        -- `footer_hint_specs` mapper as the LIST form, so `run` / `no_hotkey` behave identically.
+        for _, it in ipairs(footer_hint_specs(opts.footer_hints_extra or {})) do
+            items[#items + 1] = it
+        end
         local hints = (form_p and form_p.hints) and form_p.hints() or {}
         -- The ● divider + chevrons only appear when there ARE focused-row keys to the right; on a row with no
         -- keys of its own (e.g. a display-only detail field) the divider would dangle, so drop it.
