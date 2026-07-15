@@ -1105,7 +1105,10 @@ local function compute_geom(state, place)
         local sizes, fixed, flex, auto_idx = {}, 0, {}, {}
         for i, pan in ipairs(panels) do
             local wgt = pan.weight
-            if auto and not wgt then
+            -- A panel auto-sizes to its natural content when the WHOLE axis is auto (`auto`) OR the panel
+            -- opted in via its own `size.<stack-axis>.auto` (`pan.auto_stack`) — so a single sector can hug
+            -- its content (e.g. a 1-row toggle bar) while its neighbours stay fixed / flex.
+            if (auto or pan.auto_stack) and not wgt then
                 sizes[i] = natural(i)
                 fixed = fixed + sizes[i]
                 auto_idx[#auto_idx + 1] = i
@@ -1610,9 +1613,17 @@ local function build_sectors(state)
         end
     end
     -- The whole center (all N panels) is ONE vertical sector — `<C-j>`/`<C-k>` step header · center ·
-    -- footer; `<C-l>`/`<C-h>` move between the panels INSIDE the center.
+    -- footer; `<C-l>`/`<C-h>` move between the panels INSIDE the center. With `center_panel_sectors` the
+    -- center is instead split so EACH panel is its OWN `<C-j>`/`<C-k>` sector (a stacked multi-layer panel:
+    -- e.g. lvim-replace's fields ⇄ results), each landed on directly by the vertical sector cycle.
     if #state.panels > 0 then
-        s[#s + 1] = { kind = "center" }
+        if state.cfg.center_panel_sectors then
+            for pi = 1, #state.panels do
+                s[#s + 1] = { kind = "center", panel = pi }
+            end
+        else
+            s[#s + 1] = { kind = "center" }
+        end
     end
     for _, band in ipairs(state.footer_bands) do
         if band.buttons then
@@ -1663,8 +1674,12 @@ local function focus_sector(state, i)
     end
     state.focus_idx = i
     if sec.kind == "center" then
-        state.focus = { kind = "center", panel = state.center_panel or 1 }
-        focus_panel_win(state, state.center_panel or 1)
+        -- With `center_panel_sectors` each center sector names its OWN panel; else the single center sector
+        -- lands on the tracked / primary panel.
+        local p = sec.panel or state.center_panel or 1
+        state.center_panel = p
+        state.focus = { kind = "center", panel = p }
+        focus_panel_win(state, p)
     else
         sec.band._sel = sec.band._sel or 1
         state.focus = { kind = "bar", band = sec.band, where = sec.where }
@@ -1687,11 +1702,12 @@ end
 ---@return integer
 local function current_sector(state)
     local w = api.nvim_get_current_win()
-    -- Any center panel window maps to the single center sector.
-    for _, pan in ipairs(state.panels) do
+    -- A center panel window maps to its center sector: with `center_panel_sectors` the sector whose `panel`
+    -- matches this window's index; else the single center sector (`sec.panel` nil ⇒ any panel).
+    for pi, pan in ipairs(state.panels) do
         if pan.win == w then
             for si, sec in ipairs(state.sectors) do
-                if sec.kind == "center" then
+                if sec.kind == "center" and (sec.panel == nil or sec.panel == pi) then
                     return si
                 end
             end
@@ -1823,9 +1839,11 @@ local function sector_cycle(state, dir)
         return -- at an edge with no escape handler → STOP (never WRAP around to the opposite end)
     end
     local target = ((cur - 1 + dir) % n) + 1
-    -- Entering the CENTER lands on the PRIMARY panel (1); the preview beside it is reached by panel-nav.
-    if state.sectors[target] and state.sectors[target].kind == "center" then
-        state.center_panel = 1
+    -- Entering the CENTER lands on that sector's OWN panel (`center_panel_sectors`), else the PRIMARY panel
+    -- (1); the preview beside it is reached by panel-nav.
+    local tsec = state.sectors[target]
+    if tsec and tsec.kind == "center" then
+        state.center_panel = tsec.panel or 1
     end
     focus_sector(state, target)
 end
@@ -3222,8 +3240,22 @@ local function open_windows(state)
     --- Move LEFT/RIGHT between the center panels (`dir` = +1 / -1). Only meaningful inside the center.
     --- Reads the REAL focused window (not just the tracked `center_panel`), so it works even when the
     --- preview was focused without going through `focus_panel` (e.g. its own buffer keymaps).
+    ---
+    --- When the panels are stacked VERTICALLY, left/right never means "another panel" (that is `<C-j>`/
+    --- `<C-k>` between the stacked sectors) — so `<C-h>`/`<C-l>` step OUT to the neighbouring editor window
+    --- instead, letting a side-docked vertical stack (e.g. lvim-replace) escape to the code beside it. A
+    --- docked split with no neighbour on that side is a no-op; a horizontal layout keeps the panel-to-panel
+    --- move unchanged.
     ---@param dir integer  +1 (right) / -1 (left)
     state.panel = function(dir)
+        if state.cfg.direction == "vertical" then
+            -- Remember the sector we are leaving from, so native nav BACK into the container (the WinEnter
+            -- hook) returns focus to THIS sector instead of resetting to the first — a side-docked stack
+            -- reopens on the row you left.
+            state._return_sector = current_sector(state)
+            escape_to_neighbor(state, dir < 0 and "h" or "l")
+            return
+        end
         local w = api.nvim_get_current_win()
         local base = state.center_panel or 1
         for i, pan in ipairs(state.panels) do
@@ -4160,6 +4192,13 @@ local function open_native_split(state)
     local function refit_native()
         state._geom.panels[1] = { width = api.nvim_win_get_width(pan.win), height = api.nvim_win_get_height(pan.win) }
         render_panel(state, 1)
+        -- Re-pin the native FOOTER float to the panel's NEW last row. The footer is anchored at a row computed
+        -- from the window height at render time (`content_h - 1`); a resize changes that height, but re-rendering
+        -- the panel content alone leaves the footer stranded at its old row — the gap the user sees below it. The
+        -- surface owns the float, so it must keep it pinned: re-render it from the live `cfg.footer` spec here.
+        if state.cfg.footer then
+            render_native_footer(state.cfg.footer)
+        end
     end
     -- WinResized fires session-wide for EVERY resized window; only re-render when OUR split was one of them
     -- (mirror the float path's `vim.v.event.windows` filter) so an unrelated split drag never re-renders us.
@@ -4362,6 +4401,7 @@ function M.open(cfg)
             provider = blk.provider,
             size = blk.size,
             weight = bw.fixed,
+            auto_stack = bw.auto, -- fit this panel to its natural content along the stacking axis (per-panel auto)
             border = blk_border,
             shrink_first = blk.shrink_first, -- give up rows before protected panels when the stack overflows
         }
