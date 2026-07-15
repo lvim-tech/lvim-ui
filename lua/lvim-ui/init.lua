@@ -1545,6 +1545,55 @@ end
 ---@param opts { title?: string, items: table[], close_keys?: string[], width?: number, height?: number, footer?: table }
 ---   items: `{ { key, description }, … }` — already resolved to the plugin's LIVE keys (unmapped rows omitted)
 ---   footer: a full frame footer spec, for a consumer whose action bar is config-driven; else a `q close` bar
+--- Word-wrap `text` to `w` display cells (never bytes) — a word longer than `w` is hard-broken so a single
+--- long token can never overflow the column. Returns the list of wrapped lines (at least one, possibly "").
+---@param text string
+---@param w integer
+---@return string[]
+local function help_wrap(text, w)
+    local dw = util.dw
+    text = tostring(text or "")
+    w = math.max(1, w)
+    if dw(text) <= w then
+        return { text }
+    end
+    local out, line = {}, ""
+    for word in text:gmatch("%S+") do
+        while dw(word) > w do -- a token wider than the column: hard-break it by display width
+            local take, acc, nch = 0, 0, vim.fn.strchars(word)
+            for c = 1, nch do
+                local cwdt = dw(vim.fn.strcharpart(word, c - 1, 1))
+                if acc + cwdt > w then
+                    break
+                end
+                acc, take = acc + cwdt, take + 1
+            end
+            take = math.max(1, take)
+            if line ~= "" then
+                out[#out + 1] = line
+                line = ""
+            end
+            out[#out + 1] = vim.fn.strcharpart(word, 0, take)
+            word = vim.fn.strcharpart(word, take)
+        end
+        if word ~= "" then
+            local cand = (line == "") and word or (line .. " " .. word)
+            if dw(cand) <= w then
+                line = cand
+            else
+                if line ~= "" then
+                    out[#out + 1] = line
+                end
+                line = word
+            end
+        end
+    end
+    if line ~= "" then
+        out[#out + 1] = line
+    end
+    return (#out > 0) and out or { "" }
+end
+
 function M.help(opts)
     opts = opts or {}
     local items = opts.items or {}
@@ -1552,37 +1601,76 @@ function M.help(opts)
         return
     end
     local dw = util.dw
+    -- Minimum usable DESCRIPTION cells: the key column is capped so a single very long key (or a long
+    -- description) can never swallow the other column — instead BOTH columns WRAP within their width and the
+    -- window grows in HEIGHT. So the help stays content-fit (never wider than `max`) and nothing is ever
+    -- truncated at the right edge (the ragged/cut description this component kept hitting).
+    local MIN_DESC = 28
     local kw, dwid = 0, 0
     for _, r in ipairs(items) do
         kw = math.max(kw, dw(tostring(r[1])))
         dwid = math.max(dwid, dw(tostring(r[2])))
     end
-    local keybox = kw + 4 -- 2 spaces left of the key + the key + ≥2 right — the aligned KEY column
+
+    --- The window width + the fixed KEY-column width for a given max. `key_col` is `kw + 4` (2 lead + key +
+    --- ≥2 gap) but never more than `max_w - MIN_DESC - 2`, so the description always keeps ≥ MIN_DESC cells.
+    ---@return integer w, integer key_col
+    local function dims()
+        local mw = opts.width or 0.7
+        local max_w = math.max(24, math.floor(mw <= 1 and mw * vim.o.columns or mw))
+        local key_col = math.min(kw + 4, math.max(10, max_w - MIN_DESC - 2))
+        local w = math.min(key_col + dwid + 4, max_w)
+        return w, key_col
+    end
+
+    --- Flatten the items into rendered ROWS (a wrapped item spans several rows): `{ k, d, item }` where `k`/`d`
+    --- are the (possibly continuation) key/description line texts and `item` is the source index (for the
+    --- odd/even stripe + the active highlight, which cover EVERY row of the item under the cursor).
+    ---@param width integer
+    ---@param key_col integer
+    ---@return table[]
+    local function rows_for(width, key_col)
+        local rows = {}
+        local desc_col = math.max(6, width - key_col - 2)
+        for i, r in ipairs(items) do
+            local klines = help_wrap(tostring(r[1]), math.max(1, key_col - 2))
+            local dlines = help_wrap(tostring(r[2]), desc_col)
+            for j = 1, math.max(#klines, #dlines) do
+                rows[#rows + 1] = { k = klines[j] or "", d = dlines[j] or "", item = i }
+            end
+        end
+        return rows
+    end
 
     local pan
     local provider = {
         hide_cursor = true,
         size = function()
-            return keybox + dwid + 4, #items
+            local w, key_col = dims()
+            return w, #rows_for(w, key_col)
         end,
         render = function(width)
+            local _, key_col = dims()
+            local rows = rows_for(width, key_col)
             local cur = (pan and pan.win and vim.api.nvim_win_is_valid(pan.win))
                     and vim.api.nvim_win_get_cursor(pan.win)[1]
                 or 1
+            local cur_item = rows[cur] and rows[cur].item
             local lines, hls = {}, {}
-            for i, r in ipairs(items) do
-                local s = (i % 2 == 1) and "Odd" or "Even"
-                -- Pad by DISPLAY WIDTH, never by byte length: a `…` is 3 bytes and one cell, and padding by
-                -- bytes leaves the box two cells short — the ragged right edge this component was born from.
-                local kcell = "  " .. tostring(r[1])
-                kcell = kcell .. string.rep(" ", math.max(0, keybox - dw(kcell)))
-                local dcell = "  " .. tostring(r[2])
-                dcell = dcell .. string.rep(" ", math.max(0, width - keybox - dw(dcell)))
-                lines[i] = kcell .. dcell
-                -- The spans are BYTE offsets (extmark columns are bytes) — the one place `#` is right.
-                hls[#hls + 1] = { i - 1, 0, #kcell, "LvimUiHelpKey" .. s }
+            for idx, row in ipairs(rows) do
+                local s = (row.item % 2 == 1) and "Odd" or "Even"
+                -- Pad by DISPLAY WIDTH, never by byte length: a `…` is 3 bytes and one cell.
+                local kcell = "  " .. row.k
+                kcell = kcell .. string.rep(" ", math.max(0, key_col - dw(kcell)))
+                local dcell = "  " .. row.d
+                dcell = dcell .. string.rep(" ", math.max(0, width - key_col - dw(dcell)))
+                lines[idx] = kcell .. dcell
+                -- The spans are BYTE offsets (extmark columns are bytes) — the one place `#` is right. The
+                -- ACTIVE tint covers every row of the item under the cursor (a wrapped item reads as one block).
+                hls[#hls + 1] = { idx - 1, 0, #kcell, "LvimUiHelpKey" .. s }
+                local active = cur_item ~= nil and row.item == cur_item
                 hls[#hls + 1] =
-                    { i - 1, #kcell, #lines[i], (i == cur) and ("LvimUiHelpActive" .. s) or ("LvimUiHelpDesc" .. s) }
+                    { idx - 1, #kcell, #lines[idx], active and ("LvimUiHelpActive" .. s) or ("LvimUiHelpDesc" .. s) }
             end
             return lines, hls
         end,
