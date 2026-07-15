@@ -3871,7 +3871,12 @@ local function close(state)
     if state.augroup then
         pcall(api.nvim_del_augroup_by_id, state.augroup)
     end
-    -- The native-split footer float (owned by the surface) — close it before the panel windows.
+    -- The native-split footer window (owned by the surface) — drop its focus-bounce autocmd and close it
+    -- before the panel windows (its reserved row returns to the panel).
+    if state._footer_augroup then
+        pcall(api.nvim_del_augroup_by_id, state._footer_augroup)
+        state._footer_augroup = nil
+    end
     if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
         pcall(api.nvim_win_close, state._footer_win, true)
     end
@@ -4036,13 +4041,98 @@ local function open_native_split(state)
         render_panel(state, 1)
     end
     pan.frame = state
+    -- A footer float overlays the panel's bottom row: reserve it BEFORE the first render (the content provider
+    -- reads `pan.footer_reserve`), so the last row never lands under the bar even on the opening paint. No
+    -- footer configured ⇒ no reserve ⇒ the panel fills its whole height exactly as before.
+    if cfg.footer then
+        pan.footer_reserve = 1
+        vim.wo[pan.win].scrolloff = 1
+    end
     render_panel(state, 1)
 
-    -- Native-split FOOTER: a 1-row bar pinned to the panel's bottom row. A native split is ONE real window
-    -- (no chrome container to host header/footer bands), so the footer is a managed float THE SURFACE owns —
-    -- `relative = "win"`, so it tracks the panel and stays put however far the content scrolls. A consumer
-    -- passes `footer = { bars = { { items = …, align = … } } }` and refreshes it live via `state.set_footer`,
-    -- instead of hand-rolling a window.
+    -- Native FOOTER: a 1-row overlay float sitting on the panel's last USABLE row (`relative = "win"`). A native
+    -- panel is ONE real window — no chrome container to host a footer band, and stacking a second window for one
+    -- would force a statusline SEPARATOR row between them (drawn even at laststatus=0), a gap the panel must not
+    -- have. So the panel instead RESERVES the row(s) the float overlays (`pan.footer_reserve` + `scrolloff`) — the
+    -- content provider keeps that many trailing blank rows and the last REAL row stays above the bar, so a `j`
+    -- onto it can never drop it under the float. A consumer passes `footer = { bars = { { items = …, align = … }}}`
+    -- and refreshes its labels via `state.set_footer`.
+    --
+    -- POSITION is split from PAINT: `place_footer` (geometry → float config + reserve) must re-run whenever the
+    -- panel's height changes, which happens WITHOUT a content change — a global statusline toggles (laststatus),
+    -- the cmdline grows/shrinks (cmdheight), the view scrolls. So it is driven by its own light autocmds below,
+    -- not only by `set_footer`. It is config-INDEPENDENT: with `laststatus=3` the global statusline is a NATIVE
+    -- row OUTSIDE the panel (the panel's own bottom row is already above it); but a bottom msgarea at
+    -- `laststatus=0` lays a FLOAT over the very bottom screen row, INSIDE the panel's extent — so it detects a
+    -- thin bottom float covering the panel's bottom row over its columns and sits ONE row higher, reserving that
+    -- extra row too, so the footer never lands on the statusline.
+    local function place_footer()
+        if state._closed or not (pan.win and api.nvim_win_is_valid(pan.win)) then
+            return
+        end
+        if not (state._footer_buf and api.nvim_buf_is_valid(state._footer_buf)) then
+            return -- nothing painted yet (no footer configured)
+        end
+        local fw = api.nvim_win_get_width(pan.win)
+        -- The TEXT-area height, not `nvim_win_get_height` (which counts the winbar the panel title rides): the
+        -- footer is a `relative="win"` float and its `row = 0` is the first TEXT row (below the winbar), so its
+        -- last row is `text_h - 1`. `getwininfo().height` is winbar-exclusive; `winrow` is the frame top, so the
+        -- text top adds a row when a winbar is present.
+        local wi = vim.fn.getwininfo(pan.win)[1]
+        local text_h = wi.height
+        local psp = vim.fn.win_screenpos(pan.win)
+        local pc = psp[2]
+        local text_top = wi.winrow + (((vim.wo[pan.win].winbar or "") ~= "") and 1 or 0)
+        local panel_bottom = text_top + text_h - 1
+        local chrome = 0 -- extra bottom rows owned by an overlapping msgarea/statusline float
+        for _, w in ipairs(api.nvim_list_wins()) do
+            if w ~= state._footer_win and w ~= pan.win then
+                local c = api.nvim_win_get_config(w)
+                if c.relative and c.relative ~= "" then
+                    local fh = api.nvim_win_get_height(w)
+                    if fh <= 3 then -- a bar, never a full-height backdrop
+                        local sp = vim.fn.win_screenpos(w)
+                        local fr, fc, fwid = sp[1], sp[2], api.nvim_win_get_width(w)
+                        local col_overlap = fc <= (pc + fw - 1) and (fc + fwid - 1) >= pc
+                        local covers_bottom = fr <= panel_bottom and (fr + fh - 1) >= panel_bottom
+                        if col_overlap and covers_bottom then
+                            chrome = 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        local reserve = 1 + chrome
+        local fpos = {
+            relative = "win",
+            win = pan.win,
+            row = math.max(0, text_h - 1 - chrome),
+            col = 0,
+            width = fw,
+            height = 1,
+        }
+        if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
+            pcall(api.nvim_win_set_config, state._footer_win, fpos)
+        else
+            fpos.focusable = false
+            fpos.style = "minimal"
+            fpos.zindex = 60
+            fpos.noautocmd = true
+            state._footer_win = api.nvim_open_win(state._footer_buf, false, fpos)
+            vim.wo[state._footer_win].winhighlight = "Normal:" .. normal_hl
+            vim.wo[state._footer_win].wrap = false
+            vim.wo[state._footer_win].cursorline = false
+        end
+        -- Only re-render the provider when the reserve COUNT actually changes (footer added, or the bottom-chrome
+        -- situation flipped) — this runs on scroll/resize, and an unconditional refresh would recurse forever.
+        local need_reserve = pan.footer_reserve ~= reserve
+        pan.footer_reserve = reserve
+        vim.wo[pan.win].scrolloff = reserve
+        if need_reserve and pan.refresh then
+            pan.refresh() -- apply the trailing reserved row(s) immediately (once)
+        end
+    end
     local function render_native_footer(spec)
         local bar = spec and spec.bars and spec.bars[1]
         if not (bar and bar.items and pan.win and api.nvim_win_is_valid(pan.win)) then
@@ -4051,19 +4141,20 @@ local function open_native_split(state)
         if not (state._footer_buf and api.nvim_buf_is_valid(state._footer_buf)) then
             state._footer_buf = api.nvim_create_buf(false, true)
             vim.bo[state._footer_buf].bufhidden = "wipe"
-            vim.keymap.set("n", "<LeftMouse>", function()
-                local m = vim.fn.getmousepos()
-                if m.winid ~= state._footer_win then
+            -- Clicks go through the GLOBAL mouse layer (by window under the pointer), NOT a buffer-local
+            -- <LeftMouse>: the footer is a NON-focusable float, so focus never enters it and a buffer-local map
+            -- would never fire. `register_click` hit-tests the clicked column against the rendered item boxes.
+            require("lvim-utils.mouse").register_click(state._footer_buf, function(_line, col0)
+                if vim.o.mouse == "" then
                     return
                 end
-                local col = m.column - 1
                 for _, it in ipairs(state._footer_items or {}) do
-                    if it.c0 and col >= it.c0 and col < it.c1 and it.spec and it.spec.run then
+                    if it.c0 and col0 >= it.c0 and col0 < it.c1 and it.spec and it.spec.run then
                         it.spec.run()
                         return
                     end
                 end
-            end, { buffer = state._footer_buf, nowait = true, silent = true })
+            end)
         end
         local fw = api.nvim_win_get_width(pan.win)
         local band = require("lvim-ui.bar").render({ items = bar.items, width = fw, align = bar.align or "center" })
@@ -4088,29 +4179,7 @@ local function open_native_split(state)
                 { end_col = s[2], hl_group = s[3], priority = 200 }
             )
         end
-        -- Pin the bar to the panel's LAST CONTENT row. `relative = "win"` counts rows from BELOW the winbar
-        -- (row 0 = first text row), so the anchor must be the text height, NOT `nvim_win_get_height` (which
-        -- includes the winbar row) — otherwise the bar drops one row too low and lands ON the global
-        -- statusline. `getwininfo().height` is the text height (winbar excluded), correct with or without one.
-        local info = vim.fn.getwininfo(pan.win)[1]
-        local content_h = (info and info.height) or api.nvim_win_get_height(pan.win)
-        local wcfg = {
-            relative = "win",
-            win = pan.win,
-            row = math.max(0, content_h - 1),
-            col = 0,
-            width = fw,
-            height = 1,
-            focusable = false,
-            zindex = (state.zindex or 40) + 5,
-            style = "minimal",
-        }
-        if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
-            pcall(api.nvim_win_set_config, state._footer_win, wcfg)
-        else
-            state._footer_win = api.nvim_open_win(state._footer_buf, false, wcfg)
-            vim.wo[state._footer_win].winhighlight = "Normal:" .. normal_hl
-        end
+        place_footer()
     end
     --- Rebuild + repaint the native footer bar (live counts / labels).
     ---@param spec table
@@ -4224,6 +4293,28 @@ local function open_native_split(state)
                 refit_native()
             end
         end,
+    })
+    -- The footer float pins to the panel's last USABLE row — a geometry that shifts WITHOUT a content change:
+    -- `laststatus`/`cmdheight` toggle the panel's height (a global statusline or the cmdline appears/disappears —
+    -- a bottom msgarea drives these live), the view SCROLLS, focus moves. Any of these can strand the footer a
+    -- row too high or low (e.g. ON the statusline). `place_footer` is cheap (a set_config), so re-run it on all
+    -- of them — scheduled, because the window's new height is applied AFTER the option set / scroll settles.
+    local function schedule_place()
+        vim.schedule(function()
+            if not state._closed and pan.win and api.nvim_win_is_valid(pan.win) then
+                place_footer()
+            end
+        end)
+    end
+    api.nvim_create_autocmd("OptionSet", {
+        group = state.augroup,
+        pattern = { "laststatus", "cmdheight" },
+        callback = schedule_place,
+    })
+    api.nvim_create_autocmd("WinScrolled", {
+        group = state.augroup,
+        pattern = tostring(pan.win),
+        callback = schedule_place,
     })
 end
 

@@ -512,12 +512,22 @@ function M.new(opts)
         -- turns out everything fits. Otherwise a panel that fits would waste a column on a bar it never shows.
         local info = (pan.win and api.nvim_win_is_valid(pan.win)) and vim.fn.getwininfo(pan.win)[1] or nil
         local height = (info and info.height) or (pan.win and api.nvim_win_get_height(pan.win)) or 0
+        -- A native-footer FLOAT (the surface owns it) overlays the panel's bottom `footer_reserve` screen rows.
+        -- Reserve that many trailing BLANK lines so the last REAL row is pushed above the float — the window's
+        -- `scrolloff` (set to the same count by the surface) keeps it there when scrolled to the bottom, and the
+        -- cursor clamp below never lets the selection rest on a reserved row. The covered rows are also
+        -- unavailable for content, so they count against the height when deciding whether a scrollbar is needed.
+        local footer_reserve = (pan.footer_reserve and pan.footer_reserve > 0) and pan.footer_reserve or 0
+        state.footer_reserve = footer_reserve
         local reserve = scrollbar and 1 or 0
         local lines, hls, virts, rows, order, header_rows = build(width, reserve)
-        if reserve == 1 and height > 0 and #lines <= height then
+        if reserve == 1 and height > 0 and #lines <= height - footer_reserve then
             lines, hls, virts, rows, order, header_rows = build(width, 0) -- fits: no bar, no reserved column
         end
         state.rows, state.order, state.header_rows = rows, order, header_rows
+        for _ = 1, footer_reserve do
+            lines[#lines + 1] = "" -- the row the footer float overlays; the clamp keeps the selection off it
+        end
         vim.bo[pan.buf].modifiable = true
         api.nvim_buf_set_lines(pan.buf, 0, -1, false, lines)
         vim.bo[pan.buf].modifiable = false
@@ -807,6 +817,16 @@ function M.new(opts)
                     then
                         api.nvim_win_set_cursor(pan.win, { state.header_rows + 1, 0 })
                         return -- the clamp re-fires CursorMoved; notify from that pass
+                    end
+                    -- Symmetric bottom clamp: the footer-reserve rows are chrome (the row the footer float sits on),
+                    -- not selectable content — keep the cursor on the last real row. No footer ⇒ reserve 0 ⇒ no-op.
+                    local reserve = state.footer_reserve or 0
+                    if reserve > 0 then
+                        local last_sel = api.nvim_buf_line_count(pan.buf) - reserve
+                        if last_sel >= 1 and line > last_sel then
+                            api.nvim_win_set_cursor(pan.win, { last_sel, 0 })
+                            return -- re-fires CursorMoved; notify from that pass
+                        end
                     end
                     if opts.on_move then
                         local e = state.rows[line]
