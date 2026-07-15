@@ -1601,25 +1601,26 @@ function M.help(opts)
         return
     end
     local dw = util.dw
-    -- Minimum usable DESCRIPTION cells: the key column is capped so a single very long key (or a long
-    -- description) can never swallow the other column — instead BOTH columns WRAP within their width and the
-    -- window grows in HEIGHT. So the help stays content-fit (never wider than `max`) and nothing is ever
-    -- truncated at the right edge (the ragged/cut description this component kept hitting).
-    local MIN_DESC = 28
+    -- The KEY column HUGS the keys but is capped at ~40% of the window, so a single very long key (an
+    -- outlier — e.g. four `<localleader>x` chords on one row) can NEVER stretch the column past the
+    -- description: keys wider than 40% wrap instead, and short keys never leave a wide gap. Both columns wrap,
+    -- so the help stays content-fit (never wider than `max`) and grows in HEIGHT — nothing is truncated.
+    local KEY_FRACTION = 0.4
     local kw, dwid = 0, 0
     for _, r in ipairs(items) do
         kw = math.max(kw, dw(tostring(r[1])))
         dwid = math.max(dwid, dw(tostring(r[2])))
     end
 
-    --- The window width + the fixed KEY-column width for a given max. `key_col` is `kw + 4` (2 lead + key +
-    --- ≥2 gap) but never more than `max_w - MIN_DESC - 2`, so the description always keeps ≥ MIN_DESC cells.
+    --- The window width + the KEY-column width. The window fits key + description naturally, capped at `max`;
+    --- the key column is `kw + 4` (2 lead + key + ≥2 gap) but never more than `KEY_FRACTION` of the WINDOW, so
+    --- the description always keeps the majority (~60%).
     ---@return integer w, integer key_col
     local function dims()
         local mw = opts.width or 0.7
         local max_w = math.max(24, math.floor(mw <= 1 and mw * vim.o.columns or mw))
-        local key_col = math.min(kw + 4, math.max(10, max_w - MIN_DESC - 2))
-        local w = math.min(key_col + dwid + 4, max_w)
+        local w = math.min(kw + dwid + 8, max_w)
+        local key_col = math.min(kw + 4, math.max(10, math.floor(w * KEY_FRACTION)))
         return w, key_col
     end
 
@@ -1643,6 +1644,9 @@ function M.help(opts)
     end
 
     local pan
+    -- The buffer line → source-item map from the last render, so j/k can move per ITEM (skipping a wrapped
+    -- item's continuation lines) rather than per buffer line.
+    local row_items = {}
     local provider = {
         hide_cursor = true,
         size = function()
@@ -1657,7 +1661,9 @@ function M.help(opts)
                 or 1
             local cur_item = rows[cur] and rows[cur].item
             local lines, hls = {}, {}
+            row_items = {}
             for idx, row in ipairs(rows) do
+                row_items[idx] = row.item
                 local s = (row.item % 2 == 1) and "Odd" or "Even"
                 -- Pad by DISPLAY WIDTH, never by byte length: a `…` is 3 bytes and one cell.
                 local kcell = "  " .. row.k
@@ -1674,8 +1680,29 @@ function M.help(opts)
             end
             return lines, hls
         end,
-        keys = function(_, p)
+        keys = function(map, p)
             pan = p
+            -- Move per ITEM, not per line: a wrapped item is ONE entry, so j/k step over its continuation
+            -- lines and land on the next/previous item's FIRST line (a single j/k always changes item).
+            local function move(delta)
+                if not (pan and pan.win and vim.api.nvim_win_is_valid(pan.win)) then
+                    return
+                end
+                local cur = vim.api.nvim_win_get_cursor(pan.win)[1]
+                local target = math.max(1, math.min((row_items[cur] or 1) + delta, #items))
+                for idx = 1, #row_items do
+                    if row_items[idx] == target then
+                        pcall(vim.api.nvim_win_set_cursor, pan.win, { idx, 0 })
+                        return
+                    end
+                end
+            end
+            map({ "j", "<Down>" }, function()
+                move(1)
+            end)
+            map({ "k", "<Up>" }, function()
+                move(-1)
+            end)
             -- Repaint so the bright ACTIVE row follows the (hidden) cursor.
             vim.api.nvim_create_autocmd("CursorMoved", {
                 buffer = p.buf,
