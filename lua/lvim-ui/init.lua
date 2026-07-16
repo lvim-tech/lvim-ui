@@ -23,6 +23,10 @@
 --   M.menu(opts)          – cursor-anchored NON-FOCUSABLE popup handle (completion menus)
 --   M.hint(opts)          – NON-FOCUSABLE key-hint BAR handle (a sub-mode's live keys, above the statusline)
 --   M.tree(opts)          – generic node-provider TREE content layer for a surface panel
+--
+-- The `M.transient` PRESET renders; the plugin-agnostic transient ENGINE (the DATA + arg math + persisted
+-- defaults) is a separate module — `require("lvim-ui.transient").new{…}` — so any plugin owns its own
+-- engine over its own state table + store and shares this one renderer (see lvim-ui/transient.lua).
 ---@module "lvim-ui"
 
 local frame = require("lvim-ui.surface")
@@ -370,7 +374,8 @@ end
 
 --- Pick multiple items — a 1-panel `frame` of checkbox rows + a toggle/confirm/cancel footer.
 --- `<Space>` toggles the focused row, `<CR>` confirms. callback(confirmed, selected) where `selected`
---- maps each chosen item to true.
+--- maps each chosen item to true. An item table with `checked == true` opens pre-selected (edit an
+--- existing set).
 ---@param opts UiOpts
 function M.multiselect(opts)
     opts = opts or {}
@@ -384,7 +389,15 @@ function M.multiselect(opts)
         return
     end
     local confirmed = false
+    -- Pre-checked rows: an item with `checked == true` opens already selected (the "edit an existing set"
+    -- flow — labels / assignees / reviewers seeded from a topic's current set). Additive: an item without
+    -- the field opens unchecked exactly as before.
     local selected = {}
+    for _, it in ipairs(items) do
+        if type(it) == "table" and it.checked then
+            selected[it] = true
+        end
+    end
     local pan
     local ico = util.cfg().icons or {}
 
