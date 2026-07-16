@@ -107,7 +107,11 @@ function M.row_display(row, ico)
     local label = row.label or row.name or ""
     local val = tostring(row.value ~= nil and row.value or row.default or "")
     ico = ico or M.icons()
-    local ri = row.icon and (row.icon .. " ") or ""
+    -- An EMPTY `icon` means NO icon — it must not emit a lone separator space. (`row.icon and …` alone is a
+    -- Lua-truthiness trap: `""` is truthy, so an icon-less row rendered a phantom 1-space gutter that the
+    -- colour paths never accounted for — they test `r.icon ~= ""` — which shifted every label span one byte
+    -- left and so left the row's LAST character uncoloured.)
+    local ri = (row.icon and row.icon ~= "") and (row.icon .. " ") or ""
 
     -- Expandable rows (accordion) show a caret instead of a type icon. A `flat` header carries its own caret
     -- in `icon` (so no auto caret); `tight` additionally drops the 2-space lead so it sits at the tight
@@ -159,7 +163,7 @@ end
 ---@return string prefix, { text: string, opt: string }[]
 function M.segmented_segments(row, ico)
     ico = ico or M.icons()
-    local ri = row.icon and (row.icon .. " ") or ""
+    local ri = (row.icon and row.icon ~= "") and (row.icon .. " ") or "" -- "" = no icon (see row_display)
     local prefix = ri .. (row.label or "")
     if prefix ~= "" then
         prefix = prefix .. "  "

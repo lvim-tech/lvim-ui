@@ -214,7 +214,13 @@ local function subtitle_bars(subtitle)
             out[#out + 1] = { text = ln, hl = "LvimUiSubtitle" }
         else
             local hl = ln.hl or (ln.type and SUBTITLE_TYPES[ln.type]) or "LvimUiSubtitle"
-            out[#out + 1] = { text = (ln.icon and (ln.icon .. "  ") or "") .. (ln.text or ""), hl = hl }
+            -- `hls`: optional per-part inline spans `{ byte_c0, byte_c1, group }` for a MULTI-colour line (the
+            -- offsets are into `text`, so such a caller builds any icon INTO `text` rather than passing `icon`).
+            out[#out + 1] = {
+                text = (ln.icon and (ln.icon .. "  ") or "") .. (ln.text or ""),
+                hl = hl,
+                hls = ln.hls,
+            }
             if ln.blank_below then
                 out[#out + 1] = { text = "" } -- one empty meta band = a blank row under this line
             end
@@ -274,7 +280,10 @@ function M.select(opts)
 
     local provider = {
         hide_cursor = true,
-        cursorline = true,
+        -- The simple pickers opt INTO the full-row yellow cursorline (`LvimUiPeekCursorLine`): their rows carry
+        -- no per-segment colours, so highlighting the whole focused row reads best. Rich menus (ui.tabs) leave
+        -- this a boolean and get the neutral bg-only cursorline instead, so their own row colours survive.
+        cursorline = "LvimUiPeekCursorLine",
         -- A left-click on a row picks it (the chassis moves the hidden selection onto the clicked row first,
         -- so `pick` reads it) — exactly what <CR>/<Space> do on the focused row.
         on_click = function(_, st)
@@ -427,7 +436,10 @@ function M.multiselect(opts)
 
     local provider = {
         hide_cursor = true,
-        cursorline = true,
+        -- The simple pickers opt INTO the full-row yellow cursorline (`LvimUiPeekCursorLine`): their rows carry
+        -- no per-segment colours, so highlighting the whole focused row reads best. Rich menus (ui.tabs) leave
+        -- this a boolean and get the neutral bg-only cursorline instead, so their own row colours survive.
+        cursorline = "LvimUiPeekCursorLine",
         -- A left-click on a row toggles its checkbox (the chassis moves the hidden selection there first) —
         -- exactly what <Space> does on the focused row. Confirm stays on <CR> / the footer button.
         on_click = function()
@@ -974,6 +986,10 @@ function M.tabs(opts)
                 specs[#specs + 1] = {
                     key = key,
                     name = h.label or h.name or "",
+                    -- A chip may carry its OWN box colours (`style` = a partial `{ icon, text }` override
+                    -- merged over the footer kind), so a legend can read as distinct coloured verbs rather
+                    -- than one flat key list. Forwarded here or it is silently dropped.
+                    style = h.style,
                     no_hotkey = h.no_hotkey,
                     run = function(st2)
                         if h.run then

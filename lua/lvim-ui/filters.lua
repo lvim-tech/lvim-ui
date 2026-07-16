@@ -1,9 +1,12 @@
 -- lvim-ui.filters: build a centered `ui.bar` band from filter GROUPS — the ONE filter-bar model shared
 -- by the picker (its header filter bar) and `ui.tabs` (a tab's toolbar filter), so every filter bar across the
--- plugins is identical: one button per option, a `●` separator between GROUPS, a live count, the bracketed
--- hotkey, the active highlight, and the canonical 4-state button styling (normal/active/hover/hover_active).
+-- plugins is identical: one button per option, a `●` separator between GROUPS, a live count, the active
+-- highlight, and the canonical 4-state button styling (normal/active/hover/hover_active).
 --
--- The BUTTON STYLE (bracketed accelerator, not a key badge) comes from the shared `surface.STYLES.hotkey`, so the
+-- A filter button is fired with `<CR>` on it (or a click) — it carries NO bracketed letter accelerator, so the
+-- bar reads as plain captions and claims none of the panel's key space.
+--
+-- The BUTTON STYLE comes from the shared `surface.STYLES.hotkey`, so the
 -- style FLAGS are defined in ONE place for every bar (action `surface.bar` + these filters); only the COLOURS
 -- (the LvimUiPeekFilter* accents + per-button `hl`) live here. The consumer owns the SEMANTICS (what a filter
 -- does, how its count is computed) and passes them in; this module owns the LOOK + the spec construction. See
@@ -16,7 +19,8 @@ local M = {}
 ---@class LvimUiFilterButton
 ---@field id     string
 ---@field label  string
----@field key?   string                 -- hotkey letter to bracket ([X]); also the direct activation key
+---@field key?   string                 -- IGNORED (kept so existing group specs still load): filter buttons are
+---                                      -- fired with <CR>/click only — no bracketed letter, no accelerator
 ---@field predicate? fun(src: any): boolean
 ---@field hl?            string         -- inactive colour (default LvimUiPeekFilterInactive)
 ---@field hl_active?     string         -- active colour (default LvimUiPeekFilterActive)
@@ -64,7 +68,10 @@ function M.bar(filters, opts)
             local ha = b.hl_hover_active -- nil → ui.button degrades hover_active to plain hover
             specs[#specs + 1] = surface.button({
                 name = b.label,
-                key = b.key, -- the hotkey KIND brackets this letter in the accent colour
+                -- NO `key`: a filter button is activated by <CR> on it (or a click), never by a bare letter.
+                -- Passing a key would BOTH bracket a letter of the caption (`[I]ssues`) and bind that letter as
+                -- a direct accelerator — the bar reads cleaner, and stays out of the panel's key space, without
+                -- it. (`LvimUiFilterButton.key` is accepted-but-ignored so existing group specs still load.)
                 style = "hotkey",
                 active = b.id == g.active,
                 count = opts.count and function()

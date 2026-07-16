@@ -478,10 +478,12 @@ local function bar_items(items, footer)
         if it.type or not footer then
             out[i] = it -- full button / separator spec (or a non-footer bar) — passes through
         else
-            -- footer action shorthand `{ key, name|text, run }` → the shared `action` KIND (via `M.button`); a
-            -- caller-supplied `it.style` is a full BOX colour override, passed through as the button's `hl`.
+            -- footer action shorthand `{ key, name|text|label, run }` → the shared `action` KIND (via
+            -- `M.button`); a caller-supplied `it.style` is a full BOX colour override, passed through as the
+            -- button's `hl`. (The `action` kind is a KEY BADGE — its lead box is the key, so a chip's glyph
+            -- belongs in the caption, not in `icon`.)
             out[i] = M.button({
-                name = it.name or it.text or "",
+                name = it.name or it.text or it.label or "",
                 key = it.key,
                 run = it.run,
                 active = it.active,
@@ -538,7 +540,14 @@ local function build_bands(spec, footer, add_air)
             -- function is re-evaluated on every chrome render. Passed through with its fields intact.
             bands[#bands + 1] = bar
         elseif bar.text ~= nil then
-            bands[#bands + 1] = { meta = bar.text, hl = bar.hl or (footer and "LvimUiSubtitle" or "LvimUiPeekTitle") }
+            -- `hls` (optional): per-part inline highlight spans `{ byte_c0, byte_c1, group }` into `text`, so a
+            -- meta line can carry MULTIPLE colours (e.g. a repo band: branch / ahead / sha / subject) instead
+            -- of one `hl` for the whole row.
+            bands[#bands + 1] = {
+                meta = bar.text,
+                hl = bar.hl or (footer and "LvimUiSubtitle" or "LvimUiPeekTitle"),
+                hls = bar.hls,
+            }
         elseif bar.input then
             -- An editable INPUT band — a focusable 1-row editable window the frame creates over this row
             -- (see open_windows). It reserves a row like a meta line; the consumer drives it via
@@ -1436,9 +1445,16 @@ local function render_chrome(state, L)
         end
         if band.meta ~= nil then
             lines[ln] = util.center(band.meta, W)
-            if band.meta ~= "" and band.hl then
+            -- The centred text starts at `s` leading spaces (1 byte each), so a byte offset into `meta` maps
+            -- to column `s + offset` on the row.
+            local s = math.floor((W - util.dw(band.meta)) / 2)
+            if band.hls then
+                -- Per-part inline spans (a multi-colour meta line, e.g. the repo band).
+                for _, sp in ipairs(band.hls) do
+                    placements[#placements + 1] = { ln - 1, s + sp[1], s + sp[2], util.resolve_hl(sp[3]), 200 }
+                end
+            elseif band.meta ~= "" and band.hl then
                 -- 1 space of padding on each side, so a title's bg chrome reads " LVIM LSP " not hugging.
-                local s = math.floor((W - util.dw(band.meta)) / 2)
                 placements[#placements + 1] =
                     { ln - 1, math.max(0, s - 1), math.min(W, s + #band.meta + 1), band.hl, 200 }
             end
@@ -1467,9 +1483,12 @@ local function render_chrome(state, L)
         lines[ln] = res.line
         -- A continuous full-width bg STRIP under the buttons, so the whole bar row reads as one tinted bar
         -- (the buttons + chevrons sit ON it). Priority below the button/chevron spans (200) so they show through.
-        -- `band.fill = false` drops the strip (the buttons then float on the bare panel bg).
+        -- `band.fill = false` drops the strip (the buttons then float on the bare panel bg). Two depths: the
+        -- deeper `Hover` tint when this bar is the one you're ON (focused / cursor on its row), else the resting
+        -- tint — the whole bar reads as "active" without any layout change (one bg, two tints).
         if band.fill ~= false then
-            placements[#placements + 1] = { ln - 1, 0, #res.line, "LvimUiBarFill", 150 }
+            placements[#placements + 1] =
+                { ln - 1, 0, #res.line, focused and "LvimUiBarFillHover" or "LvimUiBarFill", 150 }
         end
         local entry = { kind = where, row = ln, buttons = {}, band = band }
         for i, b in ipairs(res.items) do
@@ -2621,8 +2640,12 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     local normal = (pan.provider and pan.provider.normal_hl) or "LvimUiPeekNormal"
     local fbord = "LvimUiPeekBorder"
     if pan.provider and pan.provider.cursorline then
-        local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline)
-            or ((#state.panels > 1) and "LvimUiCursorLine" or "LvimUiPeekCursorLine")
+        -- The cursorline group: a provider-named one (a string), else the NEUTRAL bg-only `LvimUiCursorLine`
+        -- so the focused row is marked by a background wash ALONE — a rich menu's per-segment fg colours
+        -- (a commit id, a topic title) survive on the cursor row. The full-row yellow `LvimUiPeekCursorLine`
+        -- (which overrides fg) is opt-IN, requested by name only by the simple pickers (`M.select` /
+        -- `M.multiselect`), whose rows carry no colours of their own.
+        local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline) or "LvimUiCursorLine"
         vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s,CursorLine:%s"):format(normal, fbord, cl)
         vim.wo[pan.win].cursorline = true
     else

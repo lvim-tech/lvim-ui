@@ -147,7 +147,16 @@ function M.render(spec, state)
         txt = txt()
     end
     txt = txt or ""
-    put(sp(tf), thl) -- text box left pad
+    -- On HOVER, bracket the text box — `[caption]` — CONSUMING one padding cell each side, so the button's
+    -- width (and the whole bar's layout) is unchanged: no reflow, the label just gains `[ ]`. Only when there
+    -- is padding to consume on both sides (else brackets would widen the button). The brackets wear the text
+    -- colour (itself the deeper hover tint).
+    local hovered = (state == "hover" or state == "hover_active") and tf >= 1 and tb >= 1
+    if hovered then
+        put(sp(tf - 1) .. "[", thl)
+    else
+        put(sp(tf), thl) -- text box left pad
+    end
     if not spec.key_badge and (spec.key or spec.key_pos) and txt ~= "" then
         local pos = M.key_pos(txt, spec.key, spec.key_pos)
         local byte_pos = vim.str_byteindex(txt, "utf-32", pos - 1, false) + 1
@@ -172,7 +181,11 @@ function M.render(spec, state)
     if count ~= nil and count ~= "" then
         put(" " .. tostring(count), thl)
     end
-    put(sp(tb), thl) -- text box right pad
+    if hovered then
+        put("]" .. sp(tb - 1), thl)
+    else
+        put(sp(tb), thl) -- text box right pad
+    end
     return text, spans
 end
 

@@ -394,12 +394,25 @@ function M.new(opts)
                         if r.label_spans and label ~= "" then
                             -- Per-SEGMENT label colours: a list of `{ c0, c1, hl }` BYTE offsets INTO the label
                             -- (so a row can paint e.g. its location one colour and its snippet another). Takes
-                            -- precedence over the single `text_hl`.
+                            -- precedence over the single `text_hl`. CLAMP each span's end to the rendered line —
+                            -- a `tabs`/menu row truncates a long label (with `…`), so a span reaching past the cut
+                            -- would be an out-of-range extmark that nvim REJECTS, silently dropping the colour of
+                            -- the whole segment (e.g. a long reflog description losing its yellow).
+                            local line_len = #lines[i]
                             for _, sp in ipairs(r.label_spans) do
-                                hls[#hls + 1] = { i - 1, ls + sp[1], ls + sp[2], sp[3] }
+                                local c0, c1 = ls + sp[1], math.min(ls + sp[2], line_len)
+                                if c1 > c0 then
+                                    hls[#hls + 1] = { i - 1, c0, c1, sp[3] }
+                                end
                             end
                         elseif r.text_hl and label ~= "" then
-                            hls[#hls + 1] = { i - 1, ls, ls + #label, r.text_hl }
+                            -- Clamped to the rendered line for the same reason as `label_spans` above: a long
+                            -- label is truncated, and a span reaching past the cut is an out-of-range extmark
+                            -- that nvim rejects — silently dropping the row's colour entirely.
+                            local c1 = math.min(ls + #label, #lines[i])
+                            if c1 > ls then
+                                hls[#hls + 1] = { i - 1, ls, c1, r.text_hl }
+                            end
                         end
                         if r.suffix and r.suffix ~= "" and r.suffix_hl then
                             local suffix_start = math.max(lead, math.min(#lines[i], lead + #disp - #r.suffix))
