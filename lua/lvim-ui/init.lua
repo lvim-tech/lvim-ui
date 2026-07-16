@@ -17,6 +17,7 @@
 --   M.input(opts)         – free-text input field
 --   M.confirm(opts)       – yes/no dialog → callback(yes: boolean)
 --   M.tabs(opts)          – tabbed view with typed rows or simple item lists
+--   M.transient(opts)     – a Magit-style switch/option/action popup with direct hotkeys + levels
 --   M.info(content, opts) – read-only markdown/text info window
 --   M.close_info(win)     – programmatically close an info window
 --   M.menu(opts)          – cursor-anchored NON-FOCUSABLE popup handle (completion menus)
@@ -1088,8 +1089,13 @@ function M.tabs(opts)
     -- picker's filter bar). The TITLE is the frame's border-title, not a header bar.
     local static_bars = {} -- the per-surface prefix (subtitle bars); the tab bar + per-TAB bars are appended live
     local set_active_tab -- forward decl: switch to a tab; shared by the tab bar, the body l/h keymaps + the handle
-    for _, b in ipairs(subtitle_bars(opts.subtitle)) do
-        static_bars[#static_bars + 1] = b
+    -- A `subtitle` FUNCTION is a LIVE subtitle: re-evaluated inside `header_spec()` on every recalc / tab
+    -- switch, so a caller whose subtitle tracks changing state (a git repo band that follows HEAD) sees it
+    -- refresh with the content. A static subtitle is captured here once, as before.
+    if type(opts.subtitle) ~= "function" then
+        for _, b in ipairs(subtitle_bars(opts.subtitle)) do
+            static_bars[#static_bars + 1] = b
+        end
     end
 
     --- Map one tab-bar AFFORDANCE record — a per-tab companion (`tab.actions`, e.g. a kill ×) or a bar
@@ -1184,6 +1190,12 @@ function M.tabs(opts)
     -- active tab's bar rows as bands. Re-evaluated on every tab switch / content rebuild via `st.set_header`.
     local function header_spec()
         local hb = {}
+        -- A live (function) subtitle is re-read here; a static one lives in `static_bars`.
+        if type(opts.subtitle) == "function" then
+            for _, b in ipairs(subtitle_bars(opts.subtitle())) do
+                hb[#hb + 1] = b
+            end
+        end
         for _, b in ipairs(static_bars) do
             hb[#hb + 1] = b
         end
@@ -1526,6 +1538,404 @@ function M.tabs(opts)
         ---@return boolean
         focus_index = function(i)
             return form_p ~= nil and form_p.focus_index(i)
+        end,
+    }
+end
+
+-- ─── transient ────────────────────────────────────────────────────────────────
+
+--- A Magit-style TRANSIENT popup: grouped SWITCH / OPTION / ACTION rows, each with a direct single-key
+--- hotkey, current values shown inline, a visibility LEVEL that hides advanced rows, and a footer of
+--- level/set/save/reset controls. It is the generic "toggle switches + set options + pick an action"
+--- shape — the DATA (what the rows are, their argv, their persisted defaults) belongs to the CALLER
+--- (e.g. lvim-git's transient engine); this preset owns only the RENDERING + interaction, exactly the
+--- split the `select`/`tabs` presets use. It reuses the typed-row `form` provider (nav / render / click)
+--- and the `surface` chassis, so it is centred, themed and cursor-managed like every other lvim-ui popup.
+---
+--- Each row is an ACTION row so activation is uniform (a switch toggles, an option edits/cycles, an
+--- action runs then closes) — the direct hotkey and `<CR>` on the focused row go through the SAME path.
+--- Rows above the current level are hidden but their hotkeys still fire (raising the level reveals them
+--- in the right state). Groups render as dim section titles with the rows beneath.
+---
+---@class UiTransientRow
+---@field kind    "switch"|"option"|"action"
+---@field key     string             -- the direct hotkey (also shown as a badge before the row)
+---@field label   string             -- the human description
+---@field level?  integer            -- visibility level (default 1 — always shown)
+---@field flag?   string             -- switch: the argv flag it toggles (informational)
+---@field arg?    string             -- option: the argv name it sets (informational)
+---@field value?  any                -- switch: boolean state; option: the current string value
+---@field choices? string[]          -- option: a fixed value set (cycled/picked instead of typed)
+---@field run?    fun()              -- action: execute the verb (the preset closes the popup first)
+---
+---@class UiTransientGroup
+---@field title? string              -- the group / column heading (e.g. "Arguments", "Actions")
+---@field rows   UiTransientRow[]
+---
+---@class UiTransientOpts
+---@field title      string
+---@field subtitle?  string|table|table[]
+---@field groups     UiTransientGroup[]
+---@field level?     integer          -- the current visible level (default = max_level)
+---@field min_level? integer          -- lowest selectable level (default 1)
+---@field max_level? integer          -- highest selectable level (default 7)
+---@field layout?    "float"|"cursor"|"bottom"
+---@field on_toggle? fun(row: UiTransientRow)  -- a switch was flipped (caller persists to its state)
+---@field on_option? fun(row: UiTransientRow)  -- an option value changed
+---@field on_level?  fun(level: integer)       -- the visible level changed (caller persists it session-wide)
+---@field on_set?    fun()            -- "set": persist the current values as this prefix's session default
+---@field on_save?   fun()            -- "save": write the current values to the on-disk defaults store
+---@field on_reset?  fun()            -- "reset": drop back to the saved/built-in defaults (caller mutates the
+---                                   --   row `value`s in place, then the popup re-renders)
+---@field callback?  fun(confirmed: boolean)   -- fired on close (true when an action ran, false on cancel)
+---@field origin?    integer          -- return focus HERE on close (a transient opened from another frame)
+---@field position?  string           -- explicit float position override (else derived from `layout`)
+---@field title_pos? string           -- border-title alignment ("left"|"center"|"right"; default center)
+---@field close_keys? string[]        -- keys that close the popup (default config.close_keys)
+---@field max_width?  number          -- auto-fit width cap (fraction ≤1 or column count)
+---@field max_height? number          -- auto-fit height cap (fraction ≤1 or row count)
+---@param opts UiTransientOpts
+---@return table handle  { close }
+function M.transient(opts)
+    opts = opts or {}
+    local groups = opts.groups or {}
+    local max_level = opts.max_level or 7
+    local min_level = opts.min_level or 1
+    local level = math.max(min_level, math.min(opts.level or max_level, max_level))
+    local done = false
+    ---@type fun(...): any
+    local cb = opts.callback or function() end
+
+    -- Every row across every group, flat — hotkeys are wired for ALL of them (a level-hidden row still
+    -- toggles), while only rows at/below the current `level` are rendered.
+    local all_rows = {}
+    for _, g in ipairs(groups) do
+        for _, r in ipairs(g.rows or {}) do
+            all_rows[#all_rows + 1] = r
+        end
+    end
+
+    local st -- the frame state (assigned by frame.open; reached by the deferred row/footer callbacks)
+    local form_p -- the typed-row form provider (built below)
+    local rebuild -- forward decl: re-derive + swap the visible rows (level change / reset)
+    local footer_spec -- forward decl: the level/set/save/reset footer (rebuilt on a level change)
+
+    --- The trailing value a row shows: a switch's flag when on, an option's value (or "unset").
+    ---@param r UiTransientRow
+    ---@return string?  suffix text, or nil for no suffix
+    ---@return boolean  whether the value is "active" (bright) vs absent (dim)
+    local function row_suffix(r)
+        if r.kind == "switch" then
+            if r.value then
+                return r.flag or "on", true
+            end
+            return "off", false
+        elseif r.kind == "option" then
+            local v = r.value
+            if v ~= nil and v ~= "" then
+                return tostring(v), true
+            end
+            return "unset", false
+        end
+        return nil, false
+    end
+
+    --- Turn one transient row into a form ACTION row: a key badge (icon), the label, and a value suffix,
+    --- coloured to reflect state (on/set = bright, off/unset = dim). Its `run` delegates to `activate`.
+    ---@param r UiTransientRow
+    ---@param activate fun(r: UiTransientRow)
+    ---@return Row
+    local function form_row(r, activate)
+        local suffix, active = row_suffix(r)
+        local bright = r.kind == "action" or active
+        return {
+            type = "action",
+            flat = true, -- no auto action glyph — the key badge is the row's lead
+            name = "row:" .. r.key,
+            icon = r.key,
+            icon_hl = "LvimUiHelpKey",
+            label = r.label,
+            text_hl = bright and "LvimUiPathName" or "LvimUiPathDim",
+            suffix = suffix,
+            suffix_hl = active and "LvimUiPathName" or "LvimUiPathDim",
+            run = function()
+                activate(r)
+            end,
+        }
+    end
+
+    --- Build the visible row set: for each group, a dim title (labeled spacer) + a blank between groups,
+    --- then its rows filtered to the current level. `activate` is threaded into each row's `run`.
+    ---@param activate fun(r: UiTransientRow)
+    ---@return Row[]
+    local function build_rows(activate)
+        local out = {}
+        for gi, g in ipairs(groups) do
+            local visible = {}
+            for _, r in ipairs(g.rows or {}) do
+                if (r.level or 1) <= level then
+                    visible[#visible + 1] = r
+                end
+            end
+            if #visible > 0 then
+                if gi > 1 and #out > 0 then
+                    out[#out + 1] = { type = "spacer_line" }
+                end
+                if g.title and g.title ~= "" then
+                    out[#out + 1] = { type = "spacer", label = g.title }
+                end
+                for _, r in ipairs(visible) do
+                    out[#out + 1] = form_row(r, activate)
+                end
+            end
+        end
+        return out
+    end
+
+    --- Activate a transient row: a switch toggles, an option cycles (choices) or is typed (string), an
+    --- action closes the popup then runs its verb. Switch/option changes re-render in place.
+    ---@param r UiTransientRow
+    local function activate(r)
+        if r.kind == "switch" then
+            r.value = not r.value
+            if opts.on_toggle then
+                opts.on_toggle(r)
+            end
+            if rebuild then
+                rebuild(true)
+            end
+        elseif r.kind == "option" then
+            if r.choices and #r.choices > 0 then
+                -- cycle to the next choice (empty → first → … → wrap back to unset)
+                local idx = 0
+                for i, c in ipairs(r.choices) do
+                    if c == r.value then
+                        idx = i
+                        break
+                    end
+                end
+                r.value = r.choices[idx + 1] -- nil past the end → unset (a clean "no value" cycle stop)
+                if opts.on_option then
+                    opts.on_option(r)
+                end
+                if rebuild then
+                    rebuild(true)
+                end
+            else
+                M.input({
+                    prompt = r.label,
+                    default = tostring(r.value or ""),
+                    callback = function(confirmed, value)
+                        if confirmed ~= true then
+                            return
+                        end
+                        r.value = value
+                        if opts.on_option then
+                            opts.on_option(r)
+                        end
+                        if rebuild then
+                            rebuild(true)
+                        end
+                    end,
+                })
+            end
+        elseif r.kind == "action" then
+            done = true
+            if st then
+                st.close()
+            end
+            vim.schedule(function()
+                if r.run then
+                    r.run()
+                end
+                cb(true)
+            end)
+        end
+    end
+
+    form_p = form.new({
+        rows = build_rows(activate),
+        pad = 2,
+    })
+
+    -- Re-derive the visible rows after a value/level change. `keep` restores the cursor onto the same row
+    -- (a toggle should not jump the cursor); a level change lands on the first row.
+    rebuild = function(keep)
+        if not form_p then
+            return
+        end
+        local focus = keep and form_p.cursor_name() or nil
+        form_p.set_rows(build_rows(activate))
+        if st and st.relayout then
+            st.relayout()
+        end
+        if focus then
+            vim.schedule(function()
+                form_p.focus_name(focus)
+            end)
+        end
+    end
+
+    --- Change the visible level by `delta`, clamped; re-render and tell the caller (it persists the level).
+    ---@param delta integer
+    local function bump_level(delta)
+        local nl = math.max(min_level, math.min(level + delta, max_level))
+        if nl == level then
+            return
+        end
+        level = nl
+        if opts.on_level then
+            opts.on_level(level)
+        end
+        rebuild(false)
+        if st and st.set_footer then
+            st.set_footer(footer_spec())
+        end
+    end
+
+    -- assigned to the forward decl above so bump_level can refresh the level indicator after a change
+    footer_spec = function()
+        return {
+            bars = {
+                {
+                    align = "center",
+                    items = {
+                        { key = "_/+", name = ("level %d/%d"):format(level, max_level), no_hotkey = true },
+                        { type = "separator", text = "●", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
+                        {
+                            key = "C-s",
+                            name = "set",
+                            no_hotkey = true,
+                            run = function()
+                                if opts.on_set then
+                                    opts.on_set()
+                                end
+                            end,
+                        },
+                        {
+                            key = "C-w",
+                            name = "save",
+                            no_hotkey = true,
+                            run = function()
+                                if opts.on_save then
+                                    opts.on_save()
+                                end
+                            end,
+                        },
+                        {
+                            key = "C-d",
+                            name = "reset",
+                            no_hotkey = true,
+                            run = function()
+                                if opts.on_reset then
+                                    opts.on_reset()
+                                end
+                                rebuild(true)
+                            end,
+                        },
+                        { type = "separator", text = "●", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
+                        {
+                            key = "q",
+                            name = "close",
+                            no_hotkey = true,
+                            run = function(s)
+                                s.close()
+                            end,
+                        },
+                    },
+                },
+            },
+        }
+    end
+
+    -- The frame keymaps: a direct hotkey per row (fires from anywhere in the popup), plus the
+    -- level/set/save/reset controls. Row hotkeys cover EVERY row (even level-hidden ones).
+    local keymaps = {}
+    for _, r in ipairs(all_rows) do
+        keymaps[#keymaps + 1] = {
+            key = r.key,
+            run = function()
+                activate(r)
+            end,
+        }
+    end
+    keymaps[#keymaps + 1] = {
+        key = "+",
+        run = function()
+            bump_level(1)
+        end,
+    }
+    -- level DOWN is `_` (not `-`): a switch infix key is `-x`, so a bare `-` mapping would shadow every
+    -- `-x` behind a `timeoutlen` wait. `_` and `+` are symmetric shift keys no infix uses.
+    keymaps[#keymaps + 1] = {
+        key = "_",
+        run = function()
+            bump_level(-1)
+        end,
+    }
+    keymaps[#keymaps + 1] = {
+        key = "<C-s>",
+        run = function()
+            if opts.on_set then
+                opts.on_set()
+            end
+        end,
+    }
+    keymaps[#keymaps + 1] = {
+        key = "<C-w>",
+        run = function()
+            if opts.on_save then
+                opts.on_save()
+            end
+        end,
+    }
+    keymaps[#keymaps + 1] = {
+        key = "<C-d>",
+        run = function()
+            if opts.on_reset then
+                opts.on_reset()
+            end
+            rebuild(true)
+        end,
+    }
+
+    local layout = opts.layout or "float"
+    st = frame.open({
+        origin = opts.origin,
+        mode = "float",
+        position = (layout == "cursor" and "cursor") or (layout == "bottom" and "bottom") or opts.position,
+        border = FRAME_BORDER,
+        title = opts.title or "Transient",
+        title_pos = opts.title_pos or "center",
+        panel_border = "none",
+        close_keys = opts.close_keys or config.close_keys,
+        keymaps = keymaps,
+        size = {
+            width = { auto = true, max = opts.max_width or float_geo().width or 0.7 },
+            height = { auto = true, max = opts.max_height or float_geo().height or 0.8 },
+        },
+        header = (function()
+            local bars = subtitle_bars(opts.subtitle)
+            return #bars > 0 and { bars = bars } or nil
+        end)(),
+        content = { blocks = { { id = "form", provider = form_p, border = CONTENT_BORDER } } },
+        footer = footer_spec(),
+        on_close = function()
+            if not done then
+                vim.schedule(function()
+                    cb(false)
+                end)
+            end
+        end,
+    })
+
+    return {
+        --- Close the popup programmatically (fires the close `callback` with false unless an action ran).
+        ---@return nil
+        close = function()
+            if st and st.close then
+                st.close()
+            end
         end,
     }
 end
