@@ -106,6 +106,10 @@ end)
 ---@field filetype? string              stamped on the panel buffer (drives the user's cursor `panel_ft`)
 ---@field cursorline? boolean           selection bar via cursorline (default true)
 ---@field hide_cursor? boolean          modal usage: hide the hardware cursor (chassis list-move + click seam)
+---@field double_click? boolean         a mouse click that ACTIVATES a row (expand a directory / hand a leaf to
+---                                     `on_activate`) must be a DOUBLE click; a SINGLE click then only SELECTS the
+---                                     row (default false — a single click activates). Ignored for `hide_cursor`
+---                                     modal panels, where a pick is always one click.
 ---@field scrollbar? boolean            right-edge thumb when the tree overflows the window (default FALSE — opt in
 ---                                     with `true`). When on, ONE extra right column is reserved for it on top of
 ---                                     `padding.right`, so the bar never sits on the content.
@@ -708,17 +712,43 @@ function M.new(opts)
     --- label under the pointer. Folding stays immediate (it never leaves the panel), and the row selection has
     --- already been moved by the caller — so the click still feels instant.
     ---@param line integer  1-based clicked buffer row
-    ---@param col0 integer  0-based byte column
-    local function click(line, col0)
+    ---@param col0 integer|nil  0-based byte column; nil = no chevron hit-test (a whole-row activate, e.g. a double click)
+    local function do_activate(line, col0)
         local e = state.rows[line]
         if not e then
             return
         end
-        if e.c0 and col0 >= e.c0 and col0 < e.c1 then
+        if col0 and e.c0 and col0 >= e.c0 and col0 < e.c1 then
             t.toggle(e.node.id) -- a fold toggle never leaves the panel — safe to run now
             return
         end
         mouse.defer_activation(expand_or_activate)
+    end
+
+    --- A panel row click, `count` = 1 (single) or 2 (double) from the GLOBAL mouse layer. With `double_click` a
+    --- single click ONLY selects (the mouse layer already parked the cursor on the row) and a DOUBLE click
+    --- activates; otherwise a single click activates and a double click toggles the fold. Driving the double off
+    --- the mouse layer's count (not a buffer-local `<2-LeftMouse>`) is what makes it RELIABLE — the panel is not
+    --- yet current when a fast second click lands, so a buffer-local double-click map would silently miss.
+    ---@param line integer  1-based clicked buffer row
+    ---@param col0 integer  0-based byte column
+    ---@param count? integer  click count (1 = single, 2 = double)
+    local function click(line, col0, count)
+        count = count or 1
+        if opts.double_click then
+            if count >= 2 then
+                do_activate(line, col0)
+            end
+            return -- a single click only selects the row
+        end
+        if count >= 2 then
+            local e = state.rows[line]
+            if e then
+                t.toggle(e.node.id) -- default mode: a double click toggles the fold
+            end
+            return
+        end
+        do_activate(line, col0)
     end
 
     -- ─── the surface content provider ──────────────────────────────────────────
@@ -778,30 +808,19 @@ function M.new(opts)
                 map(keys.collapse or "h", collapse_or_parent)
             end
             -- Mouse: the row-click is registered with the GLOBAL mouse layer (`lvim-utils.mouse`), NOT bound as a
-            -- buffer-local `<LeftMouse>`. A buffer-local map only fires when the panel is ALREADY current — but
-            -- the everyday case is clicking INTO the panel from the editor, where nvim runs its native click
-            -- instead (moving focus AND parking the cursor on the clicked column, which is what let
+            -- buffer-local `<LeftMouse>`/`<2-LeftMouse>`. A buffer-local map only fires when the panel is ALREADY
+            -- current — but the everyday case is clicking INTO the panel from the editor, where nvim runs its
+            -- native click instead (moving focus AND parking the cursor on the clicked column, which is what let
             -- word-highlighters paint the row's label). The global layer decides by the window under the pointer,
-            -- focuses the panel, parks the cursor at column 0, and calls this handler with the clicked (line,
-            -- col0) — so chevron hit-testing still works. Registered for EVERY tree panel (modal or not).
-            require("lvim-utils.mouse").register_click(pan.buf, function(line, col0)
+            -- focuses the panel, parks the cursor at column 0, and calls this handler with the clicked
+            -- (line, col0, pos, COUNT) — so chevron hit-testing AND a reliable DOUBLE click both work (a
+            -- buffer-local `<2-LeftMouse>` would miss the fast second click, before the deferred focus lands).
+            require("lvim-utils.mouse").register_click(pan.buf, function(line, col0, _pos, count)
                 if vim.o.mouse == "" then
                     return
                 end
-                click(line, col0)
+                click(line, col0, count)
             end)
-            if not t.provider.hide_cursor then
-                map("<2-LeftMouse>", function()
-                    local m = vim.fn.getmousepos()
-                    if m.winid ~= pan.win then
-                        return
-                    end
-                    local e = state.rows[m.line]
-                    if e then
-                        t.toggle(e.node.id)
-                    end
-                end)
-            end
             -- Keep the cursor off the header rows (the tree starts below them) + notify row moves.
             api.nvim_create_autocmd("CursorMoved", {
                 buffer = pan.buf,
