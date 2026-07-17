@@ -82,6 +82,11 @@ end
 ---@field title? string|table|false  -- border-title (a plain string, or a `{ icon?, text }` box spec; false hides it for M.info)
 ---@field items? any[]               -- select / multiselect items
 ---@field current_item? any          -- select: focus this item on open (e.g. the installed version)
+---@field at? { win: integer, row: integer, col: integer } -- input: ANCHOR the popup over this exact spot in
+---       `win`, in that window's 0-based text coordinates (an editor over a grid cell), instead of centring it
+---@field bare? boolean             -- input: NO title row and NO footer — the popup IS the field (one row). The
+---       shape a cell editor needs; `<CR>`/`<Esc>` still confirm/cancel, they just are not advertised in a
+---       footer that would dwarf the cell.
 ---@field mark_current? boolean      -- select: default true → the focused current_item also gets a "  (current)" suffix; false = focus only (caller owns the marker)
 ---@field tabs? table[]              -- tabs: { { label, icon?, rows, menu?, hl?, actions? } , … } — or PROVIDER tabs (every tab carries `provider`; see M.tabs)
 ---@field menu? boolean              -- tabs: render the rows as a navigable MENU (action rows stay a selectable BODY list, not footer buttons); per-tab via `tab.menu`
@@ -594,9 +599,23 @@ function M.input(opts)
     frame.open({
         origin = opts.origin, -- return focus HERE on close (a popup opened from another frame)
         mode = "float",
+        -- ANCHOR the input over an exact spot instead of centring it: `at = { win, row, col }` in that
+        -- window's own 0-based text coordinates. For an editor that must sit ON the value it edits (a grid
+        -- cell), where a centred popup — or `position = "cursor"`, which drops BELOW the caret — would cover
+        -- the very row being edited.
+        at = opts.at,
         -- No container border: the top " " row existed only to give a native border-title somewhere to sit,
         -- and the title is a CONTENT ROW now (see below). The frame's own `config.border` applies.
-        title = opts.title or opts.prompt or "Input",
+        -- A BARE input (`bare = true`) drops the title row AND the footer, so the popup IS the field: one row,
+        -- the width of the value. That is the only shape that can sit ON a grid cell — anchored via `at`, a
+        -- titled+footered popup would be 5 rows of chrome over a 1-row cell, and `at` would land the CONTAINER
+        -- on the cell while the field itself sat 2 rows lower, over the wrong data.
+        title = (not opts.bare) and (opts.title or opts.prompt or "Input") or false,
+        -- …and no air row either. `build_bands` adds the header's air UNCONDITIONALLY (the footer's is guarded
+        -- on having bands; the header's is not), so a bare popup with no title and no header still got one
+        -- blank row — which put the field one row BELOW its cell. Measured: header_h=1 from a single
+        -- `{ meta = "" }` band.
+        header_air = not opts.bare,
         -- The title is a CONTENT ROW (`title_line = "row"`, the frame's default), exactly like every other
         -- popup — NOT a native border-title. It is not a cosmetic choice: Neovim places a centred BORDER-title
         -- at `floor(free/2) + 1`, i.e. always one cell right of true centre (measured on a bare `-u NONE`
@@ -616,7 +635,7 @@ function M.input(opts)
                 },
             },
         },
-        footer = {
+        footer = (not opts.bare) and {
             bars = {
                 {
                     items = {
@@ -631,7 +650,7 @@ function M.input(opts)
                     },
                 },
             },
-        },
+        } or nil,
         on_close = function()
             if not confirmed then
                 vim.schedule(function()

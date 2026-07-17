@@ -1080,6 +1080,36 @@ local function compute_geom(state, place)
     local row, col
     if place then
         row, col = place.row, place.col
+    elseif cfg.at then
+        -- ANCHORED to an exact spot in a window: `at = { win, row, col }` in that window's 0-based text
+        -- coordinates (row/col as `nvim_win_get_cursor`/`winsaveview` speak them, NOT screen cells).
+        -- The reason it exists: an EDITOR over a cell — lvim-db's grid, where an input must sit ON the value
+        -- it edits, not centred over the screen. "cursor" is not that: it follows the caret and drops BELOW
+        -- it, so it covers the row you are editing.
+        -- Translated through `nvim_win_text_height`-free arithmetic on purpose: `win_get_position` + the
+        -- window's own scroll offsets is exact and needs no redraw to have happened yet.
+        local aw = cfg.at.win
+        if aw and api.nvim_win_is_valid(aw) then
+            local wpos = api.nvim_win_get_position(aw)
+            local view = api.nvim_win_call(aw, function()
+                return vim.fn.winsaveview()
+            end)
+            -- A winbar steals the window's first screen row from the text area.
+            local wb = (vim.wo[aw].winbar ~= "") and 1 or 0
+            -- MINUS the container's own insets (`ct`/`cl`): `row`/`col` place the float's OUTER edge, while
+            -- the caller means "put the CONTENT on this cell". Without this the content lands one row below
+            -- its cell — the border eats the difference — which for a cell editor means sitting over the
+            -- wrong row's data. Measured, not assumed: with a 1-row ring the field landed at 16 for a cell
+            -- at 14.
+            row = wpos[1] + wb + (cfg.at.row - (view.topline - 1)) - ct
+            col = wpos[2] + (cfg.at.col - (view.leftcol or 0)) - cl
+            -- Never let it hang off the screen: an anchored float is still a float, and a cell near the right
+            -- edge would otherwise open a window nvim rejects.
+            row = math.max(0, math.min(row, vim.o.lines - H - ct - cb - 1))
+            col = math.max(0, math.min(col, vim.o.columns - W - cl - cr))
+        else
+            row, col = util.calc_pos(H + ct + cb, W + cl + cr, "cursor")
+        end
     elseif cfg.position == "cursor" or cfg.position == "win" then
         row, col = util.calc_pos(H + ct + cb, W + cl + cr, cfg.position)
     elseif cfg.position == "bottom" or cfg.position == "top" then
