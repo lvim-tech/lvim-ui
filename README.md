@@ -48,7 +48,9 @@ local tree = ui.tree({ root = nodes }) -- shared tree content layer (see below)
 `ui.tabs` can additionally host a PREVIEW panel beside the tab content: pass `preview = <provider>` (a
 surface content provider, typically built on `require("lvim-ui.preview").new({ item = … })`) and an optional
 `preview_side = "right"|"left"|"above"|"below"`. The block plugs into the chassis preview machinery — `<Tab>`
-/ `<C-l>` move between the panels, `<C-e>` hides the preview, `<C-n>`/`<C-p>` rotate its side.
+/ `<C-l>` move between the panels, `<C-e>` hides the preview, `<C-n>`/`<C-p>` rotate its side, and
+`<C-d>`/`<C-u>` scroll it half a screen **without leaving the list** (the fzf-lua / Magit model — a preview
+panel hides its cursor, so this is the only way to read past its first screen without spending a `<Tab>`).
 
 The low-level chassis is `require("lvim-ui.surface")` (framed floating/docked windows) with
 `require("lvim-ui.button")` / `require("lvim-ui.bar")` for navigable button bars.

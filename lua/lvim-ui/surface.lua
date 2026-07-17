@@ -131,6 +131,10 @@ M.CONTENT_BORDER = config.content_border --[[@as string[] ]]
 -- is called right after a programmatic focus change so it applies without a one-frame flash.
 local FRAME_FT = "lvim-ui-frame"
 local cursor_registered = false
+-- The literal control codes `:normal!` needs for a half-screen scroll (`scroll_preview`). Written as escapes,
+-- not "<C-d>": `:normal!` takes no key NOTATION — it would run the letters n-o-r-m-a-l on the buffer.
+local CTRL_D = "\4"
+local CTRL_U = "\21"
 
 --- The currently-open cmdline / area-docked surface, if any. The msgarea/cmdline zone hosts ONE app at a time —
 --- opening a new area dock EVICTS the previous (a picker gives way to a shell, and back). Module-level (there is
@@ -233,6 +237,9 @@ local DEFAULT_KEYS = {
     preview_next = "<C-n>",
     preview_prev = "<C-p>",
     toggle_preview = "<C-e>", -- HIDE ↔ show the preview (no-op while the preview is `dynamic`)
+    -- SCROLL the preview while the LIST keeps the focus (the fzf-lua / Magit model) — see `scroll_preview`.
+    preview_scroll_down = "<C-d>", -- half a screen down
+    preview_scroll_up = "<C-u>", -- half a screen up
 }
 
 --- The RESOLVED value of a chassis key `id` — DEFAULT_KEYS overlaid by the GLOBAL `config.keys`. For a hosted
@@ -259,6 +266,11 @@ M.CORE_FOOTER = {
     sectors = { fields = { "sector_prev", "sector_next" }, name = "sectors", action = "sector_cycle" },
     panel = { fields = { "panel_toggle" }, name = "panel", action = "panel_toggle" },
     preview = { fields = { "preview_prev", "preview_next" }, name = "preview", action = "rotate_preview" },
+    scroll = {
+        fields = { "preview_scroll_up", "preview_scroll_down" },
+        name = "scroll preview",
+        action = "scroll_preview",
+    },
     select = { fields = { "menu_confirm" }, name = "select", action = "open" },
 }
 
@@ -2205,6 +2217,19 @@ local function set_keys(state)
                 state.toggle_preview()
             end
         end)
+        -- SCROLL the preview from here, WITHOUT giving it the focus. Bound through `map` (not around the
+        -- lock): that records them in `used`, so `lock_panel` leaves exactly these two Ctrl keys live and
+        -- keeps nopping every other stray scroll.
+        map(pan.buf, K.preview_scroll_down, function()
+            if state.scroll_preview then
+                state.scroll_preview(1)
+            end
+        end)
+        map(pan.buf, K.preview_scroll_up, function()
+            if state.scroll_preview then
+                state.scroll_preview(-1)
+            end
+        end)
         -- HIDE-CURSOR list movement: on a hide-cursor panel the native cursor keys are locked
         -- (lock_panel nops every unbound printable), so the CHASSIS moves the hidden cursor —
         -- cursorline is the selection (a simple `M.select` list, a help/ops list provider). A
@@ -2328,15 +2353,46 @@ local function set_keys(state)
     -- them on the PANELS ONLY: the container is where the BARS live, and a key that manipulates CONTENT (the
     -- calendar's `h`/`l` = previous/next day) must not fire while a bar is focused — there `h`/`l` belong to
     -- the bar's own button selection, and binding over them makes a focused bar unusable.
+    -- The MOVEMENT keys are NEVER surrendered to a consumer keymap. A frame-wide keymap is bound after the
+    -- provider's own keys (above) and so silently won — which turned `k` (up) into whatever the consumer keyed
+    -- `k`: in lvim-git's transients that was Checkout / Drop / Reset / Abort, and on the stash panel a stash
+    -- DROP. Navigating a list with `k` then rewrote the user's working tree with no confirmation (four stray
+    -- detached checkouts in one session, from nothing but cursor movement). Moving the cursor is the most basic
+    -- interaction a panel has: it must always mean movement, so the collision is resolved HERE, once, for every
+    -- consumer — rather than trusting each popup to avoid two letters. A colliding key is skipped and reported,
+    -- because a row that still ADVERTISES it (a transient renders `key` as its badge) is a lie the consumer
+    -- must fix at its own call site.
+    local nav_reserved = {}
+    for _, group in ipairs({ K.down, K.up, "<Down>", "<Up>" }) do
+        for _, l in ipairs(type(group) == "table" and group or { group }) do
+            nav_reserved[l] = true
+        end
+    end
     for _, km in ipairs(state.cfg.keymaps or {}) do
         local fn = function()
             km.run(state)
         end
-        for _, pan in ipairs(state.panels) do
-            map(pan.buf, km.key, fn)
+        local clashes = {}
+        for _, l in ipairs(type(km.key) == "table" and km.key or { km.key }) do
+            if nav_reserved[l] then
+                clashes[#clashes + 1] = l
+            end
         end
-        if km.scope ~= "panel" then
-            map(state.container_buf, km.key, fn)
+        if #clashes > 0 then
+            vim.notify(
+                ("lvim-ui: keymap %q shadows the navigation keys (%s) — not bound; re-key it"):format(
+                    table.concat(clashes, ", "),
+                    table.concat(vim.tbl_keys(nav_reserved), "/")
+                ),
+                vim.log.levels.WARN
+            )
+        else
+            for _, pan in ipairs(state.panels) do
+                map(pan.buf, km.key, fn)
+            end
+            if km.scope ~= "panel" then
+                map(state.container_buf, km.key, fn)
+            end
         end
     end
 
@@ -3010,6 +3066,33 @@ local function open_windows(state)
         state.preview_hidden = false -- rotating always un-hides
         apply_preview_side(state)
         refocus_list(state)
+    end
+    --- SCROLL the preview WITHOUT focusing it — the fzf-lua / Magit model, and the ONLY way to read past a
+    --- preview's first screen from the list. A preview panel is `hide_cursor`: it has no cursor to scroll
+    --- with, and `lock_panel` nops the native `<C-d>`/`<C-u>` on the list by design (a stray scroll must not
+    --- drift a fitted panel) — so without this the content below the fold was simply unreachable unless you
+    --- spent a `panel_toggle` (Tab) to move the focus there and another to come back.
+    --- Scrolls whichever window HOLDS the preview right now: the docked panel, or the `dynamic` peek float.
+    --- No-op while the preview is hidden, or when the surface has none.
+    ---@param dir integer  +1 half a screen down, -1 half a screen up
+    state.scroll_preview = function(dir)
+        local win
+        if state.preview_side == "dynamic" then
+            win = state.dyn and state.dyn.win
+        elseif not state.preview_hidden and state.preview_panel then
+            win = state.preview_panel.win
+        end
+        if not (win and api.nvim_win_is_valid(win)) then
+            return
+        end
+        -- `nvim_win_call` + the REAL `<C-d>`/`<C-u>`, rather than a hand-computed `winrestview` topline: the
+        -- native keys already clamp at both buffer ends and honour that window's own height / `scroll`, and
+        -- `win_call` fires no Win/BufEnter — so the cursor module never sees a focus change and the list keeps
+        -- the hardware cursor. Redraw explicitly: nothing else marks a non-current, non-focusable float dirty.
+        api.nvim_win_call(win, function()
+            vim.cmd("normal! " .. (dir > 0 and CTRL_D or CTRL_U))
+        end)
+        api.nvim__redraw({ win = win, flush = true })
     end
     --- Toggle the preview HIDDEN ↔ shown (the `hide` position). A no-op while `dynamic` (its peek owns the
     --- preview); only the docked sides hide. The last docked side returns on un-hide.

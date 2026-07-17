@@ -18,6 +18,35 @@ local api = vim.api
 
 local M = {}
 
+--- The chassis' configured MOVEMENT keys for one direction (`ui.keys.down` / `ui.keys.up`), plus that
+--- direction's arrow. Read off the live frame state instead of hardcoding "j"/"k" for two reasons: a user who
+--- rebinds the chassis nav keys gets the form moving on THEIR keys, and — the load-bearing one — the keys the
+--- form claims then match exactly the set `surface.set_keys` reserves from consumer keymaps, so the guard that
+--- stops an action key shadowing movement can never drift out of sync with what actually moves the cursor.
+--- Falls back to the historical j/k when there is no frame state (the docked path never runs `set_keys`).
+---@param st table?     the frame state (carries the resolved `keys`)
+---@param id string     "down" | "up"
+---@param arrow string  the arrow key for that direction
+---@return string[]
+local function nav_keys(st, id, arrow)
+    local k = st and st.keys and st.keys[id]
+    if k == nil then
+        k = id == "down" and "j" or "k"
+    end
+    local out = {}
+    local seen = {}
+    for _, lhs in ipairs(type(k) == "table" and k or { k }) do
+        if not seen[lhs] then
+            seen[lhs] = true
+            out[#out + 1] = lhs
+        end
+    end
+    if not seen[arrow] then
+        out[#out + 1] = arrow
+    end
+    return out
+end
+
 --- Create a form provider.
 ---@param opts { rows: Row[], on_change?: fun(row: Row), ico?: table, cursorline_hl?: string, pad?: integer, initial_row?: integer|string, on_move?: fun(row: Row?), on_cursor?: fun(), on_action_close?: fun(confirmed: boolean|nil, result: any) }
 ---       cursorline_hl: name a cursorline highlight group (e.g. a bg-only one) so the hover changes only the
@@ -439,7 +468,7 @@ function M.new(opts)
             end
             return lines, hls
         end,
-        --- Install the panel's keymaps and cursor autocmds: j/k navigation, ↵ activate, ←/→ cycle-or-bar-nav,
+        --- Install the panel's keymaps and cursor autocmds: movement (the chassis `keys.down`/`up` + arrows), ↵ activate, ←/→ cycle-or-bar-nav,
         --- ⌫ cycle-back, and toolbar click hit-testing. `map(lhs, fn)` binds keys on the panel; `p` is the
         --- panel handle (`.win` / `.buf`); `st` is the frame state passed through to activate.
         ---@param map fun(lhs: string|string[], fn: fun())
@@ -458,10 +487,10 @@ function M.new(opts)
                     vim.wo[p.win].cursorline = not (r0 ~= nil and r0.type == "bar")
                 end
             end)
-            map({ "j", "<Down>" }, function()
+            map(nav_keys(st, "down", "<Down>"), function()
                 move(1)
             end)
-            map({ "k", "<Up>" }, function()
+            map(nav_keys(st, "up", "<Up>"), function()
                 move(-1)
             end)
             map({ "<CR>" }, function()

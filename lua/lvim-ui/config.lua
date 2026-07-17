@@ -204,6 +204,12 @@ return {
         menu_next = { "l", "<Right>" },
         menu_confirm = { "<CR>", "<Space>" }, -- activate the focused button
         zone_escape = { "<C-k>", "<C-w>k" }, -- leave the message zone (blur back up) when focused in it
+        -- The PREVIEW keys, all live from the LIST (the preview never takes the focus for these):
+        preview_next = "<C-n>", -- rotate the preview's side: right → left → dynamic → …
+        preview_prev = "<C-p>", -- rotate the other way
+        toggle_preview = "<C-e>", -- hide ↔ show the preview (no-op while it is `dynamic`)
+        preview_scroll_down = "<C-d>", -- scroll the preview half a screen down — the list keeps the cursor
+        preview_scroll_up = "<C-u>", -- …and up
 
         tabs = {
             next = "l",
