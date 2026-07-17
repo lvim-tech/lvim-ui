@@ -3599,7 +3599,15 @@ local function open_windows(state)
             -- means the user tried to LEAVE — and a trapping modal forbids that: bounce focus straight back so
             -- the popup cannot be escaped by a `<C-w>` jump OR a mouse click on another field. Scheduled (never
             -- synchronous inside WinEnter) and guarded by `_trapping` so it can't recurse.
-            if trap and not state._trapping then
+            -- ONLY within the frame's OWN tabpage. A trap means "you cannot leave this popup for the editor
+            -- BEHIND it" — and that editor lives in the frame's tabpage. Another tabpage is a different screen
+            -- on which the popup is not even drawn, so bouncing focus out of it traps nothing and merely fights
+            -- whoever opened it: an action that opens a view in a new tab (lvim-git's `View diff`, which the
+            -- status popup launches) landed there and was yanked straight back, so the diff appeared to never
+            -- open — it was open all along, one tabpage away, with the popup stealing the focus back three
+            -- times in a row.
+            local same_tab = api.nvim_win_get_tabpage(w) == state.tabpage
+            if trap and same_tab and not state._trapping then
                 local ok_cfg, wc = pcall(api.nvim_win_get_config, w)
                 if ok_cfg and wc.relative == "" then
                     local back = (state._trap_return and api.nvim_win_is_valid(state._trap_return))
@@ -4677,6 +4685,9 @@ function M.open(cfg)
         -- "the current window" is whatever the teardown happened to leave behind — the editor. The chain then
         -- dumps the user out of the panel they were working in.
         origin = cfg.origin or api.nvim_get_current_win(),
+        -- The tabpage the frame lives on. The focus TRAP is scoped to it (see the WinEnter hook): a modal
+        -- popup owns its own screen, never another tab's.
+        tabpage = api.nvim_get_current_tabpage(),
         panels = panels,
         header_bands = hbands,
         footer_bands = (function()
