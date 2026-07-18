@@ -614,8 +614,11 @@ local function title_chunks(title)
         return { string.rep(" ", f) .. content .. string.rep(" ", b), util.resolve_hl(bs.hl or default_hl) }
     end
     -- titles render UPPERCASE everywhere (the canon — matches the ui.bar title bars); the icon glyph is left
+    -- A plain-string title gets a SYMMETRIC 2-cell gutter, matching the ui.bar title prefix (`  TITLE  `),
+    -- so a border-title popup and a title-counter panel read identically. (An icon+text title keeps the
+    -- tighter 1/1 boxes below, so the icon does not float away from its text.)
     if type(title) == "string" then
-        return title ~= "" and { box(title:upper(), {}, "LvimUiPeekTitle") } or nil
+        return title ~= "" and { box(title:upper(), { padding = { 2, 2 } }, "LvimUiPeekTitle") } or nil
     end
     if type(title) ~= "table" then
         return nil

@@ -70,7 +70,8 @@ function M.render(opts)
     -- (e.g. a "Messages"/"Diagnostics" title with the buttons/counter aligned to the right). Prepended at the
     -- very end, with all item/chevron offsets shifted by it (in BYTES). the bar TITLE is shown UPPERCASE
     -- everywhere (the canon for these title bars — message zone, picker, …).
-    local prefix = (opts.title and opts.title ~= "") and (" " .. tostring(opts.title):upper() .. "  ") or ""
+    -- Symmetric gutter: 2 cells before the title and 2 after (a bare 1-before/2-after read lopsided).
+    local prefix = (opts.title and opts.title ~= "") and ("  " .. tostring(opts.title):upper() .. "  ") or ""
     local pb = #prefix -- BYTE length — the offset the item/chevron/span byte ranges are shifted by below
     if pb > 0 then
         -- Reserve the prefix's DISPLAY width (NOT its byte length) from the layout width: a title with a
