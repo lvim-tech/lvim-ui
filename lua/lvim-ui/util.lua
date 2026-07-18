@@ -59,6 +59,17 @@ function M.dw(s)
     return api.nvim_strwidth(tostring(s or ""))
 end
 
+--- The canonical CASING for a framed-window TITLE's text — the SINGLE source of truth every title path
+--- (border-title, winbar, split chrome row, row/counter title, ui.bar title prefix) funnels through, so
+--- ALL titles read identically. Stray surrounding whitespace is trimmed FIRST (a consumer that pre-pads
+--- its title string can't reintroduce the double gutter the central 1-cell padding now owns), then the
+--- text is UPPERCASED. Applies to the TEXT only — an icon glyph is kept verbatim by the caller.
+---@param s any
+---@return string
+function M.title_case(s)
+    return (vim.trim(tostring(s or ""))):upper()
+end
+
 --- Clip `s` to at most `width` DISPLAY cells, appending an ellipsis ("…") when it is clipped. Multibyte /
 --- wide-char aware (splits on grapheme boundaries and counts display width). Used so a row whose content is
 --- wider than its panel never spills past the border — its full-line background would otherwise overflow.

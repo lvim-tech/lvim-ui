@@ -613,12 +613,11 @@ local function title_chunks(title)
         end
         return { string.rep(" ", f) .. content .. string.rep(" ", b), util.resolve_hl(bs.hl or default_hl) }
     end
-    -- titles render UPPERCASE everywhere (the canon — matches the ui.bar title bars); the icon glyph is left
-    -- A plain-string title gets a SYMMETRIC 2-cell gutter, matching the ui.bar title prefix (`  TITLE  `),
-    -- so a border-title popup and a title-counter panel read identically. (An icon+text title keeps the
-    -- tighter 1/1 boxes below, so the icon does not float away from its text.)
+    -- titles render UPPERCASE everywhere (the canon — via util.title_case, which also trims stray padding);
+    -- the icon glyph is left verbatim. A plain-string title gets a SYMMETRIC 1-cell gutter, matching the
+    -- ui.bar title prefix (` TITLE `), so a border-title popup and a title-counter panel read identically.
     if type(title) == "string" then
-        return title ~= "" and { box(title:upper(), { padding = { 2, 2 } }, "LvimUiPeekTitle") } or nil
+        return title ~= "" and { box(util.title_case(title), { padding = { 1, 1 } }, "LvimUiPeekTitle") } or nil
     end
     if type(title) ~= "table" then
         return nil
@@ -626,7 +625,7 @@ local function title_chunks(title)
     local st = title.style or {}
     local chunks = {}
     local ic = box(title.icon, st.icon or {}, "LvimUiPeekTitleIcon")
-    local tc = box(title.text and tostring(title.text):upper() or nil, st.text or {}, "LvimUiPeekTitle")
+    local tc = box(title.text and util.title_case(title.text) or nil, st.text or {}, "LvimUiPeekTitle")
     if ic then
         chunks[#chunks + 1] = ic
     end
@@ -636,17 +635,19 @@ local function title_chunks(title)
     return #chunks > 0 and chunks or nil
 end
 
---- Flatten a `title` box (or string) to a plain string (icon + text) — for a winbar / split content row.
+--- Flatten a `title` box (or string) to a plain string (icon + UPPERCASE text) — for a winbar / split
+--- content row. The text is run through util.title_case (the title casing canon) so a native side panel's
+--- winbar title matches every other framed-window title; the icon glyph is kept verbatim.
 ---@param title table|string|nil
 ---@return string
 local function title_text(title)
     if type(title) == "string" then
-        return title
+        return util.title_case(title)
     end
     if type(title) ~= "table" then
         return ""
     end
-    return ((title.icon and title.icon .. " ") or "") .. (title.text or "")
+    return ((title.icon and title.icon .. " ") or "") .. (title.text and util.title_case(title.text) or "")
 end
 
 -- ─── title / counter placement (the single title path) ────────────────────────
@@ -1474,7 +1475,7 @@ local function render_chrome(state, L)
             end
             -- CENTER / RIGHT: place the (uppercased) title manually. Leading run is spaces (1 byte = 1 cell), so
             -- the title's byte offset == its display column; the counter is appended flush-right after it.
-            local title = tostring(band.text or ""):upper()
+            local title = util.title_case(band.text)
             local tw = util.dw(title)
             local cw = cnt ~= "" and util.dw(cnt) or 0
             local tcol = (tpos == "center") and math.max(0, math.floor((W - tw) / 2))
@@ -4810,12 +4811,12 @@ function M.open(cfg)
     local hbands = build_bands(cfg.header, false, header_air)
     if cfg.mode == "split" then
         local t = cfg.title
-        -- UPPERCASE the title text (the canon), keep the icon glyph
+        -- UPPERCASE the title text (the canon, via util.title_case), keep the icon glyph
         local s
         if type(t) == "table" then
-            s = (t.icon and t.icon .. " " or "") .. (t.text and tostring(t.text):upper() or "")
+            s = (t.icon and t.icon .. " " or "") .. (t.text and util.title_case(t.text) or "")
         else
-            s = t and tostring(t):upper() or ""
+            s = t and util.title_case(t) or ""
         end
         if s ~= "" then
             table.insert(hbands, 1, { meta = s, hl = "LvimUiPeekTitle" })

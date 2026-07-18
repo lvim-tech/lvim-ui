@@ -19,6 +19,7 @@
 ---@module "lvim-ui.bar"
 
 local button = require("lvim-ui.button")
+local util = require("lvim-ui.util")
 
 local M = {}
 
@@ -69,9 +70,9 @@ function M.render(opts)
     -- An optional LEFT-anchored TITLE prefix (always visible): the items then lay out in the width AFTER it
     -- (e.g. a "Messages"/"Diagnostics" title with the buttons/counter aligned to the right). Prepended at the
     -- very end, with all item/chevron offsets shifted by it (in BYTES). the bar TITLE is shown UPPERCASE
-    -- everywhere (the canon for these title bars — message zone, picker, …).
-    -- Symmetric gutter: 2 cells before the title and 2 after (a bare 1-before/2-after read lopsided).
-    local prefix = (opts.title and opts.title ~= "") and ("  " .. tostring(opts.title):upper() .. "  ") or ""
+    -- everywhere (the canon — via util.title_case, which also trims stray padding).
+    -- Symmetric gutter: 1 cell before the title and 1 after (the single title-padding canon).
+    local prefix = (opts.title and opts.title ~= "") and (" " .. util.title_case(opts.title) .. " ") or ""
     local pb = #prefix -- BYTE length — the offset the item/chevron/span byte ranges are shifted by below
     if pb > 0 then
         -- Reserve the prefix's DISPLAY width (NOT its byte length) from the layout width: a title with a
