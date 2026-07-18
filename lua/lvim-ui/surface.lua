@@ -2847,6 +2847,11 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     -- edge and the gutter disappears.
     local normal = (pan.provider and pan.provider.normal_hl) or "LvimUiPeekNormal"
     local fbord = "LvimUiPeekBorder"
+    -- A provider that CONCEALS characters (the masked input's `•` bullets) names the group the conceal char
+    -- wears via `conceal_hl`. The concealed replacement is ALWAYS drawn with the window's `Conceal` group (never
+    -- the match's group), and the theme's default `Conceal` is deliberately faint — so remap it here to the
+    -- provider's group (the input's own `LvimUiInput`), or the bullets are all but invisible.
+    local conceal = (pan.provider and pan.provider.conceal_hl) and (",Conceal:" .. pan.provider.conceal_hl) or ""
     if pan.provider and pan.provider.cursorline then
         -- The cursorline group: a provider-named one (a string), else the NEUTRAL bg-only `LvimUiCursorLine`
         -- so the focused row is marked by a background wash ALONE — a rich menu's per-segment fg colours
@@ -2854,12 +2859,12 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
         -- (which overrides fg) is opt-IN, requested by name only by the simple pickers (`M.select` /
         -- `M.multiselect`), whose rows carry no colours of their own.
         local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline) or "LvimUiCursorLine"
-        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s,CursorLine:%s"):format(normal, fbord, cl)
+        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s,CursorLine:%s"):format(normal, fbord, cl) .. conceal
         vim.wo[pan.win].cursorline = true
     else
         -- FloatBorder → LvimUiPeekBorder so a content-panel ring (config.content_border) paints with the same
         -- bg/fg as the container ring, reading as one nested frame instead of the unthemed default FloatBorder.
-        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s"):format(normal, fbord)
+        vim.wo[pan.win].winhighlight = ("Normal:%s,FloatBorder:%s"):format(normal, fbord) .. conceal
     end
     pan.refresh = function() -- a provider re-renders its own panel after a state change (toggle, …)
         -- find the panel's CURRENT index by identity — `state.panels` is reordered/shrunk by the preview
@@ -4287,8 +4292,11 @@ local function open_native_split(state)
     -- opaque SIDEBAR background (matching neo-tree) instead of the transparency-following float bg.
     local normal_hl = cfg.normal_hl or "LvimUiPeekNormal"
     if pan.provider and pan.provider.cursorline then
-        -- A native docked panel (the outline) uses the NEUTRAL cursorline, not the popup-list yellow.
-        vim.wo[pan.win].winhighlight = "Normal:" .. normal_hl .. ",CursorLine:LvimUiCursorLine"
+        -- A native docked panel uses the NEUTRAL cursorline by default (the outline), but honours a
+        -- provider-NAMED group (a string) just like the float path — so a panel whose own washes swallow the
+        -- faint neutral tint can name a stronger one (e.g. lvim-db's grid → LvimDbCursorLine).
+        local cl = (type(pan.provider.cursorline) == "string" and pan.provider.cursorline) or "LvimUiCursorLine"
+        vim.wo[pan.win].winhighlight = "Normal:" .. normal_hl .. ",CursorLine:" .. cl
         vim.wo[pan.win].cursorline = true
     else
         vim.wo[pan.win].winhighlight = "Normal:" .. normal_hl

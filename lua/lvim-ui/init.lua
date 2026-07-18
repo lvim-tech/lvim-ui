@@ -574,6 +574,9 @@ function M.input(opts)
         -- accent / text colour / tint strength all come from the shared spec (lvim-utils config.ui:
         -- `accent.input`, `tint.input`) — never named here.
         normal_hl = "LvimUiInput",
+        -- When masking, the `•` bullets are the window's Conceal char; the theme's Conceal is faint, so tell the
+        -- surface to remap Conceal to the input's own group (visible on the field). Absent for a normal input.
+        conceal_hl = opts.mask and "LvimUiInput" or nil,
         size = function()
             -- The content's own width — the side gutters are the block's border, added around this by the frame.
             -- The TITLE needs room of its own: it is drawn on the container's border row as ` <title> `, so the
