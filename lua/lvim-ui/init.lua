@@ -1613,6 +1613,53 @@ function M.tabs(opts)
         focus_index = function(i)
             return form_p ~= nil and form_p.focus_index(i)
         end,
+        --- Switch to the NEXT tab, wrapping past the last back to the first (provider + form mode).
+        ---@return nil
+        next_tab = function()
+            if set_active_tab and #tabset > 0 then
+                set_active_tab(st, active % #tabset + 1)
+            end
+        end,
+        --- Switch to the PREVIOUS tab, wrapping past the first to the last.
+        ---@return nil
+        prev_tab = function()
+            if set_active_tab and #tabset > 0 then
+                set_active_tab(st, (active - 2) % #tabset + 1)
+            end
+        end,
+        --- Switch to the tab whose `name` matches (the by-name analogue of `tab_selector`). This is what a
+        --- provider-tab consumer (a dock) needs to FOCUS a section on demand — the form-only `focus(name)`
+        --- above moves a ROW and is a no-op in provider mode.
+        ---@param name string
+        ---@return boolean  whether a tab matched
+        select_tab = function(name)
+            if not set_active_tab then
+                return false
+            end
+            for i, t in ipairs(tabset) do
+                if t.name == name then
+                    set_active_tab(st, i)
+                    return true
+                end
+            end
+            return false
+        end,
+        --- Repaint the ACTIVE tab's content in place. In provider mode this re-renders the shared content
+        --- panel (so a consumer streaming into a text/render tab — a REPL, a console — shows new lines live
+        --- without a tab switch); in form mode it defers to `render()`. The provider-tab analogue of the
+        --- form's `render()`, and the CANONICAL seam for "repaint my visible tab" (no borrowing the `keys`
+        --- hook to capture the panel).
+        ---@return nil
+        refresh_content = function()
+            if form_p then
+                form_p.rerender()
+                return
+            end
+            local p = content_pan()
+            if p and p.refresh then
+                p.refresh()
+            end
+        end,
     }
 end
 
@@ -2014,21 +2061,6 @@ function M.transient(opts)
     }
 end
 
---- The keymap CHEATSHEET — the canonical `?` window of the whole set, in ONE place.
----
---- Every plugin used to hand-roll this: the same row builder, the same striping, the same hidden cursor, and
---- its own `nvim_set_hl` calls with literal tints. Five copies, and four of them padded the row boxes by BYTE
---- length while measuring the columns in display CELLS — so any row carrying a multi-byte glyph (an `…`, a
---- Nerd icon) came up short and the right edge went ragged. It is a component now: the rows, the colours
---- (from the shared spec — `accent.help` + the tint scale) and the window all live here.
----
---- Each row is a KEY box (a fixed, aligned column) + a DESCRIPTION box filling the rest of the width. Rows
---- stripe odd/even by accent; the row under the (hidden) cursor raises its description to the key's tint, so
---- the active row reads as one solid block and follows the cursor with no hardware caret.
----
----@param opts { title?: string, items: table[], close_keys?: string[], width?: number, height?: number, footer?: table }
----   items: `{ { key, description }, … }` — already resolved to the plugin's LIVE keys (unmapped rows omitted)
----   footer: a full frame footer spec, for a consumer whose action bar is config-driven; else a `q close` bar
 --- Word-wrap `text` to `w` display cells (never bytes) — a word longer than `w` is hard-broken so a single
 --- long token can never overflow the column. Returns the list of wrapped lines (at least one, possibly "").
 ---@param text string
@@ -2078,6 +2110,21 @@ local function help_wrap(text, w)
     return (#out > 0) and out or { "" }
 end
 
+--- The keymap CHEATSHEET — the canonical `?` window of the whole set, in ONE place.
+---
+--- Every plugin used to hand-roll this: the same row builder, the same striping, the same hidden cursor, and
+--- its own `nvim_set_hl` calls with literal tints. Five copies, and four of them padded the row boxes by BYTE
+--- length while measuring the columns in display CELLS — so any row carrying a multi-byte glyph (an `…`, a
+--- Nerd icon) came up short and the right edge went ragged. It is a component now: the rows, the colours
+--- (from the shared spec — `accent.help` + the tint scale) and the window all live here.
+---
+--- Each row is a KEY box (a fixed, aligned column) + a DESCRIPTION box filling the rest of the width. Rows
+--- stripe odd/even by accent; the row under the (hidden) cursor raises its description to the key's tint, so
+--- the active row reads as one solid block and follows the cursor with no hardware caret.
+---
+---@param opts { title?: string, items: table[], close_keys?: string[], width?: number, height?: number, footer?: table }
+---   items: `{ { key, description }, … }` — already resolved to the plugin's LIVE keys (unmapped rows omitted)
+---   footer: a full frame footer spec, for a consumer whose action bar is config-driven; else a `q close` bar
 function M.help(opts)
     opts = opts or {}
     local items = opts.items or {}
