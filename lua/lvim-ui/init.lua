@@ -87,6 +87,9 @@ end
 ---@field bare? boolean             -- input: NO title row and NO footer — the popup IS the field (one row). The
 ---       shape a cell editor needs; `<CR>`/`<Esc>` still confirm/cancel, they just are not advertised in a
 ---       footer that would dwarf the cell.
+---@field mask? boolean             -- input: MASK the value — each character renders as `•` (conceal), so a
+---       master password / secret is never shown on screen. The real text lives only in the scratch buffer
+---       (read on confirm, wiped on close); `callback(true, value)` still receives the true text.
 ---@field mark_current? boolean      -- select: default true → the focused current_item also gets a "  (current)" suffix; false = focus only (caller owns the marker)
 ---@field tabs? table[]              -- tabs: { { label, icon?, rows, menu?, hl?, actions? } , … } — or PROVIDER tabs (every tab carries `provider`; see M.tabs)
 ---@field menu? boolean              -- tabs: render the rows as a navigable MENU (action rows stay a selectable BODY list, not footer buttons); per-tab via `tab.menu`
@@ -542,6 +545,14 @@ function M.input(opts)
     -- of where the value starts, and every consumer has to strip it back off on confirm.
     local PAD = 2
 
+    --- Wipe the value out of the scratch buffer — a masked field must not leave the plaintext sitting in a
+    --- buffer between confirm/close and the frame's `:bwipeout`. A no-op for a normal input.
+    local function scrub()
+        if opts.mask and buf and vim.api.nvim_buf_is_valid(buf) then
+            pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, { "" })
+        end
+    end
+
     --- @param st table
     local function confirm(st)
         confirmed = true
@@ -550,6 +561,7 @@ function M.input(opts)
             val = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
         end
         val = val:match("^%s*(.-)%s*$") or "" -- the value IS the line now; only stray edge whitespace goes
+        scrub()
         st.close()
         vim.schedule(function()
             cb(true, val)
@@ -575,6 +587,16 @@ function M.input(opts)
         end,
         keys = function(map, p, st)
             buf = p.buf
+            -- MASK: conceal every character with `•` so a password is never on screen. The real text stays in
+            -- the buffer (read on confirm); only the DISPLAY is hidden. `concealcursor = "nvic"` keeps the
+            -- current line concealed while inserting (without the `i`, typing would reveal the value). A per-
+            -- character `matchadd` on `.` conceals each cell, re-evaluated every redraw, so it tracks typing
+            -- with no TextChangedI plumbing.
+            if opts.mask and p.win and vim.api.nvim_win_is_valid(p.win) then
+                vim.wo[p.win].conceallevel = 2
+                vim.wo[p.win].concealcursor = "nvic"
+                pcall(vim.fn.matchadd, "Conceal", ".", 10, -1, { window = p.win, conceal = "•" })
+            end
             -- Land the cursor at the END of the value. Column 0 is the value's first character, so backspace
             -- there has nothing left to delete — the gutter is the block's border, not text.
             vim.schedule(function()
@@ -652,6 +674,7 @@ function M.input(opts)
             },
         } or nil,
         on_close = function()
+            scrub() -- a masked cancel (Esc) also must not leave the plaintext in the buffer
             if not confirmed then
                 vim.schedule(function()
                     cb(false)
