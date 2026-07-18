@@ -1094,15 +1094,26 @@ local function compute_geom(state, place)
             local view = api.nvim_win_call(aw, function()
                 return vim.fn.winsaveview()
             end)
-            -- A winbar steals the window's first screen row from the text area.
+            -- PLUS the ANCHOR's own chrome: `nvim_win_get_position` reports a bordered float's OUTER
+            -- top-left — its ring is drawn INSIDE that — and a winbar then takes the first row after the
+            -- ring. Both have to be stepped over to reach the anchor's text area, or every `at.row` lands
+            -- that many rows high. MEASURED on lvim-db's grid (a docked panel with a 1-row blank ring and a
+            -- sticky-header winbar): the window reports row 31 while its text row 0 is at screen row 33 —
+            -- 31 + 1 ring + 1 winbar. Missing the ring put a cell editor on the HEADER instead of the cell.
+            local at_t, at_l = 0, 0
+            local acfg = api.nvim_win_get_config(aw)
+            if acfg.relative and acfg.relative ~= "" and acfg.border then
+                local t, _, _, l = util.insets(util.resolve_border(acfg.border))
+                at_t, at_l = t, l
+            end
             local wb = (vim.wo[aw].winbar ~= "") and 1 or 0
             -- MINUS the container's own insets (`ct`/`cl`): `row`/`col` place the float's OUTER edge, while
             -- the caller means "put the CONTENT on this cell". Without this the content lands one row below
             -- its cell — the border eats the difference — which for a cell editor means sitting over the
             -- wrong row's data. Measured, not assumed: with a 1-row ring the field landed at 16 for a cell
             -- at 14.
-            row = wpos[1] + wb + (cfg.at.row - (view.topline - 1)) - ct
-            col = wpos[2] + (cfg.at.col - (view.leftcol or 0)) - cl
+            row = wpos[1] + at_t + wb + (cfg.at.row - (view.topline - 1)) - ct
+            col = wpos[2] + at_l + (cfg.at.col - (view.leftcol or 0)) - cl
             -- Never let it hang off the screen: an anchored float is still a float, and a cell near the right
             -- edge would otherwise open a window nvim rejects.
             row = math.max(0, math.min(row, vim.o.lines - H - ct - cb - 1))
@@ -2203,6 +2214,88 @@ local function set_keys(state)
         -- fit-to-window float the wheel must not pull the view. `<LeftMouse>` stays live (rows/bar buttons).
         nop_mouse(buf, u, true)
     end
+    -- A READ-ONLY panel WITH a visible cursor (a data grid the user scrolls but must not type into). It is a
+    -- MODAL viewer: the cursor MOTIONS work (j/k/gg/G/<C-d>/search…) and so do the panel's own bound keys,
+    -- but EVERYTHING else is inert. Two things leak in otherwise, both reported: builtin EDIT operators
+    -- (`o`/`dd`/`p`/`s`) raise `E21: Cannot make changes` on the `nomodifiable` buffer, AND the user's GLOBAL
+    -- plain-key mappings fire — a global `-` (a file explorer) opened a directory listing OVER the grid.
+    -- `lock_panel` (the hide-cursor lock) would kill the motions too, so it cannot be used; this nops the
+    -- whole printable + <C-letter> + arrow range EXCEPT the MOTION whitelist and the keys already bound (a
+    -- chord prefix / a user chord / a panel action). Builtin motions are not mappings, so nopping mapped
+    -- keys elsewhere would not stop `-`; sweeping the range and keeping only motions does. The buffer is
+    -- marked `_readonly` so `map_hotkeys` restores a REMOVED footer hotkey to `<Nop>` (not a bare del) — else
+    -- a key that is a footer button only in the OTHER mode (save/cancel while editing, paging while browsing)
+    -- would fall back to a builtin edit the moment the footer swaps.
+    --
+    -- MOTIONS kept: the cursor moves and scrolls a data grid needs. `.`/`u`/`&` are deliberately NOT here
+    -- (they edit); `-`/`+`/`=` are dropped (line motions j/k cover them) so a global `-` mapping cannot fire.
+    local RO_KEEP = {}
+    for _, k in ipairs({
+        "h",
+        "j",
+        "k",
+        "l",
+        "w",
+        "b",
+        "e",
+        "W",
+        "B",
+        "E",
+        "0",
+        "$",
+        "^",
+        "G",
+        "H",
+        "M",
+        "L",
+        "f",
+        "F",
+        "t",
+        "T",
+        ";",
+        ",",
+        "{",
+        "}",
+        "(",
+        ")",
+        "%",
+        "|",
+        "g",
+        "z",
+        "n",
+        "N",
+        "/",
+        "?",
+        "*",
+        "#",
+    }) do
+        RO_KEEP[k] = true
+    end
+    local function lock_readonly(buf)
+        local u = used[buf] or {}
+        local own_prefix = chord_prefixes(u)
+        local function nop(lhs)
+            if u[lhs] or chords[lhs:lower()] or own_prefix[lhs] or RO_KEEP[lhs] then
+                return
+            end
+            pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
+        end
+        for i = 33, 126 do
+            local ch = string.char(i)
+            if ch ~= ":" then -- keep the cmdline escape hatch
+                nop(ch)
+            end
+        end
+        -- Ctrl-letter combos, EXCEPT the scroll/paging ones a viewer needs (<C-d>/<C-u>/<C-f>/<C-b>/<C-e>/
+        -- <C-y>). The nav chords (<C-n/p> columns, <C-h/j/k/l> region nav) are already in `used`, so skipped.
+        local keep_ctrl = { d = true, u = true, f = true, b = true, e = true, y = true }
+        for i = string.byte("a"), string.byte("z") do
+            local ch = string.char(i)
+            if not keep_ctrl[ch] then
+                nop("<C-" .. ch .. ">")
+            end
+        end
+    end
     for _, pan in ipairs(state.panels) do
         -- Panels: vertical sector cycling (header·center·footer) AND horizontal panel nav (left/right);
         -- the panel keys are ONLY here (not on the container), so `<C-l>`/`<C-h>` are inert in a bar.
@@ -2462,6 +2555,10 @@ local function set_keys(state)
             if not light and prov.hide_cursor and not prov.editable and vim.bo[pan.buf].buftype ~= "terminal" then
                 lock_panel(pan.buf)
                 state._locked[pan.buf] = true -- map_hotkeys restores <Nop> (not a bare del) on a stale hotkey here
+            elseif not light and prov.readonly and not prov.hide_cursor then
+                -- a cursor-visible read-only grid: keep the motions, nop everything else (see lock_readonly)
+                lock_readonly(pan.buf)
+                state._readonly[pan.buf] = true
             end
         end
         -- the container is the chrome buffer (bar-menu mode), never cursor-navigated — h/l move a Sel stripe (re-
@@ -2500,6 +2597,34 @@ local function panel_content_rect(pl)
     return pl.row + t, pl.col + l, pl.width, pl.height
 end
 
+--- The window config placing a center panel at layout rect `pl` (absolute editor coords).
+---
+--- For a DOCKED split the panel is anchored to the CONTAINER (`relative = "win"`), so nvim moves it WITH the
+--- container whenever something shifts the container WITHOUT firing a resize. That case is real and was the
+--- "chrome rises, grid stays at the bottom" gap: the msgarea shows a message by growing `cmdheight`, which
+--- pushes a docked-`below` split UP without changing its (winfixheight) height — so `WinResized` never fires,
+--- `relayout` never runs, and an editor-anchored float is stranded at its old row while the chrome moved up.
+--- MEASURED: cmdheight 0→3 moved the container row 31→28 while an editor-relative content float stayed at 33.
+--- Anchoring to the container removes the dependence on catching that event at all.
+---
+--- An UNDOCKED (float) surface keeps `relative = "editor"`: its container is itself an editor-relative float
+--- that `relayout` already moves the panels with, and a picker's preview rotation relies on editor coords.
+---@param state table
+---@param pl table
+---@return table
+local function panel_win_config(state, pl)
+    local cfg = { width = pl.width, height = pl.height, border = pl.border }
+    if state.cfg.mode == "split" and state.container_win and api.nvim_win_is_valid(state.container_win) then
+        local cpos = api.nvim_win_get_position(state.container_win)
+        cfg.relative, cfg.win = "win", state.container_win
+        cfg.row, cfg.col = pl.row - cpos[1], pl.col - cpos[2]
+    else
+        cfg.relative = "editor"
+        cfg.row, cfg.col = pl.row, pl.col
+    end
+    return cfg
+end
+
 --- Move the center panels + editable input bands to a computed layout `L`, then repaint the chrome. NO
 --- container/cmdheight side effects — the caller has already placed the container — so it is safe to call on
 --- a host-zone reflow (`reposition`) without re-reserving (which would loop).
@@ -2510,14 +2635,7 @@ local function place_panels(state, L)
     for i, pan in ipairs(state.panels) do
         local pl = L.panels[i]
         if pan.win and api.nvim_win_is_valid(pan.win) then
-            pcall(api.nvim_win_set_config, pan.win, {
-                relative = "editor",
-                width = pl.width,
-                height = pl.height,
-                row = pl.row,
-                col = pl.col,
-                border = pl.border,
-            })
+            pcall(api.nvim_win_set_config, pan.win, panel_win_config(state, pl))
         end
     end
     -- Re-fit the editable input bands so they follow the moved panels / header (else a resize leaves the
@@ -2695,17 +2813,18 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     -- Floor the dimensions at 1: a TIGHT layout (a tall preview in a nearly-full editor / dashboard) can compute
     -- a 0-or-negative panel height/width, which `nvim_open_win` rejects with `E36: Not enough room`. A 1-cell
     -- floor keeps the panel openable (squished, not crashed) in that pathological case; a no-op when it fits.
-    pan.win = api.nvim_open_win(pan.buf, false, {
-        relative = "editor",
+    -- `panel_win_config` anchors a docked panel to the container (relative=win) so it follows it — see there.
+    local wc = panel_win_config(state, {
         width = math.max(1, pl.width or 1),
         height = math.max(1, pl.height or 1),
         row = pl.row,
         col = pl.col,
         border = pl.border,
-        style = "minimal",
-        focusable = not docked,
-        zindex = not docked and (state.zindex + 1) or nil,
     })
+    wc.style = "minimal"
+    wc.focusable = not docked
+    wc.zindex = not docked and (state.zindex + 1) or nil
+    pan.win = api.nvim_open_win(pan.buf, false, wc)
     -- Mark EVERY panel window (float-mode too, not just docked) as managed UI — same as the container — so a
     -- generic "close all floating windows" / "focus next float" helper skips it instead of tearing the panel
     -- out from under the frame.
@@ -3479,7 +3598,7 @@ local function open_windows(state)
         end
         for key in pairs(state._hotkey_mapped[buf] or {}) do
             if not live[key] then
-                if state._locked[buf] then
+                if state._locked[buf] or state._readonly[buf] then
                     pcall(vim.keymap.set, "n", key, "<Nop>", { buffer = buf, nowait = true, silent = true })
                 else
                     pcall(vim.keymap.del, "n", key, { buffer = buf })
@@ -4730,6 +4849,10 @@ function M.open(cfg)
         _hotkey_targets = {},
         _hotkey_mapped = {},
         _locked = {},
+        -- cursor-visible READ-ONLY panels (a data grid): map_hotkeys restores a REMOVED footer hotkey to
+        -- <Nop> here too (like _locked), so a save/paging key never falls back to the builtin edit on the
+        -- nomodifiable buffer when the footer swaps between browse and edit.
+        _readonly = {},
     }
     state.close = function()
         close(state)
