@@ -70,6 +70,37 @@ function M.title_case(s)
     return (vim.trim(tostring(s or ""))):upper()
 end
 
+--- Clip `s` to at most `w` DISPLAY columns, never mid-codepoint, with NO ellipsis. ONE forward pass over the
+--- UTF-8 codepoint boundaries (linear) — unlike a shrink-one-char-at-a-time loop that re-measures the whole
+--- prefix on every step (quadratic on a wide row). Returns `s` untouched when it already fits, "" when nothing
+--- does. The shared single-pass core behind both `truncate` (adds an ellipsis) and tree.clip (no ellipsis).
+---@param s any
+---@param w integer
+---@return string
+function M.clip(s, w)
+    s = tostring(s or "")
+    if w <= 0 then
+        return ""
+    end
+    if M.dw(s) <= w then
+        return s
+    end
+    local out, acc = {}, 0
+    local starts = vim.str_utf_pos(s)
+    for i = 1, #starts do
+        local a = starts[i]
+        local b = starts[i + 1] and (starts[i + 1] - 1) or #s
+        local ch = s:sub(a, b)
+        local cw = M.dw(ch)
+        if acc + cw > w then
+            break
+        end
+        out[#out + 1] = ch
+        acc = acc + cw
+    end
+    return table.concat(out)
+end
+
 --- Clip `s` to at most `width` DISPLAY cells, appending an ellipsis ("…") when it is clipped. Multibyte /
 --- wide-char aware (splits on grapheme boundaries and counts display width). Used so a row whose content is
 --- wider than its panel never spills past the border — its full-line background would otherwise overflow.
@@ -84,29 +115,13 @@ function M.truncate(s, width)
     if M.dw(s) <= width then
         return s
     end
-    local ok_cfg, cfg = pcall(require, "lvim-ui.config")
-    local ell = (ok_cfg and cfg.text and cfg.text.ellipsis) or "…"
+    local ell = (config.text and config.text.ellipsis) or "…"
     local budget = width - M.dw(ell) -- reserve room for the ellipsis
     if budget <= 0 then
         return M.dw(ell) <= width and ell or ""
     end
-    -- Walk the UTF-8 codepoint boundaries natively (one pass, no `vim.fn.split` regex + no per-char VimL
-    -- round-trip): `str_utf_pos` gives the 1-based byte offset of every codepoint start; slice each and
-    -- accumulate display width until the budget is spent.
-    local out, w = {}, 0
-    local starts = vim.str_utf_pos(s)
-    for i = 1, #starts do
-        local a = starts[i]
-        local b = starts[i + 1] and (starts[i + 1] - 1) or #s
-        local ch = s:sub(a, b)
-        local cw = M.dw(ch)
-        if w + cw > budget then
-            break
-        end
-        out[#out + 1] = ch
-        w = w + cw
-    end
-    return table.concat(out) .. ell
+    -- The single-pass codepoint walk lives in `M.clip`; truncate just appends the ellipsis to the clipped body.
+    return M.clip(s, budget) .. ell
 end
 
 --- Return s centered within width columns, padded with spaces on both sides (clipped if it overflows).
@@ -185,12 +200,11 @@ end
 -- ─── border helpers ───────────────────────────────────────────────────────────
 
 -- The border PRESETS live in the config (`lvim-ui.config.borders`) — a user may retune or add one, and every
--- surface that names a preset follows. Read lazily (the config requires util, so a top-level require here
--- would be circular) and cached per call.
+-- surface that names a preset follows. `config` is the module-level require; it is a plain table that requires
+-- NOTHING of its own, so reading it here is never circular.
 ---@return table<string, string[]>
 local function border_presets()
-    local ok, cfg = pcall(require, "lvim-ui.config")
-    return (ok and cfg.borders) or {}
+    return config.borders or {}
 end
 
 M.BORDERS = setmetatable({}, {
@@ -221,11 +235,10 @@ end
 --- The shared FRAME border, resolved from the single `config.border` (default "none") to the 8-element
 --- form `nvim_open_win` accepts. ONE source for every plugin that opens its own float (lvim-keys-helper,
 --- lvim-qf-loc, lvim-shell) instead of each re-resolving the config — so the frame border is consistent
---- everywhere. Standalone callers (lvim-utils absent) keep their own fallback by guarding the require.
+--- everywhere.
 ---@return table  an 8-element resolved border
 function M.frame_border()
-    local ok, conf = pcall(require, "lvim-ui.config")
-    local b = (ok and conf and conf.border) or "none"
+    local b = config.border or "none"
     return M.resolve_border(b)
 end
 
@@ -322,13 +335,36 @@ end
 
 -- ─── position helper ──────────────────────────────────────────────────────────
 
+--- Rows the STATUSLINE occupies at the bottom of the editor — the single source both the menu (docs dock +
+--- direction geometry) and the hint bar use so a float never overlaps or floats above the statusline row.
+--- `laststatus` 2/3 always reserve one row; `laststatus == 1` reserves one ONLY when a SECOND non-floating
+--- window exists to show it (a single-window `laststatus=1` layout has NO statusline); 0 otherwise.
+---@param win? integer  the window to EXCLUDE when looking for a "second" window (default: current)
+---@return integer
+function M.status_rows(win)
+    local ls = vim.o.laststatus
+    if ls >= 2 then
+        return 1
+    end
+    if ls == 1 then
+        win = (win and api.nvim_win_is_valid(win)) and win or api.nvim_get_current_win()
+        for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
+            if w ~= win and api.nvim_win_get_config(w).relative == "" then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
 --- Compute the (row, col) for nvim_open_win (both 0-based, relative = "editor").
 --- "editor" → centered in the full Neovim editor area.
 --- "win"    → centered within the current window.
 --- "cursor" → below the cursor when space allows, otherwise above.
+--- "bottom" → anchored just above the cmdline, horizontally centred.
 ---@param height   integer
 ---@param width    integer
----@param position "editor"|"win"|"cursor"|nil
+---@param position "editor"|"win"|"cursor"|"bottom"|nil
 ---@return integer row, integer col
 function M.calc_pos(height, width, position)
     if position == "cursor" then

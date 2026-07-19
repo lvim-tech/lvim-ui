@@ -151,6 +151,10 @@ local area_current = nil
 -- when to release it. One at a time; module-level.
 ---@type table?
 local active_surface_bd = nil
+-- Surfaces that opened while `active_surface_bd` was already held and therefore SKIPPED their own backdrop. When
+-- the owner closes it promotes one of these to own a fresh veil (so a still-open dock does not lose its dim).
+---@type table<table, true>
+local bd_skippers = setmetatable({}, { __mode = "k" })
 
 --- Rebuild the surface's live backdrop namespace from the CURRENT global highlights, so windows veiled behind an
 --- open surface track a LIVE theme change (e.g. the colorscheme picker preview) instead of freezing on the
@@ -821,8 +825,11 @@ local function publish_overlay_title(state)
         text = tostring(title)
     end
     local cur, tot = resolve_count(cfg)
+    -- Uppercase the TEXT here (the single central title-casing authority — every framed title funnels through
+    -- `util.title_case`), so a docked/statusline overlay title reads identically to a border-title. The hud
+    -- overlay itself stays case-neutral; the icon glyph is kept verbatim.
     pcall(function()
-        require("lvim-hud.overlay").set({ title = text, icon = icon, current = cur, total = tot })
+        require("lvim-hud.overlay").set({ title = util.title_case(text), icon = icon, current = cur, total = tot })
     end)
 end
 
@@ -2939,6 +2946,8 @@ local function open_backdrop(state)
     -- the first's veil when this one closes. Mirrors the auto-zindex "stacked above a frame ⇒ skip our own".
     if active_surface_bd and active_surface_bd ~= state then
         state.skip_backdrop = true
+        -- Remember it so the owner can hand the veil off to this surface when it closes first (see close()).
+        bd_skippers[state] = true
         return
     end
     local bd = resolve_backdrop(state.cfg)
@@ -3098,7 +3107,20 @@ local function open_windows(state)
     -- focused (insert) while open, so there is no mode clash with the chassis keymaps.
     do
         local _, _, _, cl = util.insets(L.cbord)
-        for bi, band in ipairs(state.header_bands) do
+        -- Row index MUST count only row-taking (non-scoped) bands, exactly as `place_panels` does — a scoped
+        -- input band overlays its panel and takes no header row, so a raw `bi` would put a following unscoped
+        -- band one row too low until the first relayout. Mirror the `hbi` walk + scope_id resolution here.
+        local hbi = 0
+        for _, band in ipairs(state.header_bands) do
+            local scope = band.scope_panel
+            if band.scope_id then
+                for i, pan in ipairs(state.panels) do
+                    if pan.id == band.scope_id then
+                        scope = i
+                        break
+                    end
+                end
+            end
             if band.input then
                 band.buf = api.nvim_create_buf(false, true)
                 vim.bo[band.buf].bufhidden = "hide"
@@ -3110,10 +3132,10 @@ local function open_windows(state)
                 -- row — a finder whose prompt sits over its LIST, level with the other panels' titles, not on
                 -- a separate full-width header row. Otherwise it spans the full container width on its header
                 -- row.
-                local iw, icol, irow = L.W, L.col + cl, L.row + L.ct + (bi - 1)
-                if band.scope_panel and L.panels[band.scope_panel] then
+                local iw, icol, irow = L.W, L.col + cl, L.row + L.ct + hbi
+                if scope and L.panels[scope] then
                     -- inside the LIST panel's border (shared helper), not on the border row
-                    local prow, pcol, pwidth = panel_content_rect(L.panels[band.scope_panel])
+                    local prow, pcol, pwidth = panel_content_rect(L.panels[scope])
                     iw, icol, irow = pwidth, pcol, prow
                 end
                 band.win = api.nvim_open_win(band.buf, false, {
@@ -3162,6 +3184,9 @@ local function open_windows(state)
                     pcall(band.keys, band.buf, state)
                 end
             end
+            if not scope then
+                hbi = hbi + 1
+            end
         end
         -- Enter the FIRST input band on open (insert), unless the consumer opted out of focusing.
         if state.cfg.enter ~= false then
@@ -3176,6 +3201,7 @@ local function open_windows(state)
     end
 
     -- Wire interaction: the sector list, the keymaps, and the initial focus (the first center panel).
+    -- NOTE: adding a `state.<name> = function` below requires a matching DEFERRED_METHODS entry (cmdwin stub).
     state.refresh_chrome = function() -- re-render the header/footer bands (e.g. after a tab switch)
         render_chrome(state, state._geom)
     end
@@ -4156,6 +4182,12 @@ local function close(state)
         pcall(api.nvim_buf_delete, state._footer_buf, { force = true })
     end
     dyn_disable(state) -- close the dynamic peek float + its autocmds, if armed
+    -- The dynamic peek's own scratch buffer (created once per surface, `bufhidden=hide`) survives dyn_hide (which
+    -- only drops the window). Delete it here or every docked picker that rotated into the peek leaks one buffer.
+    if state.dyn and state.dyn.buf and api.nvim_buf_is_valid(state.dyn.buf) then
+        pcall(api.nvim_buf_delete, state.dyn.buf, { force = true })
+    end
+    state.dyn = nil
     -- Let providers release any external state before we drop the windows (the frame's own scratch panel
     -- buffers are deleted below, taking their keymaps/extmarks with them, but a provider may hold things
     -- outside them — e.g. autocommands, or keymaps on a real buffer).
@@ -4200,11 +4232,29 @@ local function close(state)
     if state.container_win and api.nvim_win_is_valid(state.container_win) then
         pcall(api.nvim_win_close, state.container_win, true)
     end
+    -- The chrome container's scratch buffer (created in open_windows / open_native_split, `bufhidden=hide`) is NOT
+    -- dropped by closing its window — delete it explicitly or every frame open/close leaks one hidden buffer plus
+    -- its full buffer-local <Nop> keymap sweep and extmarks. Split mode shares this exact buffer + path.
+    if state.container_buf and api.nvim_buf_is_valid(state.container_buf) then
+        pcall(api.nvim_buf_delete, state.container_buf, { force = true })
+    end
     -- Backdrop: tear down this surface's veil through the shared applier (restores every window it muted to its
     -- original namespace and resumes the colorscheme dim manager) and release the surface's ownership tracker.
     require("lvim-utils.dim").clear_backdrop(tostring(state))
+    bd_skippers[state] = nil
     if active_surface_bd == state then
         active_surface_bd = nil
+        -- Ownership transfer: another surface may still be open having SKIPPED its own backdrop because this one
+        -- owned the shared veil (two coexisting docks). Releasing the veil here would un-dim the editor behind a
+        -- surface that is still up, so promote one live skipper to own a fresh backdrop in this one's place.
+        for other in pairs(bd_skippers) do
+            if other ~= state and not other._closed then
+                bd_skippers[other] = nil
+                other.skip_backdrop = false
+                open_backdrop(other)
+                break
+            end
+        end
     end
     if state.base_cmdheight ~= nil then -- a `cmdline` surface grew cmdheight; restore the user's value
         vim.o.cmdheight = state.base_cmdheight
@@ -4457,6 +4507,7 @@ local function open_native_split(state)
         place_footer()
     end
     --- Rebuild + repaint the native footer bar (live counts / labels).
+    -- NOTE: adding a `state.<name> = function` here requires a matching DEFERRED_METHODS entry (cmdwin stub).
     ---@param spec table
     state.set_footer = function(spec)
         state.cfg.footer = spec
@@ -4619,21 +4670,29 @@ local zone_hooks = nil
 -- The public METHOD names a `state` handle exposes (every `state.<name> = function` below). Used by the
 -- cmdwin-deferred stub so it can answer a method call with a no-op while leaving DATA fields nil.
 ---@type table<string, true>
+-- Adding a `state.<name> = function` in open_windows / open_native_split REQUIRES a matching entry here, or a
+-- frame deferred from the command-line window returns a stub that crashes when that method is called.
 local DEFERRED_METHODS = {
     close = true,
+    enter = true,
     focus_block = true,
     focus_panel = true,
     focus_sector = true,
     map_hotkeys = true,
     panel = true,
+    panel_toggle = true,
     refresh_chrome = true,
     relayout = true,
+    remap_hotkeys = true,
     reposition = true,
     rotate_preview = true,
+    scroll_preview = true,
     sector = true,
+    sector_count = true,
     set_counter = true,
     set_footer = true,
     set_header = true,
+    set_prompt = true,
     set_title = true,
     toggle_header = true,
     toggle_preview = true,
@@ -4666,6 +4725,12 @@ function M.open(cfg)
             end,
         })
     end
+    -- Shallow-copy the caller's table before normalizing: M.open writes MANY top-level keys (`mode`, `size`,
+    -- `close_keys`, `border`, `title_line`, and the host bind closure that captures THIS open's `state`). A
+    -- consumer that reuses one opts table across opens would otherwise re-enter with a stale normalized shape
+    -- (the auto-host gate sees a non-nil `cfg.host` and rebinds the OLD state). Only top-level keys are written,
+    -- so a shallow copy suffices; nested tables (items, panels, keys) stay shared by reference as intended.
+    cfg = vim.tbl_extend("force", {}, cfg)
     cfg.mode = cfg.mode or "float"
     -- Shared title / counter placement: per-open override < `config` default < the hardcoded fallback.
     -- `title_line` ("row" | "statusline" | "border") places the title: a CONTENT row at the top (the canon —
@@ -4874,9 +4939,14 @@ function M.open(cfg)
     -- shell, and back). EXCLUDE `host == false` — that is the msgarea zone's OWN surface, which merely GROWS
     -- cmdheight for the zone and must never be treated as an occupant (evicting it would tear down the zone). The
     -- picker also self-replaces finder→finder via its own registry; this is the cross-consumer safety net.
+    local previous_area
     if cfg.position == "cmdline" and cfg.host ~= false then
         if area_current and area_current ~= state and not area_current._closed and area_current.close then
-            pcall(area_current.close)
+            -- Do NOT close the evicted dock YET. Closing its (focused) window here makes Neovim fall focus to the
+            -- editor for a beat BEFORE the new panel's windows exist — the editor flips inactive→active→inactive
+            -- and its focus-dependent highlights (Normal/NormalNC, the winbar) repaint = the subtle tremble on
+            -- the way back from search. Remember it; close it AFTER open_windows, when the new panel owns focus.
+            previous_area = area_current
         end
         area_current = state
     end
@@ -4906,8 +4976,17 @@ function M.open(cfg)
     end
     -- A `native` split is a REAL window (not a float over a container) — for a navigable persistent side
     -- panel; everything else (modal float, docked-modal peek) uses the float chassis.
+    -- Close the dock this one EVICTED (if any) only AFTER its own windows exist and hold focus, so closing the
+    -- old (now-unfocused) window steals no focus — no editor inactive→active→inactive flip, no tremble. `close()`'s
+    -- `if area_current == state` guard leaves the NEW area_current (now `state`) intact. Inside the handoff when
+    -- hosted, so the create + the background close coalesce into the one open frame.
+    local function close_previous_area()
+        if previous_area and not previous_area._closed and previous_area.close then
+            pcall(previous_area.close)
+        end
+    end
     if cfg.mode == "split" and cfg.native then
-        open_native_split(state)
+        open_native_split(state) -- native split is not an area dock; previous_area is nil here
     elseif cfg.host then
         -- HOSTED in the zone: open inside the zone's reflow-coalescing handoff, so the whole open — the segment
         -- reserve, the cmdheight growth it causes, every window placement — paints as ONE frame. Without it the
@@ -4917,9 +4996,11 @@ function M.open(cfg)
         -- open in a handoff just nests (the zone counts the batch depth).
         M.zone_handoff(function()
             open_windows(state)
+            close_previous_area()
         end)
     else
         open_windows(state)
+        close_previous_area()
     end
     return state
 end

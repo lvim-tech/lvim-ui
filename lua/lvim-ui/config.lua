@@ -15,11 +15,13 @@
 ---@field group_border       string[]             Common ring around the data panels as a group (8-element; false to disable)
 ---@field separator_hl       string               Highlight group for the inter-panel divider
 ---@field chevrons           table                Overflow-chevron glyphs ({ left, right }) a bar shows when its buttons don't all fit
+---@field peek_enter         boolean              Whether the dynamic peek float is an enterable/focusable stop (default false)
 ---@field disable_completion boolean              Disable all completion sources (native, nvim-cmp, blink.cmp) for input popups
 ---@field position           string               Popup anchor ("editor")
 ---@field max_items          integer              Maximum list rows shown before scrolling (content-fit list cap)
 ---@field filetype           string               Filetype set on the popup buffer
 ---@field close_keys         string[]             Keys that close the popup
+---@field trap_focus         boolean              Global default for whether a surface traps focus (a surface may override per open)
 ---@field markview           boolean              Enable markview rendering in the popup
 ---@field icon_provider       string               File-icon provider for previews: "auto"|"lvim"|"devicons"|"mini" (via lvim-utils.icons)
 ---@field icon_color_mode     string?              lvim-icons colour mode for the preview icon: "theme"|"brand"|"theme_brand"; nil = the lvim-icons default
@@ -31,6 +33,10 @@
 ---@field labels             table                Footer-legend action labels (navigate / confirm / cancel / …)
 ---@field keys               table                Popup + chassis navigation keys (vim notation; strings or lists)
 ---@field tree               LvimUiTreeConfig     Defaults for the shared `lvim-ui.tree` primitive (padding / scrollbar)
+---@field menu               table                Defaults for the menu primitive (candidate list): `colors` (selection/match/detail/thumb/track) + group `separator`
+---@field borders            table<string, string[]>  Named 8-element border presets a surface may name (`border = "rounded"`)
+---@field text               table                Text chrome: `ellipsis` (what a clipped row ends with; its width is reserved before clipping)
+---@field form_hints         table                The form's key-hint legend glyphs (`activate`/`next`/`prev`) + per-row-type `labels`
 ---@field hint               LvimUiHintConfig     Defaults for the shared `lvim-ui.hint` bar (a sub-mode's live key row)
 
 ---@class LvimUiHintConfig

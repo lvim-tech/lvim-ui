@@ -18,6 +18,12 @@
 -- expanded directories and re-decorates live (git badges), so the tree never caches what the provider
 -- can answer; an eager consumer (an LSP symbol tree) just passes the tables.
 --
+-- LIFECYCLE — a handle is SINGLE-SURFACE: once its surface closes, `provider.on_close` sets
+-- `state.destroyed = true` PERMANENTLY (render/refresh early-return, the decoration providers + scrollbar
+-- augroup are torn down). Re-plugging the SAME handle into a new surface renders nothing. Every consumer
+-- builds a FRESH handle per open (lvim-files, lvim-dap-view rebuild `state.trees`); do the same — never
+-- cache a handle across opens.
+--
 ---@module "lvim-ui.tree"
 
 local config = require("lvim-ui.config")
@@ -156,6 +162,9 @@ end
 function M.new(opts)
     opts = opts or {}
     seq = seq + 1
+    -- Capture THIS handle's sequence — the module-level `seq` advances as later handles are created, so any
+    -- reference from a deferred callback (e.g. on_close) must use the captured value, not the live counter.
+    local myseq = seq
     local ns = api.nvim_create_namespace("lvim_ui_tree_" .. seq) -- content spans + virt text
     local ns_mark = api.nvim_create_namespace("lvim_ui_tree_mark_" .. seq) -- the follow-mark row
     local ns_bar = api.nvim_create_namespace("lvim_ui_tree_bar_" .. seq) -- scrollbar decoration provider
@@ -288,23 +297,12 @@ function M.new(opts)
     -- ─── rendering ─────────────────────────────────────────────────────────────
 
     --- Clip `s` to at most `w` DISPLAY columns (never mid-codepoint). Used so a long row cannot run under the
-    --- scrollbar / into the right padding. Returns `s` untouched when it already fits.
+    --- scrollbar / into the right padding. The single-pass (linear) core lives in `util.clip`.
     ---@param s string
     ---@param w integer
     ---@return string
     local function clip(s, w)
-        if w <= 0 or util.dw(s) <= w then
-            return s
-        end
-        local n = vim.fn.strchars(s)
-        while n > 0 do
-            local cut = vim.fn.strcharpart(s, 0, n)
-            if util.dw(cut) <= w then
-                return cut
-            end
-            n = n - 1
-        end
-        return ""
+        return util.clip(s, w)
     end
 
     --- Build the visible rows: lines, hl spans, virt texts and the row registry. Each line is
@@ -502,8 +500,9 @@ function M.new(opts)
         -- ONE panel window + buffer, and each tree keeps its own decoration provider / autocmds bound to
         -- it — so a hidden tree repainting on a redraw, a scroll or a width change would write its rows
         -- over whatever tab the user is actually looking at. (That is how every tab of the debug dock came
-        -- to show the same content.) `update` stamps ownership as a tab becomes active; a tree that no
-        -- longer owns the panel simply does not draw.
+        -- to show the same content.) The tabs delegate stamps `pan.tree_owner` with the ACTIVE tab's provider
+        -- as it becomes active (a TREE tab's `update` re-stamps it to its own `state`); so when a NON-tree
+        -- text tab is active the owner is that tab's provider, not this tree — and this tree does not draw.
         if pan.tree_owner ~= nil and pan.tree_owner ~= state then
             return
         end
@@ -610,7 +609,7 @@ function M.new(opts)
         -- repaint of the panel on every scroll makes every visible row go through `on_line` again, so the thumb
         -- is always re-derived from the CURRENT topline.
         api.nvim_create_autocmd("WinScrolled", {
-            group = api.nvim_create_augroup("LvimUiTreeBar" .. seq, { clear = true }),
+            group = api.nvim_create_augroup("LvimUiTreeBar" .. myseq, { clear = true }),
             callback = function()
                 local pan = state.pan
                 if state.destroyed or not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
@@ -863,6 +862,14 @@ function M.new(opts)
         on_close = function(pan)
             state.destroyed = true
             pcall(api.nvim_set_decoration_provider, ns_bar, {})
+            -- The width-watcher decoration provider (ns_width) and — with a scrollbar — the WinScrolled augroup
+            -- are per-handle and NEVER torn down otherwise: every open/close would leave one more `on_win` firing
+            -- for EVERY window on EVERY redraw (a no-op via `state.destroyed`, but real accumulating overhead)
+            -- plus a dead global autocmd. Kill them here alongside ns_bar.
+            pcall(api.nvim_set_decoration_provider, ns_width, {})
+            if scrollbar then
+                pcall(api.nvim_del_augroup_by_name, "LvimUiTreeBar" .. myseq)
+            end
             if opts.on_close then
                 pcall(opts.on_close, pan)
             end

@@ -20,6 +20,7 @@
 local uibar = require("lvim-ui.bar")
 local surface = require("lvim-ui.surface")
 local config = require("lvim-ui.config")
+local util = require("lvim-ui.util")
 
 local api = vim.api
 
@@ -45,7 +46,9 @@ local NS = api.nvim_create_namespace("lvim_ui_hint")
 --- hint replaces nothing — it floats over the top line of the editor's bottom chrome-free area.
 ---@return integer row, integer width
 local function geometry()
-    local status = (vim.o.laststatus > 0) and 1 or 0
+    -- The single shared authority (also used by the menu): `laststatus == 1` with only ONE window shows NO
+    -- statusline, so reserving a row there would float the hint one row above the bottom.
+    local status = util.status_rows()
     local row = math.max(0, vim.o.lines - vim.o.cmdheight - status - 1)
     return row, math.max(1, vim.o.columns)
 end

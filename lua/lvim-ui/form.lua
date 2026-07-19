@@ -154,6 +154,12 @@ function M.new(opts)
         if not (row and (row.type == "select" or row.type == "segmented")) then
             return false
         end
+        -- A DISABLED row is inert: its value must never change (the struck-through row promises exactly that).
+        -- `activate` already guards this, but the direct <Left>/<Right>/<BS> maps call cycle_value straight, so
+        -- the guard has to live here too. Return false (not true) so the key still falls through to bar_nav.
+        if is_disabled(row) then
+            return false
+        end
         local list = row.options or {}
         if #list == 0 then
             return false
@@ -443,7 +449,11 @@ function M.new(opts)
                                 hls[#hls + 1] = { i - 1, ls, c1, r.text_hl }
                             end
                         end
-                        if r.suffix and r.suffix ~= "" and r.suffix_hl then
+                        -- The suffix anchor (`lead + #disp - #suffix`) assumes the row rendered as the FULL
+                        -- `disp`. When lpad truncated it (row wider than the panel) the suffix was clipped away or
+                        -- shifted, so that offset paints the wrong cells — skip the span entirely; the suffix is
+                        -- not fully visible anyway.
+                        if r.suffix and r.suffix ~= "" and r.suffix_hl and (util.dw(disp) + lead) <= width then
                             local suffix_start = math.max(lead, math.min(#lines[i], lead + #disp - #r.suffix))
                             hls[#hls + 1] =
                                 { i - 1, suffix_start, math.min(#lines[i], suffix_start + #r.suffix), r.suffix_hl }

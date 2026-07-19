@@ -117,6 +117,7 @@ end
 ---@field area_height? integer       -- tabs (docked): the docked content row budget (default AREA_CAP); scrolls past it
 ---@field slot? table                -- tabs: a per-open ANCHORED geometry override `{ height?, height_auto?, width?, width_auto?, backdrop? }` (a consumer's `config.force[layout]`) — WINS over the shared central geometry for THIS open; area/bottom ignore width/width_auto (always full-width)
 ---@field backdrop? table|false      -- tabs: backdrop veil override `{ enabled?, mode, dim, darken }` (or `false` to force OFF); falls back to `slot.backdrop`
+---@field origin? integer            -- window to return focus to on close (a popup opened from another frame's callback)
 ---@field enter? boolean             -- false → open without focusing (cursor stays in the editor, e.g. hover)
 ---@field border? any                -- frame border override
 ---@field close_keys? string[]       -- keys that close the frame
@@ -720,6 +721,26 @@ function M.tabs(opts)
     -- reopened) would leave a stale "(current)" — the per-open copy keeps that conversion isolated. (A blanket
     -- deepcopy of ALL tabs silently broke the live-mutation contract: the handle rendered its own copy and
     -- never saw a consumer's row updates → install/update/delete "did nothing" and the spinner never animated.)
+    -- Resolve `current_item` to (tab, row) INDICES against the ORIGINAL specs BEFORE the per-open deepcopy
+    -- below. Items-tabs are deep-copied, so a later `it == opts.current_item` reference test can never hold
+    -- against the COPY's item tables (this silently killed the colorscheme picker's "(current)" marker + focus).
+    -- Indices survive the copy; string items would still match by value, but indices cover both uniformly.
+    local cur_ti, cur_j
+    if opts.current_item ~= nil then
+        for ti, t in ipairs(opts.tabs or {}) do
+            if t.items and not t.rows then
+                for j, it in ipairs(t.items) do
+                    if it == opts.current_item then
+                        cur_ti, cur_j = ti, j
+                        break
+                    end
+                end
+            end
+            if cur_ti then
+                break
+            end
+        end
+    end
     local tabset = {}
     for i, t in ipairs(opts.tabs or {}) do
         tabset[i] = (t.items and not t.rows) and vim.deepcopy(t) or t
@@ -754,7 +775,8 @@ function M.tabs(opts)
         local rs = {}
         for j, it in ipairs(t.items) do
             local rname = ("__item_%d_%d"):format(ti, j)
-            local is_current = opts.current_item ~= nil and it == opts.current_item
+            -- Match by the pre-resolved indices (the deepcopy broke reference equality — see cur_ti/cur_j above).
+            local is_current = cur_ti ~= nil and ti == cur_ti and j == cur_j
             if is_current then
                 item_focus = rname
             end
@@ -919,6 +941,12 @@ function M.tabs(opts)
                 if not pr then
                     return
                 end
+                -- Ownership of the SHARED panel content follows the ACTIVE tab. A TREE provider re-stamps this to
+                -- its own `state` inside its own `update` (tree.lua's render guard draws only when it owns the
+                -- panel). Stamping the active provider here FIRST means a NON-tree tab (a text/render tab, e.g. the
+                -- dap-view Console) leaves a non-nil owner that is NOT any tree — so a previously-active tree's
+                -- width-watcher / scroll repaint no longer draws its stale rows over the visible tab.
+                pan.tree_owner = pr
                 -- Keep the shared window's selection bar with the ACTIVE tab (see `any_cursorline` above).
                 if any_cursorline and pan.win and vim.api.nvim_win_is_valid(pan.win) then
                     vim.wo[pan.win].cursorline = pr.cursorline == true
@@ -2178,15 +2206,26 @@ function M.help(opts)
     -- The buffer line → source-item map from the last render, so j/k can move per ITEM (skipping a wrapped
     -- item's continuation lines) rather than per buffer line.
     local row_items = {}
+    -- Cache the wrapped row set keyed by (width, key_col): `size`, `render` AND every CursorMoved refresh all
+    -- need the SAME wrap (only the active-row tint changes on a cursor move), so re-running help_wrap over every
+    -- item on each cursor move is pure waste. Invalidated automatically when the width / key column changes.
+    local rows_cache, rows_cache_key
+    local function rows_cached(width, key_col)
+        local key = width .. ":" .. key_col
+        if rows_cache_key ~= key then
+            rows_cache, rows_cache_key = rows_for(width, key_col), key
+        end
+        return rows_cache
+    end
     local provider = {
         hide_cursor = true,
         size = function()
             local w, key_col = dims()
-            return w, #rows_for(w, key_col)
+            return w, #rows_cached(w, key_col)
         end,
         render = function(width)
             local _, key_col = dims()
-            local rows = rows_for(width, key_col)
+            local rows = rows_cached(width, key_col)
             local cur = (pan and pan.win and vim.api.nvim_win_is_valid(pan.win))
                     and vim.api.nvim_win_get_cursor(pan.win)[1]
                 or 1

@@ -101,7 +101,11 @@ end
 function M.key_pos(label, key, key_pos)
     local pos = key_pos
     if not pos and key and #key == 1 then
-        pos = label:lower():find(key:lower(), 1, true)
+        -- `find` returns a BYTE index, but render / rows.segmented treat `pos` as a UTF-32 CHARACTER index
+        -- (str_byteindex "utf-32"). Convert byte→char so a caption with a multibyte glyph before the hotkey
+        -- brackets the RIGHT letter (latent while captions are ASCII, where byte == char).
+        local b = label:lower():find(key:lower(), 1, true)
+        pos = b and (vim.fn.charidx(label, b - 1) + 1) or nil
     end
     return math.max(1, math.min(pos or 1, vim.fn.strchars(label) > 0 and vim.fn.strchars(label) or 1))
 end

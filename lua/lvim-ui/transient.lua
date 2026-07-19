@@ -66,7 +66,7 @@ local M = {}
 ---@field name?        string           notify prefix for user messages (default "lvim-ui")
 ---@field state?       table            consumer-owned table holding per-prefix snapshots, keyed "<id>@<root>"
 ---@field store?       table?           an `lvim-utils.store` live handle (or nil to disable persistence)
----@field level?       integer|fun():integer  the default visible level a fresh open starts at (default 4)
+---@field level?       integer|fun():integer  the default visible level a fresh open starts at (default: max_level — every level shown until the user lowers it)
 ---@field layout?      string|fun():string    the preset layout ("float"|"cursor"|"bottom")
 ---@field enabled?     boolean|fun():boolean   gate `open` (default true)
 ---@field resolve_root? fun(ctx: table?): string?  derive the root when `ctx.root` is absent

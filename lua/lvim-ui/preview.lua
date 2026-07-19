@@ -218,7 +218,8 @@ function M.new(opts)
                 augroup_win = nil
             end
         end,
-        on_close = function()
+        ---@param pan table?  the preview panel (its `win` is the frame's own preview window, closing anyway)
+        on_close = function(pan)
             remove_nav()
             if augroup then
                 pcall(api.nvim_del_augroup_by_id, augroup)
@@ -227,7 +228,20 @@ function M.new(opts)
             end
             for buf in pairs(owned_buffers) do
                 if api.nvim_buf_is_valid(buf) and vim.bo[buf].modified == false then
-                    pcall(api.nvim_buf_delete, buf, { force = true })
+                    -- The preview shows the REAL file buffer, so a file WE loaded may ALSO be open in a user's
+                    -- split (trivially, from any non-trapping docked surface). Only wipe it when no window OTHER
+                    -- than the frame's own preview window still shows it — else closing the surface would rip the
+                    -- buffer out of the user's window (losing its view / jumplist).
+                    local elsewhere = false
+                    for _, w in ipairs(vim.fn.win_findbuf(buf)) do
+                        if not (pan and w == pan.win) then
+                            elsewhere = true
+                            break
+                        end
+                    end
+                    if not elsewhere then
+                        pcall(api.nvim_buf_delete, buf, { force = true })
+                    end
                 end
             end
             owned_buffers = {}

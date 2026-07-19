@@ -152,9 +152,11 @@ local seq = 0
 function M.new(opts)
     opts = opts or {}
     seq = seq + 1
-    -- The selection bar is a PERSISTENT `line_hl_group` extmark in this namespace — not an ephemeral one from a
-    -- decoration provider: the menu is a NON-FOCUSABLE float, so it is not redrawn on every keystroke of the
-    -- buffer the user is actually typing in, and an ephemeral mark would simply not be re-emitted.
+    -- The selection bar is an EPHEMERAL extmark emitted from the decoration provider's `on_line` (see below),
+    -- the SAME mechanism as the box spans — NOT a persistent `line_hl_group` mark. A persistent mark depended on
+    -- nvim repainting the line highlight on this non-current float, which it did only intermittently ("the tint
+    -- sometimes shows, sometimes not"); re-emitting it per redraw in on_line is what made it reliable. Do NOT
+    -- revert this to a persistent mark — that is the flicker bug the recorder was needed to kill.
     local ns = api.nvim_create_namespace("lvim_ui_menu_" .. seq)
 
     local max_height = opts.max_height or 12
@@ -178,6 +180,7 @@ function M.new(opts)
         buf = nil, ---@type integer?      the long-lived scratch buffer
         win = nil, ---@type integer?      the menu window (nil while hidden)
         docs_buf = nil, ---@type integer?
+        docs_ft = nil, ---@type string?     the filetype the docs buffer's treesitter parser was started for
         docs_win = nil, ---@type integer?
         items = {}, ---@type LvimUiMenuRow[]
         anchor = nil, ---@type LvimUiMenuAnchor?
@@ -426,20 +429,8 @@ function M.new(opts)
         if sp.row == 0 then
             return nil
         end
-        -- usable rows end above the cmdline AND the statusline (laststatus 2/3 always;
-        -- laststatus 1 only when a second non-floating window shows it)
-        local status_rows = 0
-        if vim.o.laststatus >= 2 then
-            status_rows = 1
-        elseif vim.o.laststatus == 1 then
-            for _, w in ipairs(api.nvim_tabpage_list_wins(0)) do
-                if w ~= awin and api.nvim_win_get_config(w).relative == "" then
-                    status_rows = 1
-                    break
-                end
-            end
-        end
-        local editor_h = vim.o.lines - vim.o.cmdheight - status_rows
+        -- usable rows end above the cmdline AND the statusline (the single shared util.status_rows authority)
+        local editor_h = vim.o.lines - vim.o.cmdheight - util.status_rows(awin)
         local want = math.min(#state.items, max_height)
         if want == 0 then
             return nil
@@ -605,7 +596,15 @@ function M.new(opts)
             row = state.row,
             col = col,
             width = width,
-            height = math.min(docs_size.height, math.max(1, vim.o.lines - vim.o.cmdheight - state.row)),
+            -- Clamp the docs height to the rows between its anchor and the bottom, MINUS the statusline (the
+            -- same authority geometry() uses) — else a tall docs panel beside a low menu overlaps the statusline.
+            height = math.min(
+                docs_size.height,
+                math.max(
+                    1,
+                    vim.o.lines - vim.o.cmdheight - util.status_rows(state.anchor and state.anchor.win) - state.row
+                )
+            ),
         }
         if glyph then
             -- border order { tl, t, tr, r, br, b, bl, l }: the rule sits on the side FACING
@@ -719,13 +718,31 @@ function M.new(opts)
             return
         end
         o = o or {}
-        if not (state.docs_buf and api.nvim_buf_is_valid(state.docs_buf)) then
+        local function fresh_docs_buf()
             local b = api.nvim_create_buf(false, true)
             vim.bo[b].buftype = "nofile"
             vim.bo[b].bufhidden = "hide"
             vim.bo[b].swapfile = false
-            state.docs_buf = b
+            return b
         end
+        -- Treesitter caches ONE parser per buffer (the FIRST language started on it), so the REUSED docs buffer
+        -- cannot switch languages between candidates — `start()` for a new language silently fails on a buffer
+        -- already parsing another and the highlight degrades to none. Mirror preview.render_file: on a filetype
+        -- change, stop treesitter and swap a FRESH scratch buffer into the (already-open) docs window so the new
+        -- language starts clean. The window-local options (winhighlight / wrap / conceal) persist across the swap.
+        if state.docs_buf and api.nvim_buf_is_valid(state.docs_buf) and state.docs_ft ~= o.filetype then
+            pcall(vim.treesitter.stop, state.docs_buf)
+            local old = state.docs_buf
+            state.docs_buf = fresh_docs_buf()
+            if state.docs_win and api.nvim_win_is_valid(state.docs_win) then
+                pcall(api.nvim_win_set_buf, state.docs_win, state.docs_buf)
+            end
+            pcall(api.nvim_buf_delete, old, { force = true })
+        end
+        if not (state.docs_buf and api.nvim_buf_is_valid(state.docs_buf)) then
+            state.docs_buf = fresh_docs_buf()
+        end
+        state.docs_ft = o.filetype
         local buf = state.docs_buf
         vim.bo[buf].modifiable = true
         api.nvim_buf_set_lines(buf, 0, -1, false, lines)
