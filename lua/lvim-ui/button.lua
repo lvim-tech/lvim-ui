@@ -155,7 +155,14 @@ function M.render(spec, state)
     -- width (and the whole bar's layout) is unchanged: no reflow, the label just gains `[ ]`. Only when there
     -- is padding to consume on both sides (else brackets would widen the button). The brackets wear the text
     -- colour (itself the deeper hover tint).
-    local hovered = (state == "hover" or state == "hover_active") and tf >= 1 and tb >= 1
+    --
+    -- ONLY for a KEY-LESS button. One that carries a hotkey already advertises itself through that key — the
+    -- whole key as a lead badge (`s stage`) or its letter bracketed inside the caption (`[s]tage`) — so adding
+    -- `[ ]` around the caption on top of it double-brackets the same button and reads as noise. A key-less
+    -- button (the filter bands: All / Staged / Unstaged / Untracked …) has no such cue, and these brackets ARE
+    -- its hover affordance.
+    local keyless = not (spec.key or spec.key_pos)
+    local hovered = keyless and (state == "hover" or state == "hover_active") and tf >= 1 and tb >= 1
     if hovered then
         put(sp(tf - 1) .. "[", thl)
     else
