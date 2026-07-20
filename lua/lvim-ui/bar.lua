@@ -212,4 +212,121 @@ function M.render(opts)
     return { line = line, spans = spans, chevrons = chevrons, items = items, off = opts.off or 0 }
 end
 
+-- ── The TITLE BAND ────────────────────────────────────────────────────────────────────────────────────
+--
+-- ONE builder for every title bar in the set. It exists because the same band is PLACED in three
+-- structurally different spots and used to be re-implemented at each: a surface frame's chrome row
+-- (`surface.lay_band`, a `title_counter` band), a docked zone's per-segment content row (lvim-msgarea —
+-- a zone stacks N segments, each with its own title, interleaved with the content, so those rows can
+-- never be frame chrome), and a content row that also carries BUTTONS (lvim-hud's `:Messages` filter
+-- bar). Placement is the caller's job; everything that makes a band a BAND is decided here:
+--
+--   * the strip is the band's own tint, and it has TWO depths — resting / `focused` one step deeper,
+--   * the title text is fg-ONLY over that strip, so the row is one solid block at either depth
+--     (a boxed title would stay at the resting tint and read as a lighter patch cut out of its own bar),
+--   * the title is UPPERCASE with a 1-cell gutter each side, and a COUNTER is a padded box flush right,
+--   * a counter forces the title LEFT (title anchored left, count anchored right — the message-bar canon;
+--     only the left path renders through `M.render`, whose count is a real button box).
+--
+-- Returns the row plus its spans in BYTE columns and the `fill` group for the full-row strip UNDER them —
+-- the caller emits that however its own layer does (an eol extmark, a `{row,0,-1}` placement, …).
+---@class LvimUiTitleBandSpec
+---@field text?          string                    the title (rendered UPPERCASE, 1-cell gutter each side)
+---@field width          integer                   the row's display width
+---@field count?         string|integer|fun():string  a counter box, flush right (a function is re-read here)
+---@field count_hl?      string                    the counter box group (default LvimUiPeekCounter)
+---@field pos?           "left"|"center"|"right"   where a BARE title sits (a counter/items force "left")
+---@field focused?       boolean                   draw the strip at its deeper, focused tint
+---@field fill_hl?       string                    the resting strip group (default LvimUiPeekTitle)
+---@field fill_hl_focus? string                    the focused strip group (default LvimUiPeekTitleHover)
+---@field text_hl?       string                    the title text group (default the fg-only LvimUiPeekTitleText)
+---@field items?         LvimUiButtonSpec[]        buttons laid out on the row, right of the title
+---@field sel?           integer                   the item kept visible (scroll-follow)
+---@field hover?         integer                   the item drawn in its hover state
+---@field chevrons?      table                     overflow chevron overrides (see M.render)
+---@field off?           integer                   the scroll offset carried between renders
+
+---@class LvimUiTitleBandResult
+---@field line     string   the rendered row
+---@field spans    table[]  { c0, c1, hl } in BYTE columns of `line`
+---@field fill     string   the group for the full-row strip UNDER the spans — the caller places it
+---@field items    table[]  per-item visible ranges ({ c0, c1, spec }) for hit-testing
+---@field chevrons table[]  the overflow chevron ranges
+---@field off      integer  the resulting scroll offset
+
+---@param opts LvimUiTitleBandSpec
+---@return LvimUiTitleBandResult
+function M.title_band(opts)
+    local W = opts.width or 0
+    local text = opts.text or ""
+    local cnt = opts.count
+    if type(cnt) == "function" then
+        cnt = cnt()
+    end
+    cnt = (cnt ~= nil and cnt ~= "") and tostring(cnt) or nil
+
+    local text_hl = opts.text_hl or "LvimUiPeekTitleText"
+    -- The two depths. A band that names its OWN resting tint but no focused sibling keeps that one tint: we
+    -- cannot invent a deeper variant of an arbitrary group, and silently swapping in the peek hover would
+    -- paint it the wrong hue. Only the DEFAULT pair is known here.
+    local rest = opts.fill_hl or "LvimUiPeekTitle"
+    local focus = opts.fill_hl_focus or (rest == "LvimUiPeekTitle" and "LvimUiPeekTitleHover") or rest
+    local fill = opts.focused and focus or rest
+
+    -- Buttons and/or a counter mean the row lays out through `M.render` (it owns alignment, scrolling and
+    -- overflow chevrons); the manual center/right path below is for a BARE title only.
+    local items = {}
+    for _, it in ipairs(opts.items or {}) do
+        items[#items + 1] = it
+    end
+    if cnt then
+        items[#items + 1] = {
+            type = "button",
+            text = cnt,
+            style = { text = { padding = { 1, 1 }, normal = opts.count_hl or "LvimUiPeekCounter" } },
+        }
+    end
+    local pos = (cnt and "left") or opts.pos or "left"
+
+    if pos == "left" or #items > 0 then
+        local res = M.render({
+            items = items,
+            width = W,
+            -- With a title the items hug the RIGHT (the title owns the left edge); without one they start left.
+            align = (text ~= "") and "right" or "left",
+            chevrons = opts.chevrons,
+            sel = opts.sel,
+            hover = opts.hover,
+            off = opts.off,
+            title = text,
+            title_hl = text_hl,
+        })
+        return {
+            line = res.line,
+            spans = res.spans,
+            fill = fill,
+            items = res.items,
+            chevrons = res.chevrons,
+            off = res.off,
+        }
+    end
+
+    -- CENTER / RIGHT, bare title: place it by hand (`M.render`'s title is a left prefix only). The leading
+    -- run is spaces (1 byte = 1 cell), so the title's byte offset == its display column.
+    local title = util.title_case(text)
+    local tw = util.dw(title)
+    local tcol = (pos == "center") and math.max(0, math.floor((W - tw) / 2)) or math.max(0, W - tw)
+    local body = string.rep(" ", tcol) .. title
+    body = body .. string.rep(" ", math.max(0, W - util.dw(body)))
+    return {
+        line = body,
+        -- 1 cell of gutter each side, so the title reads " MESSAGES " and not hugging (the padding canon).
+        spans = { { math.max(0, tcol - 1), math.min(#body, tcol + #title + 1), text_hl } },
+        fill = fill,
+        items = {},
+        chevrons = {},
+        off = opts.off or 0,
+    }
+end
+
 return M

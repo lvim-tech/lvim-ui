@@ -1449,80 +1449,27 @@ local function render_chrome(state, L)
             return
         end
         if band.title_counter then
-            -- A title + a re-evaluated COUNTER. `title_pos` places the title: LEFT (default) renders THROUGH
-            -- ui.bar (title = its left prefix, counter a right-aligned item) so it matches the message bar exactly;
-            -- CENTER / RIGHT place the title by hand (ui.bar's title is prefix-only), with the counter still
-            -- flush-right. UPPERCASE in every case (the title-bar canon).
-            local cnt = band.count and tostring((type(band.count) == "function" and band.count()) or band.count) or ""
-            -- A COUNTER forces the title LEFT: the pair reads as one bar (title anchored left, count anchored
-            -- right — the message-bar canon), and only the left path renders through ui.bar, whose count is a
-            -- real padded BUTTON box (a blank cell each side of the digits) instead of a bare string glued to the
-            -- right edge. `title_pos` still places a COUNTER-LESS title (centered by default).
-            local tpos = (cnt ~= "" and "left") or band.title_pos or "left"
-            -- The STRIP under a title row wears the TITLE's own tint (blue `LvimUiPeekTitle`), not the generic
-            -- yellow `LvimUiBarFill` of a button bar: a title band must read like a native-split surface title
-            -- (the drawer's winbar, `WinBar:LvimUiPeekTitle`) — one continuous blue band across the window —
-            -- while the counter keeps its green badge. `fill_hl` overrides it for a band that wants otherwise.
-            local rest_fill = band.fill_hl or band.hl or "LvimUiPeekTitle"
-            -- FOCUSED frame → one step deeper on the same hue (`LvimUiPeekTitleHover`), the winbar's
-            -- WinBar/WinBarNC pair expressed for a content-row title: the band tells you which panel the
-            -- cursor is in. A band with a CUSTOM title hl keeps its own fill unless it names a focused
-            -- variant via `fill_hl_focus`.
-            local focus_fill = band.fill_hl_focus
-                or (rest_fill == "LvimUiPeekTitle" and "LvimUiPeekTitleHover")
-                or rest_fill
-            local title_fill = (not state._blurred) and focus_fill or rest_fill
-            -- The title TEXT is fg-ONLY by default (`LvimUiPeekTitleText`) — it sits ON the strip above and
-            -- inherits its bg, so the whole band is one solid colour at whichever depth focus put it. A BOXED
-            -- title (its own bg) is opt-in via `text_hl`: over a focus-deepening strip a boxed title stays at
-            -- the resting depth and reads as a lighter patch cut out of its own bar.
-            local text_hl = band.text_hl or "LvimUiPeekTitleText"
-            if tpos == "left" then
-                local items = {}
-                if cnt ~= "" then
-                    items[1] = {
-                        type = "button",
-                        text = cnt,
-                        style = { text = { padding = { 1, 1 }, normal = band.count_hl or "LvimUiSubtitle" } },
-                    }
-                end
-                local res = uibar.render({
-                    items = items,
-                    width = W,
-                    align = "right",
-                    title = band.text,
-                    title_hl = text_hl,
-                })
-                lines[ln] = res.line
-                placements[#placements + 1] = { ln - 1, 0, #res.line, title_fill, 150 } -- the continuous row strip
-                for _, sp in ipairs(res.spans) do
-                    placements[#placements + 1] = { ln - 1, sp[1], sp[2], sp[3], 200 }
-                end
-                return
-            end
-            -- CENTER / RIGHT: place the (uppercased) title manually. Leading run is spaces (1 byte = 1 cell), so
-            -- the title's byte offset == its display column; the counter is appended flush-right after it.
-            local title = util.title_case(band.text)
-            local tw = util.dw(title)
-            local cw = cnt ~= "" and util.dw(cnt) or 0
-            local tcol = (tpos == "center") and math.max(0, math.floor((W - tw) / 2))
-                or math.max(0, W - tw - (cw > 0 and cw + 1 or 0)) -- "right": sit before the counter
-            local body = string.rep(" ", tcol) .. title
-            local tstart, tend = tcol, tcol + #title
-            local cstart, cend
-            if cnt ~= "" then
-                local ccol = math.max(util.dw(body), W - cw - 1) -- flush right, 1-col margin, never over the title
-                body = body .. string.rep(" ", math.max(0, ccol - util.dw(body)))
-                cstart = #body
-                body = body .. cnt
-                cend = #body
-            end
-            body = body .. string.rep(" ", math.max(0, W - util.dw(body)))
-            lines[ln] = body
-            placements[#placements + 1] = { ln - 1, 0, #body, title_fill, 150 }
-            placements[#placements + 1] = { ln - 1, math.max(0, tstart - 1), math.min(#body, tend + 1), text_hl, 200 }
-            if cstart then
-                placements[#placements + 1] = { ln - 1, cstart, cend, band.count_hl or "LvimUiPeekCounter", 200 }
+            -- A TITLE BAND — built by the shared `ui.bar.title_band`, which owns the whole canon (the two-depth
+            -- strip, the fg-only uppercase title, the counter box, a counter forcing the title left). This layer
+            -- only PLACES it: the strip as a full-row span under the title/counter spans. The same builder draws
+            -- lvim-msgarea's segment titles and lvim-hud's `:Messages` filter bar, which are content rows rather
+            -- than frame chrome — the reason the band lives in `ui.bar` and not here.
+            -- `band.hl` is the BAND's tint (the strip); the focused depth follows the FRAME's focus.
+            local res = uibar.title_band({
+                text = band.text,
+                width = W,
+                count = band.count,
+                count_hl = band.count_hl,
+                pos = band.title_pos,
+                focused = not state._blurred,
+                fill_hl = band.fill_hl or band.hl,
+                fill_hl_focus = band.fill_hl_focus,
+                text_hl = band.text_hl,
+            })
+            lines[ln] = res.line
+            placements[#placements + 1] = { ln - 1, 0, #res.line, res.fill, 150 } -- the continuous row strip
+            for _, sp in ipairs(res.spans) do
+                placements[#placements + 1] = { ln - 1, sp[1], sp[2], sp[3], 200 }
             end
             return
         end

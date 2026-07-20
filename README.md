@@ -167,6 +167,38 @@ modal. Its items are ordinary bar records rendered through `ui.surface.button` +
 is byte-identical to a footer one and the overflow chevrons come for free. Defaults (align, the button kind, the
 fill strip, zindex, filetype) live in `config.hint`.
 
+### The `title_band` primitive (the one title bar in the set)
+
+`require("lvim-ui.bar").title_band(spec)` builds a TITLE BAND row. Every title bar in the set comes
+from here, because the same band is PLACED in structurally different spots: a surface frame's chrome
+row (a `title_counter` header band), a docked zone's per-segment content row (a zone stacks several
+segments, each with its own title interleaved with the content, so those can never be frame chrome),
+and a content row that also carries buttons (the `:Messages` filter bar). The builder owns everything
+that makes a band a band:
+
+- the strip has TWO depths — resting, and one step deeper while `focused`,
+- the title text is fg-ONLY over that strip, so the row is one solid block at either depth,
+- the title is UPPERCASE with a 1-cell gutter each side; a counter is a padded box flush right,
+- a counter (or any buttons) anchors the title LEFT; a bare title honours `pos`.
+
+It returns the row, its spans in BYTE columns, and the `fill` group for the full-row strip — the
+caller places those however its own layer does (an eol extmark, a frame placement, …).
+
+```lua
+local band = require("lvim-ui.bar").title_band({
+    text = "schoolexams ➤ questions",
+    width = width,
+    count = function()
+        return "1-50/536"
+    end,
+    focused = true, -- deeper strip while this panel holds the cursor
+})
+-- band.line, band.spans ({ c0, c1, hl }), band.fill (the full-row strip group)
+```
+
+A band that names its own `fill_hl` without a `fill_hl_focus` keeps that one tint: a deeper variant
+of an arbitrary group cannot be invented, and only the default pair is known here.
+
 ### The `winfooter` primitive (a button bar for a REAL window)
 
 `require("lvim-ui.winfooter").attach(win, { items, align })` pins the canonical button FOOTER BAR —

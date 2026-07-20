@@ -152,6 +152,43 @@ defaulting to `config.hint`.
 Handle: `show(items)`, `update(items)` (same window, no flicker), `hide()`,
 `close()`, `visible()`.
 
+                                                      *lvim-ui.title_band()*
+require("lvim-ui.bar").title_band({spec})              → { line, spans, fill, … }
+
+The ONE title bar in the set. The same band is PLACED in structurally
+different spots — a surface frame's chrome row (a `title_counter` header
+band), a docked zone's per-segment content row (a zone stacks several
+segments, each title interleaved with the content, so those can never be
+frame chrome), and a content row that also carries buttons (the `:Messages`
+filter bar) — so placement is the caller's job and everything that makes a
+band a BAND is decided here:
+
+- the strip has TWO depths: resting, and one step deeper while {focused};
+- the title text is fg-ONLY over that strip, so the row is one solid block
+  at either depth (a boxed title would stay at the resting tint and read as
+  a lighter patch cut out of its own bar);
+- the title is UPPERCASE with a 1-cell gutter each side, and a counter is a
+  padded box flush right;
+- a counter (or any buttons) anchors the title LEFT; a bare title honours
+  {pos} ("left" | "center" | "right").
+
+Spec: `text`, `width`, `count` (string / number / function), `count_hl`,
+`pos`, `focused`, `fill_hl`, `fill_hl_focus`, `text_hl`, `items`, `sel`,
+`hover`, `chevrons`, `off`. Returns `line`, `spans` ({ c0, c1, hl } in BYTE
+columns), `fill` (the group for the full-row strip UNDER them — the caller
+emits it however its own layer does), plus `items` / `chevrons` / `off`. A
+band naming its own `fill_hl` without a `fill_hl_focus` keeps that one tint:
+a deeper variant of an arbitrary group cannot be invented. >lua
+
+    local band = require("lvim-ui.bar").title_band({
+        text = "schoolexams ➤ questions",
+        width = width,
+        count = function()
+            return "1-50/536"
+        end,
+        focused = true,
+    })
+<
                                                        *lvim-ui.winfooter()*
 require("lvim-ui.winfooter").attach({win}, {opts})     → handle
 
