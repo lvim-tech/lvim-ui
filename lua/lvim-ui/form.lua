@@ -463,7 +463,13 @@ function M.new(opts)
                     -- LABEL (the SUFFIX of `disp`); anchored at the label's real start (body lpad + the row's
                     -- icon offset + the icon column), clamped to the rendered line. Dim the path, brighten the
                     -- name, so the name stands out.
-                    if r.dim_to and r.dim_to > 0 and type(r.label) == "string" then
+                    --
+                    -- Gated on dim_to being PRESENT, not on it being > 0: `dim_to = 0` means "this label is a
+                    -- file row with NO path part to dim" (an unnamed buffer in the quit dialog, a file at the
+                    -- repo root in lvim-git status) — the whole label is the NAME. Requiring > 0 dropped BOTH
+                    -- spans for those rows, so their label fell back to the bare panel fg while every sibling
+                    -- row was themed. The inner guards already skip an empty dim part on their own.
+                    if r.dim_to and type(r.label) == "string" then
                         local lstart = lead + (icon_at or 0) + ((r.icon and r.icon ~= "") and (#r.icon + 1) or 0)
                         local dim_end = math.min(lstart + r.dim_to, #lines[i])
                         if dim_end > lstart then

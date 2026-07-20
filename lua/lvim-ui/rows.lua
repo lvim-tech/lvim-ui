@@ -96,10 +96,16 @@ end
 --- byte anchors a caller needs to paint per-part highlights WITHOUT re-deriving that layout: `icon_at` (the
 --- offset of `row.icon`, for icon_hl/text_hl — correct even when `tight` drops the separator, at any body
 --- padding) and `type_w` (the width of the LEADING auto glyph the row starts with, for the dim).
+---
+--- `icon_at` is reported by EVERY row shape that has an `icon`/label column, not just action/accordion:
+--- `dim_to` (the path/name split of a file row) is a LABEL feature and lands on plain rows too — a `bool`
+--- row in the quit dialog, for one. While the value rows returned nil for it, that anchor fell back to 0 and
+--- the label spans were painted six bytes early, over the type glyph instead of the label.
 ---@param row Row
 ---@param ico table?
 ---@return string disp
----@return integer? icon_at  byte offset of `row.icon` within `disp` (action / accordion rows only; nil otherwise)
+---@return integer? icon_at  byte offset of `row.icon`/label within `disp` (nil for `segmented`, whose label
+---                          lives inside its own coloured segments)
 ---@return integer type_w    byte width of the leading type glyph (bool/select/number/action/caret) at the row
 ---                          start; 0 when there is none (flat rows, segmented, spacer_line) — dim exactly this
 function M.row_display(row, ico)
@@ -124,7 +130,7 @@ function M.row_display(row, ico)
 
     if t == "bool" or t == "boolean" then
         local glyph = row.value and ico.bool_on or ico.bool_off
-        return glyph .. "  " .. ri .. label, nil, #glyph
+        return glyph .. "  " .. ri .. label, #glyph + 2, #glyph
     elseif t == "segmented" then
         local prefix, segs = M.segmented_segments(row, ico)
         local texts = {}
@@ -134,11 +140,11 @@ function M.row_display(row, ico)
         -- segmented starts with `ri`/label (its options carry the colour) — no leading type glyph to dim.
         return prefix .. table.concat(texts, " "), nil, 0
     elseif t == "select" then
-        return ico.select .. "  " .. ri .. label .. ": " .. val, nil, #ico.select
+        return ico.select .. "  " .. ri .. label .. ": " .. val, #ico.select + 2, #ico.select
     elseif t == "int" or t == "integer" or t == "float" or t == "number" then
-        return ico.number .. "  " .. ri .. label .. ": " .. val, nil, #ico.number
+        return ico.number .. "  " .. ri .. label .. ": " .. val, #ico.number + 2, #ico.number
     elseif t == "string" or t == "text" then
-        return ico.string .. "  " .. ri .. label .. ": " .. val, nil, #ico.string
+        return ico.string .. "  " .. ri .. label .. ": " .. val, #ico.string + 2, #ico.string
     elseif t == "action" then
         -- a `tight` flat row drops the 2-space lead entirely (its own `icon` carries any leading marker) — a
         -- compact list (e.g. a picker's items) where the row content sits right at the panel edge. 2nd return
