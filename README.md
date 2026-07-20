@@ -167,6 +167,31 @@ modal. Its items are ordinary bar records rendered through `ui.surface.button` +
 is byte-identical to a footer one and the overflow chevrons come for free. Defaults (align, the button kind, the
 fill strip, zindex, filetype) live in `config.hint`.
 
+### The `winfooter` primitive (a button bar for a REAL window)
+
+`require("lvim-ui.winfooter").attach(win, { items, align })` pins the canonical button FOOTER BAR —
+a `ui.bar` of `ui.button` chips on an `LvimUiBarFill` row — to the bottom row of a window the
+surface chassis does NOT own: a genuine editable buffer in a tiled window (lvim-db's query editor).
+The 1-row, non-focusable float follows the host through resizes and layout shifts, closes itself
+with the host window, and hit-tests clicks against the chips through the global mouse layer. It
+DISPLAYS keys and runs actions on click — it never binds a key itself (the host buffer owns its
+own keymaps).
+
+```lua
+local surface = require("lvim-ui.surface")
+local bar = require("lvim-ui.winfooter").attach(win, {
+    align = "center",
+    items = {
+        surface.button({ name = "run", key = "⏎", style = "action", run = run }, "action"),
+        surface.button({ name = "help", key = "g?", style = "action", run = help }, "action"),
+    },
+})
+bar.set(items) -- replace the chips (re-rendered in place)
+bar.close() -- tear down (automatic when the host window closes)
+```
+
+The host window keeps `scrolloff >= 1`, so the cursor line can never sit under the bar.
+
 ### The `tree` primitive (shared tree panels)
 
 `ui.tree(opts)` creates the generic node-provider TREE — the ONE content layer every lvim-tech tree panel

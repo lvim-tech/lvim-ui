@@ -718,13 +718,15 @@ local function row_title_bands(cfg)
         return nil
     end
     local t = cfg.title
+    -- `thl` is the TITLE TEXT group and stays nil unless the caller styled the text itself: the band's own
+    -- default (fg-only over the band's tint) is what makes the title read as part of its bar. The BAND tint
+    -- is never taken from the title style — it is the LvimUiPeekTitle/…Hover focus pair.
     local text, thl
     if type(t) == "table" then
         text = (t.icon and t.icon .. " " or "") .. (t.text and tostring(t.text) or "")
-        thl = (t.style and t.style.text and t.style.text.hl) or "LvimUiPeekTitle"
+        thl = t.style and t.style.text and t.style.text.hl
     else
         text = tostring(t)
-        thl = "LvimUiPeekTitle"
     end
     return {
         {
@@ -734,7 +736,7 @@ local function row_title_bands(cfg)
             count = function()
                 return counter_text(cfg) or ""
             end,
-            hl = thl,
+            text_hl = thl,
             count_hl = "LvimUiPeekCounter",
             title_pos = cfg.title_pos, -- "left" (default) | "center" | "right"
         },
@@ -1457,6 +1459,24 @@ local function render_chrome(state, L)
             -- real padded BUTTON box (a blank cell each side of the digits) instead of a bare string glued to the
             -- right edge. `title_pos` still places a COUNTER-LESS title (centered by default).
             local tpos = (cnt ~= "" and "left") or band.title_pos or "left"
+            -- The STRIP under a title row wears the TITLE's own tint (blue `LvimUiPeekTitle`), not the generic
+            -- yellow `LvimUiBarFill` of a button bar: a title band must read like a native-split surface title
+            -- (the drawer's winbar, `WinBar:LvimUiPeekTitle`) — one continuous blue band across the window —
+            -- while the counter keeps its green badge. `fill_hl` overrides it for a band that wants otherwise.
+            local rest_fill = band.fill_hl or band.hl or "LvimUiPeekTitle"
+            -- FOCUSED frame → one step deeper on the same hue (`LvimUiPeekTitleHover`), the winbar's
+            -- WinBar/WinBarNC pair expressed for a content-row title: the band tells you which panel the
+            -- cursor is in. A band with a CUSTOM title hl keeps its own fill unless it names a focused
+            -- variant via `fill_hl_focus`.
+            local focus_fill = band.fill_hl_focus
+                or (rest_fill == "LvimUiPeekTitle" and "LvimUiPeekTitleHover")
+                or rest_fill
+            local title_fill = (not state._blurred) and focus_fill or rest_fill
+            -- The title TEXT is fg-ONLY by default (`LvimUiPeekTitleText`) — it sits ON the strip above and
+            -- inherits its bg, so the whole band is one solid colour at whichever depth focus put it. A BOXED
+            -- title (its own bg) is opt-in via `text_hl`: over a focus-deepening strip a boxed title stays at
+            -- the resting depth and reads as a lighter patch cut out of its own bar.
+            local text_hl = band.text_hl or "LvimUiPeekTitleText"
             if tpos == "left" then
                 local items = {}
                 if cnt ~= "" then
@@ -1471,10 +1491,10 @@ local function render_chrome(state, L)
                     width = W,
                     align = "right",
                     title = band.text,
-                    title_hl = band.hl or "LvimUiPeekTitle",
+                    title_hl = text_hl,
                 })
                 lines[ln] = res.line
-                placements[#placements + 1] = { ln - 1, 0, #res.line, "LvimUiBarFill", 150 } -- the continuous row strip
+                placements[#placements + 1] = { ln - 1, 0, #res.line, title_fill, 150 } -- the continuous row strip
                 for _, sp in ipairs(res.spans) do
                     placements[#placements + 1] = { ln - 1, sp[1], sp[2], sp[3], 200 }
                 end
@@ -1499,9 +1519,8 @@ local function render_chrome(state, L)
             end
             body = body .. string.rep(" ", math.max(0, W - util.dw(body)))
             lines[ln] = body
-            placements[#placements + 1] = { ln - 1, 0, #body, "LvimUiBarFill", 150 }
-            placements[#placements + 1] =
-                { ln - 1, math.max(0, tstart - 1), math.min(#body, tend + 1), band.hl or "LvimUiPeekTitle", 200 }
+            placements[#placements + 1] = { ln - 1, 0, #body, title_fill, 150 }
+            placements[#placements + 1] = { ln - 1, math.max(0, tstart - 1), math.min(#body, tend + 1), text_hl, 200 }
             if cstart then
                 placements[#placements + 1] = { ln - 1, cstart, cend, band.count_hl or "LvimUiPeekCounter", 200 }
             end
@@ -3737,6 +3756,18 @@ local function open_windows(state)
             render_chrome(state, state._geom)
         end
     end
+    -- A frame can open WITHOUT taking focus (lvim-db's result dock appears while the cursor stays in the
+    -- editor above it). `_blurred` starts nil = focused, and the first WinEnter would then be a no-op — so the
+    -- title band would wear the FOCUSED tint over an unfocused frame forever. Seed the state from the window
+    -- that is actually current at open.
+    local cur_at_open = api.nvim_get_current_win()
+    local focused_at_open = cur_at_open == state.container_win
+    for _, pan in ipairs(state.panels) do
+        focused_at_open = focused_at_open or pan.win == cur_at_open
+    end
+    if not focused_at_open then
+        set_blur(true)
+    end
     -- Resolved ONCE at open: a modal float traps focus (the WinEnter bounce below). `state._trap_return` tracks
     -- the last frame window focused, so a bounce lands the user back where they were, not on an arbitrary sector.
     local trap = traps_focus(state)
@@ -4356,7 +4387,9 @@ local function open_native_split(state)
     local tt = title_text(cfg.title)
     if tt ~= "" then
         vim.wo[pan.win].winhighlight = vim.wo[pan.win].winhighlight
-            .. ",WinBar:LvimUiPeekTitle,WinBarNC:LvimUiPeekTitle"
+            -- WinBar (this window is CURRENT) wears the deeper tint, WinBarNC the resting one — the title
+            -- band marks which panel the cursor is in, natively, with no autocmd.
+            .. ",WinBar:LvimUiPeekTitleHover,WinBarNC:LvimUiPeekTitle"
         vim.wo[pan.win].winbar = "%=" .. tt .. "%="
     end
 
@@ -4873,18 +4906,30 @@ function M.open(cfg)
     if row_title then
         header_air = false
     end
-    local hbands = build_bands(cfg.header, false, header_air)
+    -- The SPLIT title, resolved BEFORE build_bands: the header air row exists to sit UNDER a title. A docked
+    -- frame with NO title (its brand lives in a header band instead — lvim-db's result dock carries a
+    -- `title_counter` band) has nothing to breathe under, and the air would surface as a DEAD blank row at the
+    -- container's very top, right below the winseparator. Derive it off like the ring rule above — only the
+    -- unset (nil) case, an explicit `header_air = true` still wins — and WRITE it to cfg, so a `set_header`
+    -- rebuild (a tab switch re-builds the bands from the spec) derives the same and cannot bring the row back.
+    local split_title
     if cfg.mode == "split" then
         local t = cfg.title
         -- UPPERCASE the title text (the canon, via util.title_case), keep the icon glyph
-        local s
         if type(t) == "table" then
-            s = (t.icon and t.icon .. " " or "") .. (t.text and util.title_case(t.text) or "")
+            split_title = (t.icon and t.icon .. " " or "") .. (t.text and util.title_case(t.text) or "")
         else
-            s = t and util.title_case(t) or ""
+            split_title = t and util.title_case(t) or ""
         end
-        if s ~= "" then
-            table.insert(hbands, 1, { meta = s, hl = "LvimUiPeekTitle" })
+        if split_title == "" and cfg.header_air == nil then
+            cfg.header_air = false
+            header_air = false
+        end
+    end
+    local hbands = build_bands(cfg.header, false, header_air)
+    if cfg.mode == "split" then
+        if split_title ~= "" then
+            table.insert(hbands, 1, { meta = split_title, hl = "LvimUiPeekTitle" })
         end
     elseif row_title then
         -- The title (+ counter) as the FIRST content rows — a `title_counter` band + air row, drawn from column

@@ -152,6 +152,32 @@ defaulting to `config.hint`.
 Handle: `show(items)`, `update(items)` (same window, no flicker), `hide()`,
 `close()`, `visible()`.
 
+                                                       *lvim-ui.winfooter()*
+require("lvim-ui.winfooter").attach({win}, {opts})     → handle
+
+The canonical button FOOTER BAR for a window the surface chassis does NOT own:
+a genuine editable buffer in a tiled window (lvim-db's query editor). Same
+band as a frame footer — a `ui.bar` of `ui.button` chips on an `LvimUiBarFill`
+row — as a 1-row NON-FOCUSABLE float riding the host's bottom row
+(`relative = "win"`), so it follows every resize / layout shift and closes with
+its host. Clicks are hit-tested against the chips through the global mouse
+layer (the float is never focused, so a buffer-local map could not fire). The
+bar DISPLAYS keys and runs actions on click — it never binds a key itself; the
+host buffer owns its keymaps. The host keeps `scrolloff >= 1`, so the cursor
+line can never sit under the bar. >lua
+
+    local surface = require("lvim-ui.surface")
+    local bar = require("lvim-ui.winfooter").attach(win, {
+        align = "center",
+        items = {
+            surface.button({ name = "run", key = "⏎", style = "action", run = run }, "action"),
+        },
+    })
+<
+Options: `items` (ui.button element specs), `align` ("left"|"center"|"right").
+
+Handle: `set(items, align?)`, `place()`, `close()`.
+
                                                                  *lvim-ui.tree()*
 require("lvim-ui").tree({opts})                        → handle
 
