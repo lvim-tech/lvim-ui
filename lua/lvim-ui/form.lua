@@ -262,9 +262,21 @@ function M.new(opts)
             cycle_value(1) -- forward; <BS> calls cycle_value(-1) for backward
         elseif t == "int" or t == "integer" or t == "float" or t == "number" or t == "string" or t == "text" then
             local numeric = t ~= "string" and t ~= "text"
+            -- A row may CUSTOMISE its editor via `row.edit`: a wider field, a multiline code editor
+            -- (`height` + `filetype` for treesitter), a docked position, an explicit zindex, or a different
+            -- seeded text (`default`, e.g. a value shown compact in the row but edited pretty). Absent →
+            -- the default single-line input.
+            local e = row.edit or {}
             require("lvim-ui").input({
                 prompt = row.label or row.name or "",
-                default = tostring(row.value ~= nil and row.value or row.default or ""),
+                default = e.default ~= nil and tostring(e.default)
+                    or tostring(row.value ~= nil and row.value or row.default or ""),
+                width = e.width,
+                width_fixed = e.width_fixed,
+                height = e.height,
+                filetype = e.filetype,
+                position = e.position,
+                zindex = e.zindex,
                 callback = function(confirmed, input)
                     if confirmed ~= true then
                         return
@@ -409,23 +421,31 @@ function M.new(opts)
                     -- rest reads on the panel background. `type_w` is that glyph's width straight from
                     -- row_display — never re-derived, so it can't drift (e.g. segmented rows, which have no
                     -- type glyph, report 0 and are correctly left alone).
-                    if type_w > 0 then
+                    -- The generic type-icon colour, UNLESS the row set its own `icon_hl` — then that group
+                    -- fully owns the icon (fg + bg), so the default fg-only tint must not merge over it.
+                    if type_w > 0 and not r.icon_hl then
                         hls[#hls + 1] = { i - 1, lead, lead + type_w, "LvimUiRowIconInactive" }
                     end
                     -- Per-part colours an action / accordion row can request: `icon_hl` on its `icon` column,
                     -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix. Offsets come from
                     -- `icon_at` (row_display's own layout) + the body lpad `lead` — never re-derived here, so a
                     -- `tight` row (which drops the 2-space separator) colours correctly at any `pad`.
-                    if
-                        (r.type == "action" or r.children) and (r.icon_hl or r.text_hl or r.suffix_hl or r.label_spans)
-                    then
+                    -- Per-part colours are honoured for ANY row that opts in by setting one (not only
+                    -- action/accordion): a typed field (string/number/select) can colour its LABEL — the
+                    -- column "key" — while its value reads normally, so a form reads like a keymap cheatsheet.
+                    -- The offsets come from `row_display` for every shape, so a string row's `text_hl` lands
+                    -- exactly on its label (up to the `: ` before the value).
+                    if r.icon_hl or r.text_hl or r.suffix_hl or r.label_spans then
                         local base = lead + (icon_at or 0)
                         local ricon = (r.icon and r.icon ~= "") and r.icon or nil
                         if ricon and r.icon_hl then
                             hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
                         end
                         local label = r.label or r.name or ""
-                        local ls = base + (ricon and (#ricon + 1) or 0)
+                        -- The label starts right after the icon. A normal (action) row separates them with ONE
+                        -- space (`ri = icon .. " "`), so +1; a `flat` typed row puts the icon and label ADJACENT
+                        -- (each carries its own padding as a self-contained box), so no gap.
+                        local ls = base + (ricon and (#ricon + (r.flat and 0 or 1)) or 0)
                         if r.label_spans and label ~= "" then
                             -- Per-SEGMENT label colours: a list of `{ c0, c1, hl }` BYTE offsets INTO the label
                             -- (so a row can paint e.g. its location one colour and its snippet another). Takes

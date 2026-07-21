@@ -43,6 +43,7 @@ local M = {}
 ---@field suffix_hl?     string    action/accordion rows: highlight for the trailing `suffix`
 ---@field label_spans?   table[]   action/accordion rows: per-segment label colours — a list of `{ c0, c1, hl }` BYTE ranges into the label (overrides a single text_hl); used for multi-tone labels (e.g. a coloured location + a dim snippet)
 ---@field row_hl?        string|{ inactive: string, active: string }  a FULL-WIDTH background strip (hl_eol, edge to edge) under the whole row — e.g. a section-header band; a `{ inactive, active }` pair shows `active` while the cursor is on the row (a hover). The per-part fg spans (icon_hl/text_hl) render on top
+---@field edit?          { width?: number, width_fixed?: boolean, height?: integer, filetype?: string, position?: string, zindex?: integer, default?: any }  string/number rows: customise the field editor — a wider or docked input, a multiline code editor (height + filetype), or a different seeded text
 ---@field items?         table[]   bar rows: the ui.bar button / separator specs
 ---@field align?         string    bar rows: "left" | "center" (default) | "right"
 ---@field _off?          integer   bar rows: persisted horizontal scroll offset (internal)
@@ -144,6 +145,17 @@ function M.row_display(row, ico)
     elseif t == "int" or t == "integer" or t == "float" or t == "number" then
         return ico.number .. "  " .. ri .. label .. ": " .. val, #ico.number + 2, #ico.number
     elseif t == "string" or t == "text" then
+        -- `flat` + an explicit `icon`: the row carries its OWN leading glyph (a per-value type icon) in
+        -- place of the generic string glyph — so a form can show what KIND of value each field holds. Layout
+        -- is [icon][space][label], the SAME shape action rows use — icon_at is the icon's byte offset (0) and
+        -- the per-part colouring reaches the label at `icon_at + #icon + 1`. (A 2-space lead would put the
+        -- label one byte past where that formula lands, so the label's text_hl would miss it.)
+        if row.flat and row.icon and row.icon ~= "" then
+            -- No `: ` separator for a flat typed row. The icon and label are self-contained tinted boxes set
+            -- ADJACENT (each carries its own space padding, so the two tints touch with no uncolored gap); one
+            -- space between the label box and the value, so the value text is not flush against the tint.
+            return row.icon .. label .. " " .. val, 0, #row.icon
+        end
         return ico.string .. "  " .. ri .. label .. ": " .. val, #ico.string + 2, #ico.string
     elseif t == "action" then
         -- a `tight` flat row drops the 2-space lead entirely (its own `icon` carries any leading marker) — a

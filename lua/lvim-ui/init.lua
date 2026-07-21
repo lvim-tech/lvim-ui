@@ -101,8 +101,11 @@ end
 ---@field default? any               -- input: initial value
 ---@field value? any                 -- input: alias for default
 ---@field prompt? string             -- input: prompt → title fallback
+---@field filetype? string           -- input (multiline): set the editable buffer's filetype, so treesitter highlighting + any matching LSP attach — the value edits as CODE (e.g. "json")
+---@field zindex? integer            -- input: explicit float stacking (default: above every live frame). Force higher to sit over a docked surface's own decoration floats.
+---@field width_fixed? boolean       -- input: a single-line field FILLS `width` (fixed) instead of fitting its content (auto). Use to open a field as wide as the popup around it.
 ---@field width? number|table        -- FIXED width (number: fraction ≤1 or count). tabs ALSO accept a size SPEC — `{ auto = true, max = n }` (fit content, capped) or `{ fixed = n }` — to FORCE auto-fit at the call site over the shared fixed width
----@field height? number|table        -- FIXED height (number). tabs also accept a size SPEC (as `width`)
+---@field height? number|table        -- FIXED height (number). tabs also accept a size SPEC (as `width`). INPUT: height > 1 makes a MULTILINE editable field (Enter inserts a newline; <C-s> saves, q/<Esc> closes; the whole buffer is read back joined by "\n")
 ---@field max_width? number          -- auto-fit cap (fraction ≤1 or count)
 ---@field max_height? number         -- auto-fit cap (fraction ≤1 or count)
 ---@field position? string           -- "cursor" (anchor at the cursor) | "win" | "bottom" | "top" | nil (centred)
@@ -539,6 +542,15 @@ function M.input(opts)
     local confirmed = false
     local buf
 
+    -- MULTILINE input: `height > 1` turns the field into a several-row editable buffer (a long or
+    -- formatted value — code, JSON, paragraphs — edited whole, not squeezed into one scrolling line).
+    -- Enter then inserts a newline instead of confirming, so confirm/cancel move to <C-s>/<Esc> and the
+    -- whole buffer is read back joined by "\n". A single-line input is unchanged.
+    local height = math.max(1, math.floor(tonumber(opts.height) or 1))
+    local multiline = height > 1
+    ---@type string[]
+    local default_lines = vim.split(default, "\n", { plain = true })
+
     -- The side gutter is the block's own BORDER — a blank " " left and right (see `border` below) — so it is
     -- neither content nor decoration: it is the window's geometry, and the value's column 0 is the value's
     -- first character. Baking it into the line as text (`"  " .. value`) is what a naive input does, and it
@@ -559,9 +571,15 @@ function M.input(opts)
         confirmed = true
         local val = ""
         if buf and vim.api.nvim_buf_is_valid(buf) then
-            val = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+            if multiline then
+                -- The value is the WHOLE buffer, joined by newlines — no edge trim, so a value whose own
+                -- formatting includes leading/trailing blank lines round-trips faithfully.
+                val = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            else
+                val = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+                val = val:match("^%s*(.-)%s*$") or "" -- the value IS the line now; only stray edge whitespace goes
+            end
         end
-        val = val:match("^%s*(.-)%s*$") or "" -- the value IS the line now; only stray edge whitespace goes
         scrub()
         st.close()
         vim.schedule(function()
@@ -584,13 +602,29 @@ function M.input(opts)
             -- window must be WIDER than that, or it fills the row edge to edge (no trailing air, and centring
             -- becomes a no-op because there is nothing left to centre in).
             local title = util.dw(opts.title or opts.prompt or "Input") + 2 -- the spaces the frame wraps it in
-            return math.max(util.dw(default), title + PAD * 2, 30), 1
+            -- Width from the widest line (a multiline value's lines differ); height is the requested rows.
+            local widest = 0
+            for _, l in ipairs(default_lines) do
+                widest = math.max(widest, util.dw(l))
+            end
+            return math.max(widest, title + PAD * 2, 30), height
         end,
         render = function()
-            return { default }, {}
+            return default_lines, {}
         end,
         keys = function(map, p, st)
             buf = p.buf
+            -- A `filetype` (a multiline code/JSON editor) turns the field into a real editor: setting it drives
+            -- the FileType autocmds, so treesitter highlighting (via lvim-ts) and any LSP that attaches on that
+            -- filetype come along — the value is edited as CODE, not plain text. Scheduled so the buffer already
+            -- holds its seeded lines when the highlighter first parses it.
+            if opts.filetype and opts.filetype ~= "" then
+                vim.schedule(function()
+                    if p.buf and vim.api.nvim_buf_is_valid(p.buf) then
+                        vim.bo[p.buf].filetype = opts.filetype
+                    end
+                end)
+            end
             -- MASK: conceal every character with `•` so a password is never on screen. The real text stays in
             -- the buffer (read on confirm); only the DISPLAY is hidden. `concealcursor = "nvic"` keeps the
             -- current line concealed while inserting (without the `i`, typing would reveal the value). A per-
@@ -605,26 +639,53 @@ function M.input(opts)
             -- there has nothing left to delete — the gutter is the block's border, not text.
             vim.schedule(function()
                 if p.win and vim.api.nvim_win_is_valid(p.win) then
-                    pcall(vim.api.nvim_win_set_cursor, p.win, { 1, #default })
+                    local last = #default_lines
+                    pcall(vim.api.nvim_win_set_cursor, p.win, { last, #(default_lines[last] or "") })
                 end
             end)
-            vim.keymap.set("i", "<CR>", function()
-                vim.cmd("stopinsert")
-                confirm(st)
-            end, { buffer = p.buf, nowait = true })
-            vim.keymap.set("i", "<Esc>", function()
-                vim.cmd("stopinsert")
-                st.close()
-            end, { buffer = p.buf, nowait = true })
-            map("<CR>", function()
-                confirm(st)
-            end)
+            if multiline then
+                -- A multiline field is a real editor: show LINE NUMBERS (a code/JSON value is navigated by
+                -- line). Its own window only — a per-window option, not the global 'number'.
+                if p.win and vim.api.nvim_win_is_valid(p.win) then
+                    vim.wo[p.win].number = true
+                    vim.wo[p.win].numberwidth = 4
+                end
+                -- Enter is a NEWLINE here (it is a text editor), so confirm/cancel move off it. <C-s> saves
+                -- from either mode; <Esc> in insert drops to normal (to navigate/edit), and confirm/close are
+                -- driven from normal mode + the footer, never by swallowing Enter.
+                vim.keymap.set({ "i", "n" }, "<C-s>", function()
+                    vim.cmd("stopinsert")
+                    confirm(st)
+                end, { buffer = p.buf, nowait = true })
+                map("<C-s>", function()
+                    confirm(st)
+                end)
+                map("q", function()
+                    st.close()
+                end)
+            else
+                vim.keymap.set("i", "<CR>", function()
+                    vim.cmd("stopinsert")
+                    confirm(st)
+                end, { buffer = p.buf, nowait = true })
+                vim.keymap.set("i", "<Esc>", function()
+                    vim.cmd("stopinsert")
+                    st.close()
+                end, { buffer = p.buf, nowait = true })
+                map("<CR>", function()
+                    confirm(st)
+                end)
+            end
         end,
     }
 
     frame.open({
         origin = opts.origin, -- return focus HERE on close (a popup opened from another frame)
         mode = "float",
+        -- Explicit stacking, when the default "above every live frame" is not enough: an input docked OVER
+        -- another surface's panels (lvim-db's JSON editor over the result + drawer splits) must clear any
+        -- decoration a split draws in its own floating layer. Passed through so the caller can force it.
+        zindex = opts.zindex,
         -- ANCHOR the input over an exact spot instead of centring it: `at = { win, row, col }` in that
         -- window's own 0-based text coordinates. For an editor that must sit ON the value it edits (a grid
         -- cell), where a centred popup — or `position = "cursor"`, which drops BELOW the caret — would cover
@@ -649,22 +710,45 @@ function M.input(opts)
         -- a full border ring). A title ROW is drawn by us, so it centres exactly — and the input looks like the
         -- rest of the set instead of being the one primitive with its own title mechanism.
         title_pos = opts.title_pos or "center",
-        size = { width = { auto = true, max = opts.width or 0.6 }, height = { auto = true } },
+        -- WIDTH: fixed when the popup must MATCH a region — a `bare` field is anchored ON a grid cell and must
+        -- be exactly the width it was told (the column), a MULTILINE editor must fill the width it was given;
+        -- a plain centred input auto-fits (capped by `width`).
+        -- HEIGHT: fixed ONLY for multiline (a real row count). A single-line field keeps AUTO height — a fixed
+        -- height of 1 would be read as "1.0 = 100% of the screen" (axis_size treats `fixed <= 1` as a screen
+        -- FRACTION), which made a 1-row cell editor as tall as the editor and, via the fit-to-screen clamp,
+        -- flung it to the top of the screen.
+        size = {
+            width = (multiline or opts.bare or opts.width_fixed) and { fixed = opts.width or 0.6 }
+                or { auto = true, max = opts.width or 0.6 },
+            height = multiline and { fixed = height } or { auto = true },
+        },
         -- The gutter is the CONTENT BLOCK's border: blank " " cells left and right (no ring — top/bottom stay
         -- empty), so the value never butts the popup edge and the padding cannot be typed into or deleted.
+        -- A BARE field drops it: it is anchored ON a grid cell and must be EXACTLY the column width, its first
+        -- character on the cell's first column — a 1-cell gutter would eat two cells of width and shove the
+        -- text one cell right of the value it edits.
         content = {
             blocks = {
                 {
                     id = "input",
                     provider = provider,
-                    border = { "", "", "", " ", "", "", "", " " },
+                    border = opts.bare and "none" or { "", "", "", " ", "", "", "", " " },
                 },
             },
         },
         footer = (not opts.bare) and {
             bars = {
                 {
-                    items = {
+                    items = multiline and {
+                        { key = "<C-s>", name = "save", run = confirm },
+                        {
+                            key = "q",
+                            name = "close",
+                            run = function(st)
+                                st.close()
+                            end,
+                        },
+                    } or {
                         { key = "<CR>", name = "confirm", run = confirm },
                         {
                             key = "<Esc>",
@@ -1382,7 +1466,9 @@ function M.tabs(opts)
         -- Docked: "area" sits IN the cmdline region (grows cmdheight, chrome above), "bottom" floats over the
         -- bottom rows; `host` re-homes an area panel INSIDE the msgarea zone (above the messages). Float = nil.
         position = area and "cmdline" or (bottom and "bottom") or nil,
-        zindex = (area and 200) or nil, -- the surface bumps a hosted area dock to 210 in its auto-host block
+        -- Explicit `opts.zindex` wins (a float opened OVER another surface's docked panels must clear that
+        -- surface's own decoration floats); else an area dock hints 200 (bumped to 210 when hosted); else auto.
+        zindex = opts.zindex or (area and 200) or nil,
         header_air = docked and false or nil,
         -- The canonical full " " ring on EVERY mode; the chassis owns the title placement: a native centered
         -- border-title in the top border by default, or (area + `title_line="statusline"`) the chrome overlay.

@@ -2806,6 +2806,8 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     -- generic "close all floating windows" / "focus next float" helper skips it instead of tearing the panel
     -- out from under the frame.
     vim.w[pan.win].lvim_frame = true
+    vim.w[pan.win].lvim_frame_owner = tostring(state)
+    vim.w[pan.win].lvim_frame_modal = state.cfg.mode == "float"
     if want_focus then
         pcall(api.nvim_set_current_win, pan.win)
     end
@@ -2868,6 +2870,16 @@ end
 ---@param cfg table
 ---@return { mode: string, amount: number, bg: string }?
 local function resolve_backdrop(cfg)
+    -- A DOCKED SPLIT is a PERSISTENT side/bottom PANEL (the lvim-db drawer + its result grid, a file tree) —
+    -- a real docked window, not a modal. It never dims the editor, so it must NOT resolve a backdrop: doing so
+    -- makes it grab the single `active_surface_bd` slot, and then a modal opened OVER it (a row popup, the
+    -- control center) sees the slot held and SKIPS its own veil. That is exactly "the backdrop does not apply
+    -- in the db layout" — the always-open panels were holding the slot. A real MODAL never reaches here with a
+    -- `dock`: float carries none, and area/bottom identify by `position`, so keying on a docked split is safe.
+    -- (`backdrop_layout` maps a docked split to "float" by fallback, so without this it inherited the veil.)
+    if cfg.native or (cfg.mode == "split" and cfg.dock ~= nil) then
+        return nil
+    end
     local bd = require("lvim-utils.dock").slot(backdrop_layout(cfg), { backdrop = cfg.backdrop }).backdrop
     if not bd or bd.enabled == false then
         return nil
@@ -2906,30 +2918,59 @@ local function open_backdrop(state)
     if state.skip_backdrop then
         return
     end
-    -- A surface backdrop is ALREADY active for another open surface (two coexisting docks: area + bottom, each
-    -- with an EXPLICIT zindex — the auto-zindex skip above never covers them). Do NOT install a second: the
-    -- existing veil already covers the editor behind both, and letting THIS surface own the tracker would orphan
-    -- the first's veil when this one closes. Mirrors the auto-zindex "stacked above a frame ⇒ skip our own".
-    if active_surface_bd and active_surface_bd ~= state then
-        state.skip_backdrop = true
-        -- Remember it so the owner can hand the veil off to this surface when it closes first (see close()).
-        bd_skippers[state] = true
-        return
-    end
     local bd = resolve_backdrop(state.cfg)
     if not bd then
         return
     end
-    active_surface_bd = state
-    -- `protect(win)` = this surface's OWN windows (the container + every panel carry the `lvim_frame` window
-    -- marker, or the FRAME_FT filetype for a panel whose buffer a consumer swapped) — never muted. Keyed by the
-    -- state's identity so several backdrops could coexist in the shared applier (here one at a time).
-    require("lvim-utils.dim").apply_backdrop(tostring(state), {
+    -- A `float` is a MODAL: everything behind it recedes, INCLUDING other panels (the lvim-db drawer + grid, a
+    -- file tree) AND a modal opened EARLIER (a row popup under a field editor) — so over a panel-heavy
+    -- workspace the veil is visible and a STACK of modals reads top-to-bottom. A DOCKED surface (a picker, an
+    -- outline, a bottom dock) is worked ALONGSIDE its neighbours: it leaves the OTHER panels lit, mutes only
+    -- the plain editor, and coexisting docks SHARE one veil.
+    local is_modal = state.cfg.mode == "float"
+    local state_id = tostring(state)
+    if not is_modal then
+        -- DOCKS share ONE veil: a second dock skips its own (the first's already covers the editor). Letting
+        -- THIS dock own the tracker would orphan the first's veil when this one closes.
+        if active_surface_bd and active_surface_bd ~= state then
+            state.skip_backdrop = true
+            bd_skippers[state] = true -- so the owner can hand the veil off when it closes first (see close())
+            return
+        end
+        active_surface_bd = state
+    end
+    -- MODALS coexist — each keyed by its OWN state id, so a second modal's veil sits on top of the first's
+    -- rather than being suppressed. `dim.apply_backdrop` handles overlapping backdrops.
+    local my_z = state.zindex or 50
+    require("lvim-utils.dim").apply_backdrop(state_id, {
         enabled = true,
         mode = bd.mode,
         amount = bd.amount,
         bg = bd.bg,
+        -- A modal dims panel buffers too; a docked surface keeps the shared "sidebars stay lit" rule.
+        dim_panels = is_modal,
         protect = function(w)
+            if not api.nvim_win_is_valid(w) then
+                return false
+            end
+            if is_modal then
+                -- A modal veil mutes everything BEHIND it — a LOWER zindex: the editor, the panels, AND a modal
+                -- opened earlier — and leaves everything AT or ABOVE it untouched: its own windows, and a modal
+                -- stacked LATER on top (a field editor over the row popup). Panels/splits carry no zindex (→ 0),
+                -- so they always recede. This is what makes a stack of modals read correctly: only the topmost
+                -- is lit, each one below it dimmed by the one above.
+                local wz = api.nvim_win_get_config(w).zindex or 0
+                return wz >= my_z
+            end
+            -- LENIENT — never dim any frame window, so a docked surface leaves a neighbouring panel lit.
+            return vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT
+        end,
+        -- `focus_keeps` answers a DIFFERENT question than `protect`: not "leave this window undimmed" but
+        -- "keep the veil UP while THIS window has focus". It must be TRUE for EVERY surface window, not just
+        -- this modal's own — otherwise a SECOND modal opened over the first (a field editor over the row
+        -- popup) would look like the editor gained focus, and the first modal's focus-aware veil would LIFT.
+        -- The dim loop still uses the strict `protect`; only the focus lift uses this.
+        focus_keeps = function(w)
             return api.nvim_win_is_valid(w)
                 and (vim.w[w].lvim_frame == true or vim.bo[api.nvim_win_get_buf(w)].filetype == FRAME_FT)
         end,
@@ -3027,6 +3068,8 @@ local function open_windows(state)
     -- The CONTAINER holds only chrome and is never directly interacted with — always mark it so generic
     -- float helpers ("close all floats" / "focus next float") skip it and land on the content panel.
     vim.w[state.container_win].lvim_frame = true
+    vim.w[state.container_win].lvim_frame_owner = tostring(state)
+    vim.w[state.container_win].lvim_frame_modal = state.cfg.mode == "float"
     vim.wo[state.container_win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPeekBorder"
 
     render_chrome(state, L)
@@ -3120,6 +3163,8 @@ local function open_windows(state)
                 -- prompt) looked to the applier like the editor still had focus: the veil never came down, so a
                 -- float picker showed NO backdrop at all.
                 vim.w[band.win].lvim_frame = true
+                vim.w[band.win].lvim_frame_owner = tostring(state)
+                vim.w[band.win].lvim_frame_modal = state.cfg.mode == "float"
                 -- The typed area uses `input_hl` (the row's Normal bg); the prompt badge uses `prompt_hl`.
                 vim.wo[band.win].winhighlight = "Normal:" .. (band.input_hl or "LvimUiPeekNormal")
                 -- No wrap/continuation chrome on the 1-row prompt (a long query scrolls horizontally; a
@@ -3888,6 +3933,8 @@ function dyn_show(state)
             zindex = (state.zindex or 50) + 1,
         })
         vim.w[d.win].lvim_frame = true -- a frame window (see the input band): never muted, and it holds the veil
+        vim.w[d.win].lvim_frame_owner = tostring(state)
+        vim.w[d.win].lvim_frame_modal = state.cfg.mode == "float"
         vim.wo[d.win].winhighlight = "Normal:LvimUiPeekNormal,FloatBorder:LvimUiPickerSeparator"
         vim.wo[d.win].wrap = false
         -- a FRESH window has no winbar; make the provider re-assert the file title bar on the next update
