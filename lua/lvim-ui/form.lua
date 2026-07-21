@@ -344,9 +344,11 @@ function M.new(opts)
             local lead = opts.pad or 2
             for i, r in ipairs(fr) do
                 -- row_display owns the row layout and hands back its byte anchors: `icon_at` (offset of
-                -- `r.icon` within `disp`, tracking `tight`/`flat`) and `type_w` (the leading auto-glyph width).
-                -- The per-part colouring below just adds the body lpad (`lead`) — it never re-derives the layout.
-                local disp, icon_at, type_w = rows.row_display(r, ico)
+                -- `r.icon` within `disp`, tracking `tight`/`flat`), `type_w` (the leading auto-glyph width), and
+                -- `label_at` (offset of the LABEL). The per-part colouring below just adds the body lpad (`lead`)
+                -- — it never re-derives the layout (the icon↔label gap in particular: it is 1 on every shape but
+                -- the flat typed-string row, and re-deriving it from `flat` alone silently mispaints action rows).
+                local disp, icon_at, type_w, label_at = rows.row_display(r, ico)
                 if r.type == "bar" then
                     -- A toolbar row rendered through the SHARED ui.bar: centered button boxes that own their
                     -- overflow chevrons (so a wide bar scrolls instead of clipping). Three button states:
@@ -442,10 +444,13 @@ function M.new(opts)
                             hls[#hls + 1] = { i - 1, base, base + #ricon, r.icon_hl }
                         end
                         local label = r.label or r.name or ""
-                        -- The label starts right after the icon. A normal (action) row separates them with ONE
-                        -- space (`ri = icon .. " "`), so +1; a `flat` typed row puts the icon and label ADJACENT
-                        -- (each carries its own padding as a self-contained box), so no gap.
-                        local ls = base + (ricon and (#ricon + (r.flat and 0 or 1)) or 0)
+                        -- The label anchor comes STRAIGHT from row_display (`label_at`), which owns the icon↔label
+                        -- gap for every row shape — so a flat ACTION row (icon + 1-space `ri` + label) colours its
+                        -- label correctly, where the old `r.flat and 0 or 1` guess dropped the gap and painted one
+                        -- byte early (leaving the label's LAST character uncoloured). Fall back to the old formula
+                        -- only if row_display reports no label column.
+                        local ls = label_at and (lead + label_at)
+                            or (base + (ricon and (#ricon + (r.flat and 0 or 1)) or 0))
                         if r.label_spans and label ~= "" then
                             -- Per-SEGMENT label colours: a list of `{ c0, c1, hl }` BYTE offsets INTO the label
                             -- (so a row can paint e.g. its location one colour and its snippet another). Takes

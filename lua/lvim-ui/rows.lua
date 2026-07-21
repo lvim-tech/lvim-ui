@@ -109,6 +109,11 @@ end
 ---                          lives inside its own coloured segments)
 ---@return integer type_w    byte width of the leading type glyph (bool/select/number/action/caret) at the row
 ---                          start; 0 when there is none (flat rows, segmented, spacer_line) — dim exactly this
+---@return integer? label_at byte offset of the LABEL within `disp` — the anchor for `text_hl`/`label_spans`.
+---                          row_display OWNS the gap between icon and label (a 1-space `ri` gutter on every
+---                          shape EXCEPT the flat typed-string row, whose icon+label are adjacent boxes), so a
+---                          caller must take this and never re-derive it from `flat` (they diverge). nil for
+---                          `segmented`/`spacer_line` (no single label column)
 function M.row_display(row, ico)
     local t = row.type or "string"
     local label = row.label or row.name or ""
@@ -126,12 +131,12 @@ function M.row_display(row, ico)
     if row.children then
         local glyph = row.flat and "" or caret(row, ico)
         local prefix = glyph .. (row.tight and "" or "  ")
-        return prefix .. ri .. label, #prefix, #glyph
+        return prefix .. ri .. label, #prefix, #glyph, #prefix + #ri
     end
 
     if t == "bool" or t == "boolean" then
         local glyph = row.value and ico.bool_on or ico.bool_off
-        return glyph .. "  " .. ri .. label, #glyph + 2, #glyph
+        return glyph .. "  " .. ri .. label, #glyph + 2, #glyph, #glyph + 2 + #ri
     elseif t == "segmented" then
         local prefix, segs = M.segmented_segments(row, ico)
         local texts = {}
@@ -139,11 +144,11 @@ function M.row_display(row, ico)
             texts[#texts + 1] = sg.text
         end
         -- segmented starts with `ri`/label (its options carry the colour) — no leading type glyph to dim.
-        return prefix .. table.concat(texts, " "), nil, 0
+        return prefix .. table.concat(texts, " "), nil, 0, nil
     elseif t == "select" then
-        return ico.select .. "  " .. ri .. label .. ": " .. val, #ico.select + 2, #ico.select
+        return ico.select .. "  " .. ri .. label .. ": " .. val, #ico.select + 2, #ico.select, #ico.select + 2 + #ri
     elseif t == "int" or t == "integer" or t == "float" or t == "number" then
-        return ico.number .. "  " .. ri .. label .. ": " .. val, #ico.number + 2, #ico.number
+        return ico.number .. "  " .. ri .. label .. ": " .. val, #ico.number + 2, #ico.number, #ico.number + 2 + #ri
     elseif t == "string" or t == "text" then
         -- `flat` + an explicit `icon`: the row carries its OWN leading glyph (a per-value type icon) in
         -- place of the generic string glyph — so a form can show what KIND of value each field holds. Layout
@@ -154,23 +159,23 @@ function M.row_display(row, ico)
             -- No `: ` separator for a flat typed row. The icon and label are self-contained tinted boxes set
             -- ADJACENT (each carries its own space padding, so the two tints touch with no uncolored gap); one
             -- space between the label box and the value, so the value text is not flush against the tint.
-            return row.icon .. label .. " " .. val, 0, #row.icon
+            return row.icon .. label .. " " .. val, 0, #row.icon, #row.icon
         end
-        return ico.string .. "  " .. ri .. label .. ": " .. val, #ico.string + 2, #ico.string
+        return ico.string .. "  " .. ri .. label .. ": " .. val, #ico.string + 2, #ico.string, #ico.string + 2 + #ri
     elseif t == "action" then
         -- a `tight` flat row drops the 2-space lead entirely (its own `icon` carries any leading marker) — a
         -- compact list (e.g. a picker's items) where the row content sits right at the panel edge. 2nd return
         -- = the byte offset of `row.icon` (the prefix length), consumed by the per-part colouring.
         local glyph = row.flat and "" or ico.action
         local prefix = row.flat and (row.tight and "" or "  ") or (glyph .. "  ")
-        return prefix .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), #prefix, #glyph
+        return prefix .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), #prefix, #glyph, #prefix + #ri
     elseif t == "spacer" then
         local glyph = row.flat and "" or ico.spacer
-        return glyph .. "  " .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), nil, #glyph
+        return glyph .. "  " .. ri .. label .. (row.suffix and (" " .. row.suffix) or ""), nil, #glyph, #glyph + 2 + #ri
     elseif t == "spacer_line" then
-        return "", nil, 0
+        return "", nil, 0, nil
     end
-    return "   " .. label, nil, 0
+    return "   " .. label, nil, 0, 3
 end
 
 --- Build a segmented row's prefix and its segment list (text + option), honouring

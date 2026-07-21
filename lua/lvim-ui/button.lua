@@ -156,13 +156,15 @@ function M.render(spec, state)
     -- is padding to consume on both sides (else brackets would widen the button). The brackets wear the text
     -- colour (itself the deeper hover tint).
     --
-    -- ONLY for a KEY-LESS button. One that carries a hotkey already advertises itself through that key — the
-    -- whole key as a lead badge (`s stage`) or its letter bracketed inside the caption (`[s]tage`) — so adding
-    -- `[ ]` around the caption on top of it double-brackets the same button and reads as noise. A key-less
-    -- button (the filter bands: All / Staged / Unstaged / Untracked …) has no such cue, and these brackets ARE
-    -- its hover affordance.
-    local keyless = not (spec.key or spec.key_pos)
-    local hovered = keyless and (state == "hover" or state == "hover_active") and tf >= 1 and tb >= 1
+    -- ONLY for a SINGLE-PART, KEY-LESS button — a bare caption with no other cue. A button that already
+    -- advertises itself some OTHER way must NOT also get `[ ]`, or it double-brackets and reads as noise:
+    --   · a hotkey — the whole key as a lead badge (`s stage`) or its letter bracketed inside the caption
+    --     (`[s]tage`);
+    --   · a lead box — an icon/badge two-part button (`icon + label` TAB) whose glyph is its affordance.
+    -- Only a truly cue-less button (the filter bands: All / Staged / Unstaged / Untracked …) has nothing to
+    -- lean on, and for it these hover brackets ARE the affordance.
+    local two_part = (lead and lead ~= "") or spec.key or spec.key_pos
+    local hovered = not two_part and (state == "hover" or state == "hover_active") and tf >= 1 and tb >= 1
     if hovered then
         put(sp(tf - 1) .. "[", thl)
     else
