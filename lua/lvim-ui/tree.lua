@@ -359,8 +359,19 @@ function M.new(opts)
                 local gap = icon ~= "" and " " or ""
                 -- Cut the row to the CONTENT width (the panel minus the right padding + scrollbar column).
                 -- Without this a long label runs under the bar — the bar is painted ON the last column, so it
-                -- would sit on top of the text instead of beside it.
-                lines[#lines + 1] = clip(prefix .. fold_cell .. icon .. gap .. (n.label or ""), width - pad_right_eff)
+                -- would sit on top of the text instead of beside it. Right-aligned badges are pinned to that
+                -- edge, so RESERVE their display width (plus a 1-col gap) here too — otherwise a long label
+                -- runs UNDER the badges and they overlap; reserving makes the label clip so the badges (e.g. a
+                -- file's aggregate count) stay fully visible on a narrow panel.
+                local badge_w = 0
+                if n.badges and #n.badges > 0 then
+                    for _, b in ipairs(n.badges) do
+                        badge_w = badge_w + util.dw(b[1] or "")
+                    end
+                    badge_w = badge_w + 1 -- a gap between the label and the badge cluster
+                end
+                lines[#lines + 1] =
+                    clip(prefix .. fold_cell .. icon .. gap .. (n.label or ""), width - pad_right_eff - badge_w)
                 local row = #lines
 
                 if #prefix > 0 then
