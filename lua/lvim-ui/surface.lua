@@ -1578,10 +1578,16 @@ local function clamp_view(pan)
     if not info then
         return
     end
-    local max_top = math.max(1, api.nvim_buf_line_count(pan.buf) - api.nvim_win_get_height(pan.win) + 1)
+    local buf_lines = api.nvim_buf_line_count(pan.buf)
+    local max_top = math.max(1, buf_lines - api.nvim_win_get_height(pan.win) + 1)
     if info.topline > max_top then
         api.nvim_win_call(pan.win, function()
-            vim.fn.winrestview({ topline = max_top, lnum = math.min(vim.fn.line("."), max_top) })
+            -- Pull the TOPLINE back onto the content. The cursor must only be kept VISIBLE — i.e. inside
+            -- the range this topline shows, [max_top, buf_lines] — never dragged to `max_top` itself: a
+            -- follow tree parks its cursor deep in the list (the open file), which is perfectly visible
+            -- once the topline is clamped, so `min(line, max_top)` would yank the selection up the tree.
+            local lnum = math.max(max_top, math.min(vim.fn.line("."), buf_lines))
+            vim.fn.winrestview({ topline = max_top, lnum = lnum })
         end)
     end
 end

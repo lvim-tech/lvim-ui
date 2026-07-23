@@ -97,6 +97,7 @@ end)
 ---@class LvimUiTreeOpts
 ---@field root? LvimUiTreeNode|LvimUiTreeNode[]|fun(): LvimUiTreeNode[]  initial top level (see `set_root`)
 ---@field default_expanded? boolean     nodes start EXPANDED (an outline) or COLLAPSED (a file tree); default false
+---@field expanded? table<string, boolean>  initial per-id fold OVERRIDES (id → expanded?), e.g. a saved fold state restored on reopen
 ---@field connectors? boolean           ├/└ connectors on leaf rows that have a parent (default false)
 ---@field elide_guides? boolean         drop the ancestor guide column below a LAST child (default true);
 ---                                     false keeps a solid │ for every level (the file-tree style)
@@ -203,7 +204,9 @@ function M.new(opts)
     ---@class LvimUiTreeState
     local state = {
         roots = nil, ---@type LvimUiTreeNode[]|fun(): LvimUiTreeNode[]|nil  the top level (list or factory)
-        override = {}, ---@type table<string, boolean>  per-id fold override (absent = `default_expanded`)
+        -- Seeded from `opts.expanded` so a consumer can RESTORE a saved fold state (the file tree persists
+        -- its expansions across close/reopen); a fresh copy, since the tree mutates it as the user folds.
+        override = vim.deepcopy(opts.expanded or {}), ---@type table<string, boolean>  per-id fold override (absent = `default_expanded`)
         lazy = {}, ---@type table<string, boolean>  per-id: this node's children are a FUNCTION (see is_expanded)
         rows = {}, ---@type table<integer, table>  buffer line → row entry { node, parent, c0, c1 }
         order = {}, ---@type table[]               row entries in display order (visible walk order)
@@ -460,10 +463,17 @@ function M.new(opts)
         if not row then
             return
         end
-        pcall(api.nvim_buf_set_extmark, pan.buf, ns_mark, row - 1, 0, {
-            line_hl_group = groups.mark,
-            priority = 200,
-        })
+        -- The mark is a positioning target AND a visible line highlight, but PAINT it only while this panel is
+        -- NOT the current window. When it IS current the user is navigating and cursorline is the one
+        -- selection indicator; a second highlight stuck on the open file / followed symbol on top of that is
+        -- just noise (the reported "the active-file highlight never goes away while I click around the tree").
+        -- WinEnter/WinLeave re-run apply_mark so this toggles the instant focus crosses the panel border.
+        if groups.mark and pan.win and api.nvim_get_current_win() ~= pan.win then
+            pcall(api.nvim_buf_set_extmark, pan.buf, ns_mark, row - 1, 0, {
+                line_hl_group = groups.mark,
+                priority = 200,
+            })
+        end
         if move and pan.win and api.nvim_win_is_valid(pan.win) and api.nvim_get_current_win() ~= pan.win then
             pcall(api.nvim_win_set_cursor, pan.win, { row, 0 })
         end
@@ -501,6 +511,29 @@ function M.new(opts)
         end
     end
 
+    --- A compact fingerprint of everything a paint puts on screen — the row TEXT plus every highlight span
+    --- and badge (virtual-text) chunk. Two renders with an equal signature would paint pixel-identical
+    --- buffers, so the second can be skipped. (The follow MARK lives in its own namespace, updated by
+    --- `mark()` directly, so it is deliberately NOT part of this.)
+    ---@param lines string[]
+    ---@param hls table[]
+    ---@param virts table[]
+    ---@return string
+    local function paint_signature(lines, hls, virts)
+        local p = { table.concat(lines, "\n") }
+        for _, h in ipairs(hls) do
+            p[#p + 1] = h[1] .. "," .. h[2] .. "," .. h[3] .. "," .. tostring(h[4])
+        end
+        for _, v in ipairs(virts) do
+            local chunks = {}
+            for _, c in ipairs(v[2] or {}) do
+                chunks[#chunks + 1] = (c[1] or "") .. "\2" .. tostring(c[2] or "")
+            end
+            p[#p + 1] = v[1] .. "\3" .. table.concat(chunks, "\4") .. "\3" .. tostring(v[3])
+        end
+        return table.concat(p, "\1")
+    end
+
     --- Repaint the panel buffer from the current roots + fold state (synchronous).
     local function render()
         local pan = state.pan
@@ -518,6 +551,21 @@ function M.new(opts)
             return
         end
         state.dirty = false -- this render satisfies any queued refresh (its callback checks the flag)
+        -- Re-seat the panel cursor after this repaint keeps it on the right NODE, not a stale line number.
+        -- `nvim_buf_set_lines(0, -1, …)` replaces the whole buffer, so a BACKGROUND repaint (a diagnostics
+        -- refresh, a git poll, an fs-event rescan) would otherwise let the window cursor fall to a stale line
+        -- or clamp to the top/bottom. TWO cases, resolved after the lines are set (below):
+        --   * FOLLOWING — this panel is NOT the current window and a follow MARK is set (the file tree marks
+        --     the open buffer, the outline the symbol under the code cursor): re-seat on the MARK. The mark is
+        --     the authoritative target and survives a buffer that shrank under the cursor — capturing the
+        --     cursor's node instead would "preserve" a line the cursor was already wrongly clamped to.
+        --   * NAVIGATING — the panel is current (or unmarked): preserve the node the cursor was on, so a
+        --     background repaint never moves the user's selection.
+        local keep_id
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            local e = state.rows[api.nvim_win_get_cursor(pan.win)[1]]
+            keep_id = e and e.node and e.node.id or nil
+        end
         local width = (pan.win and api.nvim_win_is_valid(pan.win)) and api.nvim_win_get_width(pan.win) or 80
         state.last_width = width -- the width this render's clipping was derived from (see the resize autocmd)
         -- The scrollbar only appears when the content OVERFLOWS, and only then does it need a column reserved.
@@ -542,6 +590,16 @@ function M.new(opts)
         for _ = 1, footer_reserve do
             lines[#lines + 1] = "" -- the row the footer float overlays; the clamp keeps the selection off it
         end
+        -- Skip a redundant repaint. A background trigger (a diagnostics timer, a git poll, an fs-event
+        -- rescan, a follow reveal into an already-open branch) fires render() even when NOTHING visible
+        -- changed; rewriting the whole buffer + extmarks then still FLICKERS the panel and jars its scroll.
+        -- When the paint fingerprint matches the last one, the buffer already shows exactly this — bail
+        -- before touching it. A real change (a new/removed row, a diagnostic badge) differs and paints.
+        local sig = paint_signature(lines, hls, virts)
+        if sig == state.paint_sig and pan.buf == state.paint_buf then
+            return -- same fingerprint IN THE SAME buffer: a fresh buffer (surface re-layout) must repaint
+        end
+        state.paint_sig, state.paint_buf = sig, pan.buf
         vim.bo[pan.buf].modifiable = true
         api.nvim_buf_set_lines(pan.buf, 0, -1, false, lines)
         vim.bo[pan.buf].modifiable = false
@@ -571,6 +629,19 @@ function M.new(opts)
             })
         end
         apply_mark(false)
+        -- FOLLOW target (the mark) wins while this panel is not the current window; otherwise keep the node
+        -- the cursor was on (see the capture above). A target with no row in the new listing (collapsed /
+        -- filtered out) leaves the cursor where nvim clamped it.
+        local following = state.marked ~= nil and pan.win and api.nvim_get_current_win() ~= pan.win
+        local target = following and state.marked or keep_id
+        if target and pan.win and api.nvim_win_is_valid(pan.win) then
+            for line, e in pairs(state.rows) do
+                if e.node.id == target then
+                    pcall(api.nvim_win_set_cursor, pan.win, { line, 0 })
+                    break
+                end
+            end
+        end
         bind_actions()
         if opts.on_render then
             opts.on_render(t)
@@ -861,6 +932,19 @@ function M.new(opts)
                         local e = state.rows[line]
                         opts.on_move(e and e.node or nil, t)
                     end
+                end,
+            })
+            -- Repaint the follow mark the instant focus crosses the panel border: apply_mark shows it only
+            -- while the panel is NOT current, but no content render fires on a bare focus change, so without
+            -- this the mark would linger over a now-focused tree (or stay hidden after focus leaves) until the
+            -- next repaint. Deferred so the current window has settled before apply_mark reads it.
+            api.nvim_create_autocmd({ "WinEnter", "WinLeave" }, {
+                callback = function()
+                    vim.schedule(function()
+                        if not state.destroyed and pan.buf and api.nvim_buf_is_valid(pan.buf) then
+                            apply_mark(false)
+                        end
+                    end)
                 end,
             })
             bind_actions() -- rows rendered before `keys` fires — bind what that pass collected
