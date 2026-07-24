@@ -1581,11 +1581,18 @@ function M.tabs(opts)
             end
             -- (HOSTED area) the reserved zone rows are released by the surface engine (its `state._host_release`,
             -- set by the auto-host provider) — ui no longer releases them itself.
-            if not done then
-                vim.schedule(function()
+            --
+            -- Re-check `done` INSIDE the scheduled call, never at schedule time. An item-row <CR> confirms
+            -- through `on_action_close` (which sets `done` and fires `cb` WITH its result), and that lands
+            -- AFTER the surface has begun tearing down — so a guard evaluated here would still see
+            -- `done == false`, queue a cancel, and deliver a SECOND `cb(false)` right after the real one.
+            -- Consumers that read a false as "cancelled" then undo their own confirmed action: the theme
+            -- picker applied the chosen theme and instantly reverted it to the pre-open one on <CR>.
+            vim.schedule(function()
+                if not done then
                     cb(false)
-                end)
-            end
+                end
+            end)
         end,
     })
 
@@ -2156,11 +2163,13 @@ function M.transient(opts)
         content = { blocks = { { id = "form", provider = form_p, border = CONTENT_BORDER } } },
         footer = footer_spec(),
         on_close = function()
-            if not done then
-                vim.schedule(function()
+            -- Guard INSIDE the scheduled call (same hazard as the tabs presenter): a confirm that lands
+            -- during teardown must suppress this cancel, not race it.
+            vim.schedule(function()
+                if not done then
                     cb(false)
-                end)
-            end
+                end
+            end)
         end,
     })
 
