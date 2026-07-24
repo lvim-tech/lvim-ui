@@ -2641,6 +2641,22 @@ local function place_panels(state, L)
             pcall(api.nvim_win_set_config, pan.win, panel_win_config(state, pl))
         end
     end
+    -- A PARKED preview (hidden / `dynamic`) is NOT in `state.panels`, so the loop above skips it — and its
+    -- window is still open (parking never closes it: a WinClosed would bounce focus to the editor). It must
+    -- therefore be re-parked BEHIND the list on EVERY reflow, not only at the moment it was dropped: a
+    -- reflow that MOVES the surface (a host-zone reposition, a resize, a re-fit after a content swap) would
+    -- otherwise strand it at its old rect — a full-width block of stale file content floating over the
+    -- editor, above it in z-order. MEASURED on lvim-space's docked panel: list at row 40, parked preview
+    -- left at row 31 painting a file over the buffer text.
+    local pv = state.preview_panel
+    if pv and pv.win and api.nvim_win_is_valid(pv.win) and state.panels[1] ~= pv and state.panels[2] ~= pv then
+        local lp = L.panels[1]
+        if lp then
+            local wc = panel_win_config(state, lp)
+            wc.zindex = state.zindex or 50 -- strictly BELOW the list float (zindex + 1), which covers it
+            pcall(api.nvim_win_set_config, pv.win, wc)
+        end
+    end
     -- Re-fit the editable input bands so they follow the moved panels / header (else a resize leaves the
     -- prompt stranded). A `scope_panel` band tracks its panel's top row; a plain header band its header row.
     local _, _, _, rcl = util.insets(L.cbord)
@@ -3324,6 +3340,34 @@ local function open_windows(state)
         state.preview_hidden = not state.preview_hidden
         apply_preview_side(state)
         refocus_list(state)
+    end
+    --- Show / hide the docked preview EXPLICITLY (idempotent — unlike `toggle_preview`, which flips whatever
+    --- state it finds). For a consumer that swaps the CONTENT of a live surface between views where only some
+    --- views have a preview (lvim-space's files list vs its projects/workspaces/tabs lists): the preview panel
+    --- is built ONCE at open and parked/re-docked here, so switching view neither creates nor destroys a window
+    --- — no focus bounce, no cursor-hide round trip, no zone reflow beyond the one re-fit.
+    ---
+    --- `side` re-docks on that side (the consumer's configured position, so a surface opened with
+    --- `preview_side = "hide"` — which starts on the default "right" — returns to the configured side the
+    --- first time a preview view is shown). Focus is NOT touched: the caller owns it (the list is already
+    --- current during an in-place content swap), unlike the interactive `toggle_preview`.
+    --- No-op on a surface without a "preview" block, or while the preview is the `dynamic` peek (its float
+    --- owns the preview).
+    ---@param visible boolean  true = dock the preview beside the list, false = park it
+    ---@param side? "right"|"left"  where to dock when showing (default: keep the current side)
+    state.set_preview_visible = function(visible, side)
+        if not state.preview_panel or state.preview_side == "dynamic" then
+            return
+        end
+        if side == "right" or side == "left" then
+            state.preview_side = side
+        end
+        local hidden = not visible
+        if state.preview_hidden == hidden then
+            return -- already in the requested state: never relayout for nothing
+        end
+        state.preview_hidden = hidden
+        apply_preview_side(state)
     end
     -- Opened directly into a non-docked preview state (open_windows built BOTH panels): drop the docked preview
     -- now. `hide` as an initial side = start hidden on the default side.
@@ -4132,23 +4176,12 @@ function restack_panels(state)
     end
     apply_dock_height(state, state.preview_side)
     state.sectors = build_sectors(state)
-    relayout(state) -- positions the docked panels (place_panels)
     -- The DROPPED preview is PARKED (not closed) behind the list: a WinClosed would fire the user's window
     -- managers (BufSurf, …) and bounce focus to the editor. Re-docking just returns it to `state.panels`, so the
     -- next relayout repositions it. (The list float — higher zindex + opaque — fully covers the parked one.)
-    if undocked and pv.win and api.nvim_win_is_valid(pv.win) then
-        local lp = state._geom and state._geom.panels and state._geom.panels[1]
-        if lp then
-            pcall(api.nvim_win_set_config, pv.win, {
-                relative = "editor",
-                row = lp.row,
-                col = lp.col,
-                width = math.max(1, lp.width),
-                height = math.max(1, lp.height),
-                zindex = state.zindex or 50,
-            })
-        end
-    end
+    -- The parking itself is done by `place_panels`, on EVERY reflow — not once here — so a later move of the
+    -- surface cannot strand the parked window over the editor. `relayout` runs it now.
+    relayout(state) -- positions the docked panels + re-parks the dropped one (place_panels)
 end
 
 --- Pull focus back to the list AFTER the event loop (closing a preview float bounces focus to the editor on a
@@ -4769,6 +4802,7 @@ local DEFERRED_METHODS = {
     set_counter = true,
     set_footer = true,
     set_header = true,
+    set_preview_visible = true,
     set_prompt = true,
     set_title = true,
     toggle_header = true,

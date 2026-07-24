@@ -101,7 +101,8 @@ end
 ---@field default? any               -- input: initial value
 ---@field value? any                 -- input: alias for default
 ---@field prompt? string             -- input: prompt → title fallback
----@field filetype? string           -- input (multiline): set the editable buffer's filetype, so treesitter highlighting + any matching LSP attach — the value edits as CODE (e.g. "json")
+---@field filetype? string           -- input (multiline) / info: set the buffer's filetype, so treesitter highlighting + any matching LSP attach — the value edits (or reads) as CODE (e.g. "json", "markdown")
+---@field completion? string        -- input (single-line): a |getcompletion()| kind ("file", "dir", …) — <Tab> completes the value in place, inserting a lone candidate or extending several to their longest common prefix
 ---@field zindex? integer            -- input: explicit float stacking (default: above every live frame). Force higher to sit over a docked surface's own decoration floats.
 ---@field width_fixed? boolean       -- input: a single-line field FILLS `width` (fixed) instead of fitting its content (auto). Use to open a field as wide as the popup around it.
 ---@field width? number|table        -- FIXED width (number: fraction ≤1 or count). tabs ALSO accept a size SPEC — `{ auto = true, max = n }` (fit content, capped) or `{ fixed = n }` — to FORCE auto-fit at the call site over the shared fixed width
@@ -134,13 +135,13 @@ end
 ---@field cursorline_hl? string      -- tabs: name a bg-only cursorline group so the hover changes only the bg (a row's own fg highlights survive)
 ---@field pad? integer               -- tabs/form: body row left padding
 ---@field on_item_change? fun(item: table?) -- tabs item-list mode: live preview callback on focused item (nil on a row with no item — a section header / empty row — so the consumer can clear its preview)
+---@field on_tab_change? fun(index: integer, id: string?) -- tabs: the ACTIVE TAB changed (a different event from `on_item_change`, which is cursor movement). For chrome that depends on which tab is shown — e.g. parking the preview on a tab that has nothing to preview. Fired after the new tab is laid out, so the callback may relayout.
 ---@field preview? table                -- tabs: a surface content PROVIDER shown as a second `id="preview"` block beside the tab content (e.g. built on lvim-ui.preview); plugs into the chassis preview machinery (<Tab>/<C-l> panel moves, <C-e> hide, <C-n>/<C-p> rotation)
 ---@field preview_side? string          -- tabs: initial preview placement "right" (default) | "left" | "dynamic"
 ---@field content_width? number         -- tabs+preview: the CONTENT block's fixed share of the stack axis (fraction ≤ 1; default 0.4 — the preview takes the rest)
 ---@field footer_items? table[]      -- info: extra footer action buttons { { key, name, run } } before `q close`
 ---@field hide_cursor? boolean       -- info: hide the hardware cursor (read-only viewer)
 ---@field wrap? boolean              -- info: enable line wrap in the window (default off)
----@field filetype? string           -- info: set the buffer filetype (e.g. "markdown" → treesitter colours)
 ---@field markview? boolean          -- info: render the content as markdown via markview.nvim
 
 -- The canonical popup border — a FULL " " ring on all four sides (top for the native border-title / brand,
@@ -664,6 +665,41 @@ function M.input(opts)
                     st.close()
                 end)
             else
+                -- COMPLETION (`opts.completion`, any `getcompletion()` kind — "file", "dir",
+                -- "buffer", …). <Tab> completes the value in place: one candidate is inserted,
+                -- several extend to their longest common prefix and then list. Without this an
+                -- input that asks for a PATH is the one field in the editor where you cannot tab —
+                -- so it belongs here, in the primitive, not in each caller.
+                if opts.completion and opts.completion ~= "" then
+                    vim.keymap.set("i", "<Tab>", function()
+                        local line = vim.api.nvim_get_current_line()
+                        local col = vim.api.nvim_win_get_cursor(0)[2]
+                        local head = line:sub(1, col)
+                        local ok_c, matches = pcall(vim.fn.getcompletion, head, opts.completion)
+                        if not ok_c or type(matches) ~= "table" or #matches == 0 then
+                            return
+                        end
+                        local insert = matches[1]
+                        if #matches > 1 then
+                            -- The longest common prefix: the same thing the command line does, so
+                            -- repeated <Tab> converges instead of cycling past what you wanted.
+                            local prefix = matches[1]
+                            for _, m in ipairs(matches) do
+                                while #prefix > 0 and m:sub(1, #prefix) ~= prefix do
+                                    prefix = prefix:sub(1, #prefix - 1)
+                                end
+                            end
+                            if #prefix > #head then
+                                insert = prefix
+                            else
+                                vim.notify(table.concat(vim.list_slice(matches, 1, 20), "  "), vim.log.levels.INFO)
+                                return
+                            end
+                        end
+                        vim.api.nvim_set_current_line(insert .. line:sub(col + 1))
+                        pcall(vim.api.nvim_win_set_cursor, 0, { 1, #insert })
+                    end, { buffer = p.buf, nowait = true })
+                end
                 vim.keymap.set("i", "<CR>", function()
                     vim.cmd("stopinsert")
                     confirm(st)
@@ -1432,6 +1468,16 @@ function M.tabs(opts)
         if any_tab_footer() and st2.set_footer then
             st2.set_footer(tab_footer_spec(active)) -- the new tab's own footer band
         end
+        -- The tab CHANGED — tell the consumer explicitly. `on_item_change` fires on cursor movement,
+        -- which is a different event: after a tab switch it may not fire at all (the rows are swapped
+        -- under a cursor that never moved), so a consumer whose chrome depends on WHICH tab is active —
+        -- lvim-vault parks its location preview on the macros tab, which has no locations — would be
+        -- left a beat behind, until the user happened to move. Fired last, so the callback sees the new
+        -- tab fully laid out and may relayout again (parking the preview does exactly that).
+        if opts.on_tab_change then
+            local t = tabset[active]
+            opts.on_tab_change(active, t and (t.id or t.name or t.label) or nil)
+        end
     end
 
     -- An optional PREVIEW block beside the tab content (opt-in `opts.preview` — a raw surface content
@@ -1779,6 +1825,27 @@ function M.tabs(opts)
             local p = content_pan()
             if p and p.refresh then
                 p.refresh()
+            end
+        end,
+
+        --- Dock or PARK the optional preview block — the tabs face of the chassis seam
+        --- `state.set_preview_visible`.
+        ---
+        --- A tabbed panel whose tabs do not all HAVE something to preview (lvim-vault's macros have no
+        --- file+line, so their preview pane is permanently empty) would otherwise hold a dead half-width
+        --- pane on those tabs. Parking keeps the panel built — no window is created or destroyed on a tab
+        --- change — so this costs one relayout on the two real transitions and nothing on every other
+        --- cursor move (the chassis seam is idempotent).
+        ---
+        --- Reaching the seam directly is not possible from here: a tabs consumer never sees the surface
+        --- state, which is why this delegate exists rather than the consumer driving `surface.open`.
+        --- A no-op when the panel has no preview block, or while the preview is the `dynamic` peek.
+        ---@param visible boolean    true = dock beside the content, false = park
+        ---@param side? "right"|"left"  where to dock (default: keep the current side)
+        ---@return nil
+        set_preview_visible = function(visible, side)
+            if st and st.set_preview_visible then
+                st.set_preview_visible(visible, side)
             end
         end,
     }

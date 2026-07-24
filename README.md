@@ -45,12 +45,30 @@ local win = ui.info({ "read-only", "text" }, { title = "Info" })
 local tree = ui.tree({ root = nodes }) -- shared tree content layer (see below)
 ```
 
+`ui.input` takes `height > 1` for a multiline field (Enter inserts a newline, `<C-s>` confirms),
+`filetype` to highlight the value, and `completion = "<kind>"` — any `getcompletion()` kind, e.g.
+`"file"` or `"dir"` — which makes `<Tab>` complete the value in place: one candidate is inserted,
+several extend to their longest common prefix and then list.
+
 `ui.tabs` can additionally host a PREVIEW panel beside the tab content: pass `preview = <provider>` (a
 surface content provider, typically built on `require("lvim-ui.preview").new({ item = … })`) and an optional
 `preview_side = "right"|"left"|"above"|"below"`. The block plugs into the chassis preview machinery — `<Tab>`
 / `<C-l>` move between the panels, `<C-e>` hides the preview, `<C-n>`/`<C-p>` rotate its side, and
 `<C-d>`/`<C-u>` scroll it half a screen **without leaving the list** (the fzf-lua / Magit model — a preview
 panel hides its cursor, so this is the only way to read past its first screen without spending a `<Tab>`).
+
+A surface with a preview block can also **dock or park it from code**, on a LIVE surface:
+`st.set_preview_visible(visible, side?)` — idempotent (unlike the interactive `<C-e>` toggle) and
+focus-neutral. It exists for a consumer that swaps the CONTENT of one surface between views where only some
+views have a preview (lvim-space's files list vs its projects / workspaces / tabs lists): the preview panel
+is built once at open — pass `preview_side = "hide"` to start parked — so a view change neither creates nor
+destroys a window.
+
+A TABBED panel reaches the same seam through its handle: `handle.set_preview_visible(visible, side?)`.
+Pair it with `on_tab_change = function(index, id) … end` — a distinct event from `on_item_change`, which
+is cursor movement: switching tabs need not move the cursor, so chrome that depends on WHICH tab is
+shown must hang off the tab event or it lags a beat behind. lvim-vault uses both to park its location
+preview on the Macros tab, whose rows are key sequences and have nothing to preview.
 
 The low-level chassis is `require("lvim-ui.surface")` (framed floating/docked windows) with
 `require("lvim-ui.button")` / `require("lvim-ui.bar")` for navigable button bars.
