@@ -24,6 +24,10 @@
 -- NOT a float — for a persistent NAVIGABLE side panel like the lsp outline, so `<C-w>` nav and buffer
 -- redraw behave natively; title = winbar, no bars).
 --
+-- A docked split (`mode = "split"`, native or not) pins to the FAR EDGE of the tabpage by default;
+-- pass `anchor = <win>` to split THAT window instead — stacking a dock inside one column (e.g. a
+-- workbench editor pane split into editor-on-top / response-below) rather than spanning the whole tab.
+--
 -- A `position = "cmdline"` float OWNS the command-line region (grows `cmdheight` so heirline / a global
 -- statusline stay above it, floats over those rows). Optionally HOSTED: pass `host = fn(height) -> rect` and
 -- the surface, instead of growing cmdheight itself, reserves `height` rows in that host zone (the msgarea,
@@ -951,6 +955,20 @@ local function set_cmdheight(h)
     h = math.max(1, math.min(h, max_cmdheight()))
     vim.o.cmdheight = h
     return vim.o.cmdheight
+end
+
+--- The window a docked split anchors to. Default -1 pins the split to the FAR EDGE of the tabpage (a
+--- full-height side column, or a full-width bottom bar). `cfg.anchor` (a valid window) instead splits
+--- THAT window — so a consumer can stack a dock inside one column (e.g. an editor pane split into
+--- editor-on-top / response-below) without the split spanning the whole tabpage.
+---@param cfg table
+---@return integer
+local function split_anchor(cfg)
+    local a = cfg.anchor
+    if a and api.nvim_win_is_valid(a) then
+        return a
+    end
+    return -1
 end
 
 --- Pure geometry: the container frame, the header/footer band rows, and every center-panel rect + the
@@ -3050,7 +3068,7 @@ local function open_windows(state)
         local horiz = dock == "below" or dock == "above"
         state.container_win = api.nvim_open_win(state.container_buf, false, {
             split = dock,
-            win = -1,
+            win = split_anchor(state.cfg),
             width = (not horiz) and g0.W or nil,
             height = horiz and g0.H or nil,
             style = "minimal",
@@ -4409,7 +4427,7 @@ local function open_native_split(state)
 
     pan.win = api.nvim_open_win(pan.buf, cfg.enter == true, {
         split = dock,
-        win = -1, -- pin to the far edge of the tabpage
+        win = split_anchor(cfg), -- a specific window (split IT) or -1 = far edge of the tabpage
         width = (not horiz) and width or nil,
         height = horiz and height or nil,
         style = "minimal",
