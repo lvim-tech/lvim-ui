@@ -199,6 +199,7 @@ local function strip_chrome(win)
         colorcolumn = "",
         cursorline = false,
         list = false,
+        winfixbuf = true, -- the fill-slot float owns the tab; the backdrop window must not swap buffers
     }) do
         pcall(function()
             vim.wo[win][opt] = val
@@ -250,6 +251,8 @@ end
 ---@field id string                       Unique key — the marker var value; also the tab title default.
 ---@field editor? LvimUiWorkspaceEditor   The editor / backdrop pane's initial buffer.
 ---@field layout? "stacked"|"full"        Initial region-layout state (see `M.layout`); default "stacked".
+---@field menu? { name?: string, icon?: string }  How this workspace appears in the shared `<Leader>m` dock menu (name defaults to `editor.name`/id).
+---@field restore? fun()                   How to REOPEN this workspace after it was closed — lets the dock menu restore it, not just focus it while open. Omit ⇒ the menu lists it only while its tab is open.
 ---@field sidebar? fun(ctx: { id: string, editor: integer }): any  Open the LEFT panel (consumer owns it). Return value is stored on the handle as `.sidebar`.
 ---@field dock? fun(editor: integer): any  Open the response/result DOCK (consumer owns it; typically anchored to the editor window). Return value stored as `.dock`.
 ---@field tiled? boolean                  Force the `laststatus = 3` chrome guard (default: true when `sidebar` or `dock` is set, false for a bare fullscreen slot).
@@ -308,6 +311,35 @@ function M.open(spec)
         guard_chrome()
     else
         strip_chrome(editor)
+    end
+
+    -- Register this workspace in the shared `<Leader>m` dock menu (a COEXISTING tab entry), so every
+    -- workspace — rest / db / git / forge — is reachable from one place. `show` focuses the tab when open,
+    -- else restores it (when the consumer gave a `restore`). Registered once per id; the closures read live
+    -- state. Guarded: no lvim-utils.dock (or an older one) ⇒ silently skip.
+    do
+        local ok_dock, dock = pcall(require, "lvim-utils.dock")
+        if ok_dock and type(dock.register_tab) == "function" then
+            local restore = spec.restore
+            pcall(dock.register_tab, {
+                id = id,
+                name = (spec.menu and spec.menu.name) or (spec.editor and spec.editor.name) or id,
+                icon = spec.menu and spec.menu.icon,
+                show = function()
+                    if M.is_open(id) then
+                        M.focus(id)
+                    elseif restore then
+                        restore()
+                    end
+                end,
+                is_current = function()
+                    return M.current() == id
+                end,
+                is_alive = function()
+                    return M.is_open(id) or restore ~= nil
+                end,
+            })
+        end
     end
 
     local handle = { id = id, tab = tab, editor = editor, existing = false }
