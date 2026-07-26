@@ -41,7 +41,8 @@ end
 ---@field set fun(items: table[], align?: "left"|"center"|"right")  replace the bar's items and repaint
 ---@field place fun()   re-pin the float to the host's current geometry (auto-run on resize/scroll)
 ---@field close fun()   tear the bar down (auto-run when the host window closes)
----@field enter fun()   descend from the host window INTO the bar (keyboard nav; no-op without nav_down)
+---@field enter fun(): boolean?  descend from the host window INTO the bar (keyboard nav; no-op without
+---                             nav_down). Returns true when the bar took focus — `footernav.mark` needs that.
 
 --- Attach a footer bar to `win`. Items are `ui.button` element specs (build them with
 --- `surface.button` for the canonical chips); a spec's `run` fires on mouse click OR on `<CR>` when the
@@ -64,6 +65,7 @@ function M.attach(win, opts)
         focused = false, -- the bar currently holds keyboard focus
         sel = 1, -- the selected chip index (into `rendered`)
         aug = nil, ---@type integer?
+        scrolloff = nil, ---@type integer?  the host's own scrolloff, when the bar had to raise it
         closed = false,
     }
     if state.nav_down then
@@ -87,6 +89,14 @@ function M.attach(win, opts)
             pcall(api.nvim_buf_delete, state.buf, { force = true })
         end
         state.buf = nil
+        -- The host window can outlive the bar (a footer detaches while its editor stays open), so put
+        -- its scroll margin back exactly as it was — including a -1, which restores the global fallback.
+        if state.scrolloff ~= nil and api.nvim_win_is_valid(state.win) then
+            pcall(function()
+                vim.wo[state.win].scrolloff = state.scrolloff
+            end)
+            state.scrolloff = nil
+        end
     end
 
     --- Pin (or re-pin) the float on the host's last TEXT row.
@@ -276,8 +286,17 @@ function M.attach(win, opts)
         place()
     end
 
-    -- The cursor line must never end up UNDER the bar: keep at least one bottom scroll margin.
-    if vim.wo[win].scrolloff < 1 then
+    -- The cursor line must never end up UNDER the bar: keep at least one bottom scroll margin. Read the
+    -- EFFECTIVE value first — a window-local `scrolloff` of -1 means "use the global one", so comparing
+    -- the raw local value would treat a user's `set scrolloff=8` as 0 and then sever the global fallback
+    -- by writing a literal 1. Only a genuinely too-small effective margin is raised, and the original is
+    -- remembered so `close()` can put it back.
+    local effective = vim.wo[win].scrolloff
+    if effective < 0 then
+        effective = vim.o.scrolloff
+    end
+    if effective < 1 then
+        state.scrolloff = vim.wo[win].scrolloff
         vim.wo[win].scrolloff = 1
     end
 
