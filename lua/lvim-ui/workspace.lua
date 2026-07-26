@@ -6,7 +6,7 @@
 --
 -- Two usage modes over ONE tab lifecycle:
 --   * FULLSCREEN slot — the tab hosts a single centred surface that FILLS it: the consumer opens its
---     `lvim-ui` surface with `slot = M.slot(id)`. (lvim-git / lvim-forge status/log/diff views.)
+--     `lvim-ui` surface with `slot = M.slot()`. (lvim-git / lvim-forge status/log/diff views.)
 --   * REGION tiling — the tab is tiled into a left SIDEBAR + an EDITOR pane + a response/result DOCK.
 --     The shell owns the tab + the editor window; the consumer opens its OWN sidebar/dock panels via the
 --     `sidebar`/`dock` callbacks (it keeps its providers). (lvim-db workspace, lvim-rest workbench.)
@@ -54,6 +54,8 @@ local layouts = {}
 -- The chrome-guard augroup (shared): re-asserts `laststatus = 3` whenever ANY tiled workspace tab is
 -- current. One group for all ids — the callback checks the current tab's marker.
 local guard_group = nil
+---@type integer?  the user's `laststatus` before the first tiled workspace forced 3
+local prev_laststatus = nil
 
 --- The tabpage hosting `id`, found by its marker var (never a cached handle). nil when not open.
 ---@param id string
@@ -169,8 +171,13 @@ function M.toggle_layout(id, on_rebuild)
 end
 
 --- Force + re-assert `laststatus = 3` for a tiled workspace (see the module header). Idempotent: one
---- shared augroup re-asserts whenever a workspace tab becomes current.
+--- shared augroup re-asserts whenever a workspace tab becomes current. The user's own value is captured
+--- on the FIRST guard so `M.close` can put it back once the last workspace is gone — a global option
+--- must not stay mutated for the rest of the session because a panel was opened once.
 local function guard_chrome()
+    if prev_laststatus == nil then
+        prev_laststatus = vim.o.laststatus
+    end
     vim.o.laststatus = 3
     if guard_group then
         return
@@ -387,6 +394,12 @@ function M.close(id, on_close)
     ws[id] = nil
     layouts[id] = nil
     closing[id] = nil
+    -- The LAST tiled workspace closing hands `laststatus` back. The TabEnter guard is gated on
+    -- `M.current()`, so it cannot re-assert 3 once there is no workspace left.
+    if prev_laststatus ~= nil and next(ws) == nil then
+        vim.o.laststatus = prev_laststatus
+        prev_laststatus = nil
+    end
 end
 
 --- Open when closed, close when open — the single-launcher toggle.
