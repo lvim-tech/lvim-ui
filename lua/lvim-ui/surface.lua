@@ -1802,6 +1802,12 @@ local function escape_to_neighbor(state, nav)
     if state.cfg.mode ~= "split" then
         return false
     end
+    -- Going UP, LAYER-BY-LAYER: if we descended THROUGH a footer to get here (a full-width bottom panel
+    -- reached from one column's footer), step back onto THAT footer — the right column, its bottom bar —
+    -- instead of guessing a neighbour by cursor column. No memory (a plain up-escape) ⇒ falls through.
+    if nav == "k" and require("lvim-ui.footernav").up() then
+        return true
+    end
     if not (state.container_win and api.nvim_win_is_valid(state.container_win)) then
         return false
     end
@@ -4572,7 +4578,10 @@ local function open_native_split(state)
         if state._footer_win and api.nvim_win_is_valid(state._footer_win) then
             pcall(api.nvim_win_set_config, state._footer_win, fpos)
         else
-            fpos.focusable = false
+            -- Focusable ONLY when the consumer opted into keyboard footer navigation (`footer_nav`): the
+            -- footer is otherwise a legend/mouse-click bar that focus must never enter (a `<C-w>` walk would
+            -- park the cursor on chrome). With `footer_nav` the panel's `<C-j>` steps INTO it deliberately.
+            fpos.focusable = state.cfg.footer_nav == true
             fpos.style = "minimal"
             fpos.zindex = 60
             fpos.noautocmd = true
@@ -4590,6 +4599,14 @@ local function open_native_split(state)
             pan.refresh() -- apply the trailing reserved row(s) immediately (once)
         end
     end
+    -- The resolved nav keys (same precedence as the float path: fallback < global `ui.keys` < this surface's
+    -- `cfg.keys`) — the native path uses them ONLY for opt-in footer navigation (`<C-j>`/`<C-k>`, chip left/right).
+    local ok_uicfg, uicfg = pcall(require, "lvim-ui.config")
+    local K = vim.tbl_extend("force", DEFAULT_KEYS, (ok_uicfg and uicfg and uicfg.keys) or {}, state.cfg.keys or {})
+
+    -- Footer keyboard-navigation helpers (opt-in `cfg.footer_nav`) — forward-declared so the footer buffer's
+    -- keymaps (installed on first paint below) can close over them; assigned just after render_native_footer.
+    local footer_enter, footer_leave, footer_move, footer_activate, footer_continue
     local function render_native_footer(spec)
         local bar = spec and spec.bars and spec.bars[1]
         if not (bar and bar.items and pan.win and api.nvim_win_is_valid(pan.win)) then
@@ -4612,9 +4629,44 @@ local function open_native_split(state)
                     end
                 end
             end)
+            -- With keyboard footer nav the buffer is a focusable stop: register it for cursor-hide (it is
+            -- chrome, not text) and bind the in-footer keys — move between chips, run one, step back UP.
+            if state.cfg.footer_nav then
+                register_frame_ft()
+                vim.bo[state._footer_buf].filetype = FRAME_FT
+                local function fmap(lhs, fn)
+                    for _, l in ipairs(type(lhs) == "table" and lhs or { lhs }) do
+                        vim.keymap.set("n", l, fn, { buffer = state._footer_buf, nowait = true, silent = true })
+                    end
+                end
+                fmap({ K.sector_prev, "<Esc>", "q" }, function()
+                    footer_leave()
+                end)
+                fmap(K.sector_next, function()
+                    footer_continue()
+                end)
+                fmap({ "h", "<Left>", K.panel_prev }, function()
+                    footer_move(-1)
+                end)
+                fmap({ "l", "<Right>", K.panel_next }, function()
+                    footer_move(1)
+                end)
+                fmap({ "<CR>", "<Space>" }, function()
+                    footer_activate()
+                end)
+            end
         end
         local fw = api.nvim_win_get_width(pan.win)
-        local band = require("lvim-ui.bar").render({ items = bar.items, width = fw, align = bar.align or "center" })
+        -- While the footer HAS keyboard focus, the selected chip is drawn in its hover state (and kept in
+        -- view on a scrolled/overflowing bar) so the cursor's position is visible without a hardware cursor.
+        local sel = state._footer_focused and state._footer_sel or nil
+        local band = require("lvim-ui.bar").render({
+            items = bar.items,
+            width = fw,
+            align = bar.align or "center",
+            hover = sel,
+            sel = sel,
+        })
         state._footer_items = band.items
         vim.bo[state._footer_buf].modifiable = true
         api.nvim_buf_set_lines(state._footer_buf, 0, -1, false, { band.line })
@@ -4645,6 +4697,97 @@ local function open_native_split(state)
         state.cfg.footer = spec
         render_native_footer(spec)
     end
+
+    -- The runnable (non-separator) chip indices, in order — what the keyboard selection steps through.
+    local function footer_selectable()
+        local out = {}
+        for i, it in ipairs(state._footer_items or {}) do
+            if not it.sep and it.spec and it.spec.run then
+                out[#out + 1] = i
+            end
+        end
+        return out
+    end
+    -- Park the (hidden) cursor on the selected chip, so a mouse-less redraw keeps it in the right column.
+    local function footer_place_cursor()
+        local it = state._footer_items and state._footer_items[state._footer_sel]
+        if it and it.c0 and state._footer_win and api.nvim_win_is_valid(state._footer_win) then
+            pcall(api.nvim_win_set_cursor, state._footer_win, { 1, it.c0 })
+        end
+    end
+    -- Step DOWN into the footer: focus its window, select the first chip, repaint it highlighted. No-op
+    -- unless `footer_nav` is on and there is a live footer with at least one runnable chip.
+    footer_enter = function()
+        if not (state.cfg.footer_nav and state._footer_win and api.nvim_win_is_valid(state._footer_win)) then
+            return
+        end
+        local sel = footer_selectable()
+        if #sel == 0 then
+            return
+        end
+        state._footer_focused = true
+        state._footer_sel = sel[1]
+        api.nvim_set_current_win(state._footer_win)
+        render_native_footer(state.cfg.footer)
+        footer_place_cursor()
+        cursor.update() -- FRAME_FT is a panel_ft → the hardware cursor hides while the footer is current
+        return true
+    end
+    -- Step back UP to the panel list, dropping the chip highlight.
+    footer_leave = function()
+        state._footer_focused = false
+        render_native_footer(state.cfg.footer)
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            api.nvim_set_current_win(pan.win)
+        end
+        cursor.update()
+    end
+    -- Move the selection one runnable chip left/right (clamped — no wrap, like the sector edges).
+    footer_move = function(dir)
+        local sel = footer_selectable()
+        if #sel == 0 then
+            return
+        end
+        local pos = 1
+        for i, idx in ipairs(sel) do
+            if idx == state._footer_sel then
+                pos = i
+            end
+        end
+        state._footer_sel = sel[math.min(#sel, math.max(1, pos + dir))]
+        render_native_footer(state.cfg.footer)
+        footer_place_cursor()
+    end
+    -- Run the selected chip's action (the exact handler a mouse click on it fires).
+    footer_activate = function()
+        local it = state._footer_items and state._footer_items[state._footer_sel]
+        if it and it.spec and it.spec.run then
+            it.spec.run()
+        end
+    end
+    -- CONTINUE DOWN past the footer — the vertical chain is layer-by-layer: the footer's `<C-j>` runs the
+    -- panel's ORIGINAL sector_next action (its window-nav `wincmd j`, captured below), so from `panel → its
+    -- footer` one more `<C-j>` descends onto the window BELOW. With no such action (the footer is the bottom
+    -- layer) it simply stays.
+    footer_continue = function()
+        local down = state._footer_down
+        if not down then
+            return
+        end
+        state._footer_focused = false
+        render_native_footer(state.cfg.footer)
+        -- Remember this descent so a `<C-k>` back up the window BELOW returns to THIS footer (layer-by-layer,
+        -- in the column we came down from) rather than skipping it and guessing a column.
+        require("lvim-ui.footernav").mark(pan.win, footer_enter)
+        -- Leave the footer FLOAT for the real panel window first: `wincmd j` from a float does not walk the
+        -- tiled layout, so the down-action must run from the panel it belongs to.
+        if pan.win and api.nvim_win_is_valid(pan.win) then
+            api.nvim_set_current_win(pan.win)
+        end
+        pcall(down)
+        cursor.update()
+    end
+
     if cfg.footer then
         render_native_footer(cfg.footer)
     end
@@ -4702,6 +4845,20 @@ local function open_native_split(state)
         map(km.key, function()
             km.run(state)
         end)
+    end
+    -- Opt-in keyboard footer navigation, LAYER-BY-LAYER: `<C-j>` steps from the list DOWN into the footer chip
+    -- bar (the native-split mirror of a float surface's footer sector); `<C-l>`/`<C-h>` move between chips,
+    -- `<CR>` runs one, `<C-k>`/`<Esc>`/`q` step back UP to the list. If the provider ALREADY binds this chord
+    -- for its own window-nav (a panel whose `<C-j>` = `wincmd j` to the window below), that action is CAPTURED
+    -- and becomes the FOOTER's own `<C-j>` (see footer_continue) — so the footer is a real intermediate layer
+    -- (panel → footer → window below), never skipped.
+    if cfg.footer_nav then
+        for _, m in ipairs(api.nvim_buf_get_keymap(pan.buf, "n")) do
+            if type(m.lhs) == "string" and m.lhs:lower() == K.sector_next:lower() and m.callback then
+                state._footer_down = m.callback
+            end
+        end
+        map(K.sector_next, footer_enter)
     end
     -- Bound LAST, once every key is known: the panel owns the prefixes of its own chords (a `g?` help), so the
     -- chord no longer depends on how fast the user types (see `own_chord_prefixes`).
