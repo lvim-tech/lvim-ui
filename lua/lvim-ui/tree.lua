@@ -402,7 +402,13 @@ function M.new(opts)
                     -- `detail` is VIRTUAL text (`eol`), not part of the line — so clipping the line does NOT
                     -- constrain it: it keeps flowing right, straight under the scrollbar. Clip it to the space
                     -- that is actually left on the row (content width minus what the row already uses).
-                    local avail = (width - pad_right_eff) - util.dw(lines[row])
+                    --
+                    -- `badge_w` has to come off here for the SAME reason it comes off the line above: the
+                    -- badges are pinned to the right edge, so on a narrow panel a detail measured against the
+                    -- full content width flows right into them and the two collide with no separating column
+                    -- (`󰓹 sec:appendix` + `appendix.tex` rendering as `sec:appendixix.tex`). It already
+                    -- carries the +1 gap, so subtracting it also guarantees the blank column between them.
+                    local avail = (width - pad_right_eff - badge_w) - util.dw(lines[row])
                     if avail > 1 then
                         local d = clip(" " .. n.detail, avail)
                         if d ~= "" then
