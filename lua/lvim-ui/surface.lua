@@ -3437,10 +3437,20 @@ local function open_windows(state)
             local sec = state.sectors[fi]
             if sec and sec.kind == "bar" then
                 local btns = sec.band.buttons or {}
-                -- 1) the SAME button the user was on (matched by identity), 2) failing that its old index
-                -- (clamped), 3) failing that the active one, 4) else the first.
+                -- A `snap_active` band (a TAB bar) follows the ACTIVE button: when the view changes from the
+                -- body (a re-run, an open) the selection must move to the now-active tab, NOT stay identity-
+                -- pinned to the tab the cursor last sat on (which left a stale hover on the old tab). Every other
+                -- bar (filters) keeps the identity-preserve below, so its keyboard cursor never bounces on a
+                -- repaint: 1) the SAME button (by identity), 2) its old index (clamped), 3) the active one, 4) 1.
                 local as
-                if prev_id then
+                if sec.band.snap_active then
+                    for bi, b in ipairs(btns) do
+                        if b.active then
+                            as = bi
+                        end
+                    end
+                end
+                if not as and prev_id then
                     for bi, b in ipairs(btns) do
                         local id = b.name or b.key or (type(b.text) == "string" and b.text) or nil
                         if id and id == prev_id then
