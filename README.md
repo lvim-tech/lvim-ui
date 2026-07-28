@@ -54,8 +54,8 @@ several extend to their longest common prefix and then list.
 surface content provider, typically built on `require("lvim-ui.preview").new({ item = … })`) and an optional
 `preview_side = "right"|"left"|"above"|"below"`. The block plugs into the chassis preview machinery — `<Tab>`
 / `<C-l>` move between the panels, `<C-e>` hides the preview, `<C-n>`/`<C-p>` rotate its side, and
-`<C-d>`/`<C-u>` scroll it half a screen **without leaving the list** (the fzf-lua / Magit model — a preview
-panel hides its cursor, so this is the only way to read past its first screen without spending a `<Tab>`).
+`<C-d>`/`<C-u>` scroll it half a screen **without leaving the list** — a preview panel hides its
+cursor, so this is the only way to read past its first screen without spending a `<Tab>`.
 
 A surface with a preview block can also **dock or park it from code**, on a LIVE surface:
 `st.set_preview_visible(visible, side?)` — idempotent (unlike the interactive `<C-e>` toggle) and
