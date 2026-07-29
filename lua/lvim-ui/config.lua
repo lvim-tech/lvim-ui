@@ -127,6 +127,14 @@ return {
     -- or per popup via that surface's own `trap_focus`.
     trap_focus = true,
     markview = false,
+
+    -- HAND NEOVIM'S OWN ENTRY POINTS TO THIS TOOLKIT. Opt-in, because `vim.ui.select` is a global
+    -- another plugin may already own — a UI library must not take it just by being loaded.
+    --   ui_select — every `vim.ui.select` (a plugin's chooser, an LSP code-action list) opens as
+    --               this toolkit's popup, at the cursor, instead of the native list at the bottom.
+    -- `require("lvim-ui.bridge").restore()` gives it back. There is no `ui_input` here: a PROMPT
+    -- belongs to the message zone, and lvim-hud bridges `vim.ui.input` from there.
+    bridge = { ui_select = false },
     -- Which icon plugin supplies the preview winbar file icon (resolved through lvim-utils.icons):
     -- "auto" prefers lvim-icons, then nvim-web-devicons, then mini.icons, else no icon.
     icon_provider = "auto",

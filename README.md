@@ -362,6 +362,12 @@ require("lvim-ui").setup({
     -- false to disable globally, or per popup via that surface's own `trap_focus`.
     trap_focus = true,
     markview = false, -- markview rendering in the popup
+
+    -- Hand Neovim's own entry points to this toolkit. Opt-in: `vim.ui.select` is a global another
+    -- plugin may already own, so a UI library must not take it just by being loaded.
+    -- `require("lvim-ui.bridge").restore()` gives it back. There is no `ui_input` — a PROMPT belongs
+    -- to the message zone, and lvim-hud bridges `vim.ui.input` from there.
+    bridge = { ui_select = false },
     -- Title placement: "row" (a top content row) | "border" (native border-title) | "statusline" (overlay).
     title_line = "row",
     -- Where a supplied count renders: "title" (right of the title) | "footer" (bottom border-footer).

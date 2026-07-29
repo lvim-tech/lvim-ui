@@ -49,6 +49,8 @@ function M.setup(opts)
     if opts then
         merge(config, opts)
     end
+    -- After the merge, so a `bridge` given here is the one that decides.
+    require("lvim-ui.bridge").setup()
 end
 
 --- Build a canonical COLLAPSIBLE SECTION HEADER row (a form accordion) — the ONE shape every lvim-tech UI

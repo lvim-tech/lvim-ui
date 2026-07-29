@@ -322,4 +322,24 @@ action). Docked / hosted panels (which set `host`/`position`/`on_escape_*`) coex
 with the editor and never trap. Set `trap_focus = false` to disable globally, or on
 a single `surface.open` to opt that popup out.
 
+                                                            *lvim-ui-bridge*
+BRIDGES
+
+`vim.ui.select` can be handed to this toolkit — every chooser in the editor (a
+plugin's list, an LSP code-action menu) then opens as the same themed popup,
+AT THE CURSOR, instead of the native list at the bottom of the screen: >lua
+    require("lvim-ui").setup({ bridge = { ui_select = true } })
+<
+It is OPT-IN because `vim.ui.select` is a global another plugin may already
+own — a UI library must not take it just by being loaded. The previous handler
+is remembered: `require("lvim-ui.bridge").restore()` gives it back.
+
+Code actions are the one special case: their labels vary wildly in length, so
+that list opens through an auto-width instance and each row carries the action
+glyph. It is recognised by the prompt, which is all the API offers.
+
+There is no `ui_input` here. In this set a PROMPT belongs to the message zone
+and lvim-hud bridges `vim.ui.input` from there; a CHOICE belongs to a panel,
+which is this toolkit. Two bridges, each where its surface lives.
+
 vim:tw=78:ts=8:ft=help:norl:
