@@ -2470,6 +2470,21 @@ local function set_keys(state)
     map(state.container_buf, K.panel_prev, function()
         state.panel(-1)
     end)
+    -- `panel_toggle` (Tab) belongs to the container for the SAME reason, and leaving it out made a bar a
+    -- near-dead-end: on a footer `<C-j>` is the bottom edge (no wrap, by design), `<C-h>`/`<C-l>` move the
+    -- BUTTON selection rather than the panels, and Tab — documented as the only way onto the preview — was
+    -- one of the container's swallowed Nops. `<C-k>` was the single way back to the content, which reads as
+    -- "the panel is stuck". From a BAR it means "go to the content": step INTO the center WITHOUT cycling,
+    -- since a bar is not a panel and there is nothing to toggle from (the per-panel mapping keeps cycling
+    -- list ⇄ preview once you are inside).
+    map(state.container_buf, K.panel_toggle, function()
+        for si, sec in ipairs(state.sectors) do
+            if sec.kind == "center" then
+                focus_sector(state, si)
+                return
+            end
+        end
+    end)
     -- MOUSE: a left-click on any header/footer bar button acts exactly like navigating the selection onto it
     -- and confirming (tab switch / filter / footer action). Hit-test the click's row+column against the live
     -- `state.bands` render metadata (each button's byte range `c0..c1`), so it is pixel-accurate and never
