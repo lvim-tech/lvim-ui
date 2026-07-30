@@ -74,8 +74,10 @@ function M.new(opts)
     local function invalidate_flat()
         flat_cache = nil
     end
+    --- Re-render the rows. Guarded on the window still being alive: an ACTION row may close the frame
+    --- from inside its own `run`, and the refresh that follows the run would then repaint a dead panel.
     local function refresh()
-        if pan and pan.refresh then
+        if pan and pan.refresh and pan.win and api.nvim_win_is_valid(pan.win) then
             pan.refresh()
         end
     end
@@ -100,6 +102,27 @@ function M.new(opts)
         end
         return d == true
     end
+
+    --- A row's `label` may be a FUNCTION, evaluated LIVE at every render — the same treatment `disabled`
+    --- already gets, for the same reason: a row whose effect depends on the world outside the panel has to
+    --- SAY which effect it will have right now (an action that creates a file vs one that overwrites it),
+    --- and a string baked when the panel opened goes stale the moment the row itself changes that world.
+    --- The producer is kept on `_label_fn` and `label` holds its latest result, so every consumer downstream
+    --- keeps seeing a plain string while the row stays re-evaluable on the NEXT render (writing the string
+    --- back over the function would resolve it exactly once and freeze it again).
+    ---@param fr Row[]
+    local function resolve_labels(fr)
+        for _, r in ipairs(fr) do
+            if type(r.label) == "function" then
+                r._label_fn = r.label
+            end
+            if r._label_fn then
+                local ok, res = pcall(r._label_fn, r)
+                r.label = (ok and type(res) == "string") and res or ""
+            end
+        end
+    end
+
     local function move(delta)
         if not (pan and pan.win and api.nvim_win_is_valid(pan.win)) then
             return
@@ -307,6 +330,10 @@ function M.new(opts)
                     opts.on_action_close(confirmed, result)
                 end
             end)
+            -- Like a value change: an action that alters state (writes or removes a file, flips a mode)
+            -- is what the OTHER rows' live `label` / `disabled` predicates read, so the panel has to
+            -- repaint or it keeps offering what the action just made impossible.
+            refresh()
         end
     end
 
@@ -328,6 +355,7 @@ function M.new(opts)
         ---@return integer width, integer height
         size = function()
             local fr = flat()
+            resolve_labels(fr)
             local w = 1
             for _, r in ipairs(fr) do
                 w = math.max(w, util.dw(rows.row_display(r, ico)) + 4)
@@ -340,6 +368,7 @@ function M.new(opts)
         ---@return string[] lines, table[] hls
         render = function(width)
             local fr = flat()
+            resolve_labels(fr)
             local lines, hls = {}, {}
             local lead = opts.pad or 2
             for i, r in ipairs(fr) do

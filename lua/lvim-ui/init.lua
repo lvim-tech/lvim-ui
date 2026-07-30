@@ -975,6 +975,12 @@ function M.tabs(opts)
         -- at the top/bottom). A LABELED spacer is a section HEADER (e.g. "Frontend" atop the Projects menu), not
         -- a stray divider — it must survive even as the first/last row.
         local function is_blank_spacer(r)
+            -- A label PRODUCER (a function; see the form's `resolve_labels`) IS a label — its string is simply
+            -- not known until render. Testing only for a non-empty string trims a LIVE section header off the
+            -- top or bottom of the body as though it were a stray divider.
+            if type(r and r.label) == "function" then
+                return false
+            end
             return r
                 and (r.type == "spacer" or r.type == "spacer_line")
                 and not (type(r.label) == "string" and vim.trim(r.label) ~= "")
