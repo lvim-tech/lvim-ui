@@ -217,30 +217,53 @@ local band = require("lvim-ui.bar").title_band({
 A band that names its own `fill_hl` without a `fill_hl_focus` keeps that one tint: a deeper variant
 of an arbitrary group cannot be invented, and only the default pair is known here.
 
-### The `winfooter` primitive (a button bar for a REAL window)
+### The `winband` primitive (a button bar for a REAL window)
 
-`require("lvim-ui.winfooter").attach(win, { items, align })` pins the canonical button FOOTER BAR —
-a `ui.bar` of `ui.button` chips on an `LvimUiBarFill` row — to the bottom row of a window the
-surface chassis does NOT own: a genuine editable buffer in a tiled window (lvim-db's query editor).
-The 1-row, non-focusable float follows the host through resizes and layout shifts, closes itself
-with the host window, and hit-tests clicks against the chips through the global mouse layer. It
-DISPLAYS keys and runs actions on click — it never binds a key itself (the host buffer owns its
-own keymaps).
+`require("lvim-ui.winband").attach(win, { items, side, align })` pins the canonical button BAR — a
+`ui.bar` of `ui.button` chips on an `LvimUiBarFill` row — to an edge of a window the surface chassis
+does NOT own: a genuine editable buffer in a tiled window (lvim-db's query editor), or a window
+Neovim itself opens and closes (the quickfix window, whose buffer must stay the real
+`buftype=quickfix` one).
+
+`side` picks the edge, and the two differ in what they cost the host:
+
+- **`"bottom"`** (default) rides the host's last text row, so the host keeps `scrolloff >= 1` and the
+  cursor line can never sit under the bar;
+- **`"top"`** rides the host's **winbar** row — chrome, not text — so it costs the host no line at
+  all: nothing scrolls under it and a real buffer keeps every one of its rows. The band claims that
+  row and restores the host's own winbar on close.
+
+The 1-row float follows the host through resizes and layout shifts, closes itself with the host
+window, and hit-tests clicks against the chips through the global mouse layer.
+
+With `nav_through` the bar is a real LAYER in the window chain rather than a legend: `enter` steps
+from the host into it, `h` / `l` move between chips, `<CR>` runs one, the chord pointing back at the
+host steps out, and the one pointing past the bar runs `nav_through` (the host's own `wincmd j` /
+`wincmd k`) — so the chain is host → band → the window beyond, in both directions. Pass `enter_key`
+and the band binds the step-in key on the host buffer itself, which is what makes it beat a global
+window-navigation mapping. `lvim-winnav` also consults the band registry, so a move INTO the window
+lands on the band first.
 
 ```lua
 local surface = require("lvim-ui.surface")
-local bar = require("lvim-ui.winfooter").attach(win, {
-    align = "center",
+local bar = require("lvim-ui.winband").attach(win, {
+    side = "top",
+    align = "left",
+    enter_key = "<C-k>",
+    nav_through = function()
+        vim.cmd("wincmd k")
+    end,
+    suffix = function()
+        return " 12 items "
+    end,
     items = {
-        surface.button({ name = "run", key = "⏎", style = "action", run = run }, "action"),
+        surface.button({ name = "open", key = "CR", style = "action", run = open }, "action"),
         surface.button({ name = "help", key = "g?", style = "action", run = help }, "action"),
     },
 })
 bar.set(items) -- replace the chips (re-rendered in place)
 bar.close() -- tear down (automatic when the host window closes)
 ```
-
-The host window keeps `scrolloff >= 1`, so the cursor line can never sit under the bar.
 
 ### The `tree` primitive (shared tree panels)
 
