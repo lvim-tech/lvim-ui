@@ -2909,6 +2909,11 @@ local function open_panel_win(state, pan, i, pl, has_input, docked)
     -- the match's group), and the theme's default `Conceal` is deliberately faint — so remap it here to the
     -- provider's group (the input's own `LvimUiInput`), or the bullets are all but invisible.
     local conceal = (pan.provider and pan.provider.conceal_hl) and (",Conceal:" .. pan.provider.conceal_hl) or ""
+    -- A panel whose rows carry tints of their own needs its OWN `Visual`: the editor's is a near-bg wash and
+    -- vanishes against them, so a selection in a readable panel (the message zone) cannot be seen. Named by
+    -- the provider, like `conceal_hl` — a panel that says nothing keeps the editor's.
+    local visual = (pan.provider and pan.provider.visual_hl) and (",Visual:" .. pan.provider.visual_hl) or ""
+    conceal = conceal .. visual
     if pan.provider and pan.provider.cursorline then
         -- The cursorline group: a provider-named one (a string), else the NEUTRAL bg-only `LvimUiCursorLine`
         -- so the focused row is marked by a background wash ALONE — a rich menu's per-segment fg colours
