@@ -2992,13 +2992,20 @@ local function resolve_backdrop(cfg)
     --   • "darken" (default) — foreground + background toward black (a uniform darker look)
     --   • "dim"              — foreground only (lighter)
     -- Each mode carries its OWN `amount` sub-table (`bd.dim.amount` / `bd.darken.amount`); pick the LIVE mode's.
-    -- `bg` is the editor bg (the fg-mute target for "dim").
+    --
+    -- `bg` — the target a "dim" veil blends foregrounds toward — is deliberately NOT passed. It defaults to the
+    -- live `Normal` bg, which is what this would have handed over anyway, and passing it PINS it: `lvim-utils.dim`
+    -- makes the value part of the veil's look-key AND closes over it in the namespace's rebuild closure. A veil
+    -- opened over a light theme therefore went on blending toward `#e9e9e9` for the rest of its life, so the
+    -- colorscheme picker previewing a DARK variant repainted the editor dark and left every veiled group washed
+    -- toward WHITE — the mixed light/dark screen, with the winbar chip and the tree's cursor row as light strips.
+    -- Omitting it is the documented seam (`LvimDimBackdrop.bg` is optional precisely so the target tracks the
+    -- palette); the `Normal` read above stays, it is the transparency guard.
     local mode = bd.mode == "dim" and "dim" or "darken"
     local sub = (mode == "dim" and bd.dim or bd.darken) or {}
     return {
         mode = mode,
         amount = sub.amount or 0.5,
-        bg = string.format("#%06x", nb.bg),
     }
 end
 
