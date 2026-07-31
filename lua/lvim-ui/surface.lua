@@ -1654,7 +1654,17 @@ function M.paint(pan, lines, hls)
     vim.bo[pan.buf].modifiable = (pan.provider and pan.provider.editable) or false
     api.nvim_buf_clear_namespace(pan.buf, NS, 0, -1)
     for _, h in ipairs(hls or {}) do
-        if h[3] == -1 then -- a FULL-ROW span: the bg reaches the window edge (hl_eol), for row striping
+        if h.virt then
+            -- A VIRTUAL cell pinned to the row's right edge (`{ row, virt, hl }`). Virtual, not text: it is
+            -- chrome the provider draws BESIDE the content — a countdown, a badge — so it must sit at one
+            -- fixed column whatever the row says, and must never end up in a yank of the row.
+            pcall(api.nvim_buf_set_extmark, pan.buf, NS, h.row or 0, 0, {
+                virt_text = { { h.virt, util.resolve_hl(h.hl or "Normal") } },
+                virt_text_pos = "right_align",
+                hl_mode = "combine",
+                priority = h.priority or 300,
+            })
+        elseif h[3] == -1 then -- a FULL-ROW span: the bg reaches the window edge (hl_eol), for row striping
             pcall(api.nvim_buf_set_extmark, pan.buf, NS, h[1], 0, {
                 end_row = h[1] + 1,
                 hl_group = util.resolve_hl(h[4]),
