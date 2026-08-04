@@ -20,6 +20,7 @@ local M = {}
 ---@field type     RowType
 ---@field name?    string
 ---@field label?   string|fun(row: Row): string  a FUNCTION is re-evaluated on every render (like `disabled`), for a row whose effect — and so its wording — depends on state it can itself change
+---@field _label_fn? fun(row: Row): string  INTERNAL: the producer lifted off `label` by `form.resolve_labels`, so `label` can hold its latest result and stay re-evaluable
 ---@field icon?    string
 ---@field value?   any
 ---@field default? any

@@ -143,7 +143,7 @@ end
 --- docks at the tabpage's far bottom edge (full width, under sidebar+editor), sized as a fraction of the
 --- WHOLE tab. Feed the result straight into `surface.open` (`dock` / `anchor` / `size`).
 ---@param id string
----@param editor integer  the editor window (the "stacked" state anchors to it)
+---@param editor integer?  the editor window the "stacked" state anchors to; nil (or a stale handle) sizes against the whole tab instead
 ---@param sizes { stacked?: number, full?: number }  per-state height fraction (defaults 0.66 / 0.34)
 ---@return { dock: string, anchor: integer?, size: table }
 function M.dock_split(id, editor, sizes)

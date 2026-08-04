@@ -440,7 +440,7 @@ end
 --- position, any buttons/style.
 ---@param groups string[][]
 ---@param registry table<string, table>
----@param opts { mode?: string, separator?: string, separator_hl?: string, separator_padding?: integer[], align?: string, style?: string, hl?: table, chevrons?: table }
+---@param opts? { mode?: string, separator?: string, separator_hl?: string, separator_padding?: integer[], align?: string, style?: string, hl?: table, chevrons?: table }
 ---@return table  a ui.bar band { items, align, chevrons }
 function M.bar(groups, registry, opts)
     opts = opts or {}
@@ -2082,7 +2082,7 @@ local function default_open(state, mode)
     vim.fn.bufload(buf)
     api.nvim_win_set_buf(0, buf)
     pcall(api.nvim_win_set_cursor, 0, { item.lnum or 1, math.max(0, (item.col or 1) - 1) })
-    pcall(vim.cmd, "normal! zz")
+    pcall(vim.cmd.normal, { "zz", bang = true })
 end
 
 --- The dock LAYOUT a surface belongs to — the key its geometry (height / width / backdrop) is read under in the
@@ -3352,8 +3352,8 @@ local function open_windows(state)
         -- space above the dock. A centred FLOAT has no such space — it sits in the middle of the screen, so the
         -- peek would be squeezed against its top edge (and, holding the file's real buffer, would take the file's
         -- own autocmds down with it: `E36: Not enough room`). A float rotates between the two docked sides.
-        local docked = state.cfg.host ~= nil or state.cfg.position ~= nil or state.cfg.mode == "split"
-        local order = docked and { "right", "left", "dynamic" } or { "right", "left" }
+        local docked_surface = state.cfg.host ~= nil or state.cfg.position ~= nil or state.cfg.mode == "split"
+        local order = docked_surface and { "right", "left", "dynamic" } or { "right", "left" }
         local ci = 1
         for i, s in ipairs(order) do
             if s == (state.preview_side or "right") then
@@ -4119,7 +4119,7 @@ function dyn_show(state)
                 d.win,
                 { math.max(1, math.min(it.lnum, cnt)), math.max(0, (it.col or 1) - 1) }
             )
-            pcall(vim.cmd, "normal! zz")
+            pcall(vim.cmd.normal, { "zz", bang = true })
             if api.nvim_win_is_valid(prev) then
                 pcall(api.nvim_set_current_win, prev)
             end
@@ -4655,7 +4655,7 @@ local function open_native_split(state)
             -- Clicks go through the GLOBAL mouse layer (by window under the pointer), NOT a buffer-local
             -- <LeftMouse>: the footer is a NON-focusable float, so focus never enters it and a buffer-local map
             -- would never fire. `register_click` hit-tests the clicked column against the rendered item boxes.
-            require("lvim-utils.mouse").register_click(state._footer_buf, function(_line, col0)
+            require("lvim-utils.mouse").register_click(state._footer_buf, function(_, col0)
                 if vim.o.mouse == "" then
                     return
                 end

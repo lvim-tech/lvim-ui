@@ -99,7 +99,7 @@ end
 ---@field tab_bar_actions? table[]   -- tabs: trailing affordance buttons at the END of the tab bar (e.g. a `+` new-tab), each { name, icon?, key?, hl?, run(st) }
 ---@field callback? fun(...): any    -- result callback (signature varies per presenter)
 ---@field on_change? fun(row: table) -- tabs: fired on every typed-row edit
----@field subtitle? string|table|table[]  -- tabs / select: message line(s) under the title. A string, ONE line `{ text, type?, hl?, icon?, blank_below? }`, or a LIST of such lines. `type` ∈ "info"|"warn"|"error" (predefined fg colour); `hl` overrides; `icon` is fronted when given.
+---@field subtitle? string|table|table[]|(fun(): string|table|table[]|nil)  -- tabs / select: message line(s) under the title. A string, ONE line `{ text, type?, hl?, icon?, blank_below? }`, or a LIST of such lines. `type` ∈ "info"|"warn"|"error" (predefined fg colour); `hl` overrides; `icon` is fronted when given. In `tabs` it may instead be a FUNCTION — a LIVE subtitle, re-evaluated on every recalc / tab switch (see `header_spec`).
 ---@field default? any               -- input: initial value
 ---@field value? any                 -- input: alias for default
 ---@field prompt? string             -- input: prompt → title fallback
@@ -210,7 +210,9 @@ local SUBTITLE_TYPES = {
 --- `{ text, type?, hl?, icon?, blank_below? }`, or a LIST of such lines (a multi-line subtitle). Each line's
 --- colour is its explicit `hl`, else its `type`'s predefined group, else the default `LvimUiSubtitle`; an
 --- `icon` (optional, never implied by a type) is fronted; `blank_below` adds an empty row beneath the line.
----@param subtitle string|table|nil
+--- The LIVE (function) form of `UiOpts.subtitle` is a `tabs` feature resolved by `header_spec`
+--- before it gets here — this takes the resolved value only.
+---@param subtitle string|table|table[]|nil
 ---@return table[]
 local function subtitle_bars(subtitle)
     if not subtitle then
@@ -228,12 +230,12 @@ local function subtitle_bars(subtitle)
         if type(ln) == "string" then
             out[#out + 1] = { text = ln, hl = "LvimUiSubtitle" }
         else
-            local hl = ln.hl or (ln.type and SUBTITLE_TYPES[ln.type]) or "LvimUiSubtitle"
+            local group = ln.hl or (ln.type and SUBTITLE_TYPES[ln.type]) or "LvimUiSubtitle"
             -- `hls`: optional per-part inline spans `{ byte_c0, byte_c1, group }` for a MULTI-colour line (the
             -- offsets are into `text`, so such a caller builds any icon INTO `text` rather than passing `icon`).
             out[#out + 1] = {
                 text = (ln.icon and (ln.icon .. "  ") or "") .. (ln.text or ""),
-                hl = hl,
+                hl = group,
                 hls = ln.hls,
             }
             if ln.blank_below then
@@ -362,7 +364,9 @@ function M.select(opts)
         -- An optional `subtitle` (description / warning line) under the title — the SAME meta-band model as
         -- M.tabs, so a select can carry a one-liner like "Deletes it from disk." above its list.
         header = (function()
-            local bars = subtitle_bars(opts.subtitle)
+            -- A select's subtitle is static: the LIVE (function) form is a `tabs`-only feature.
+            local subtitle = opts.subtitle
+            local bars = subtitle_bars(type(subtitle) ~= "function" and subtitle or nil)
             return #bars > 0 and { bars = bars } or nil
         end)(),
         -- The list IS the data-content panel → the single-source content ring (CONTENT_BORDER →
@@ -955,10 +959,10 @@ function M.tabs(opts)
     -- action rows STAY IN THE BODY as a selectable list (the form provider runs `row.run` on <CR>/<Space>),
     -- instead of collapsing into footer buttons. (A long list — e.g. every saved quickfix — needs a scrollable
     -- body, not N keyed footer chips.)
-    local menu = opts.menu == true
+    local menu_mode = opts.menu == true
     local function split(ti)
         local content, actions, bars = {}, {}, {}
-        local tab_menu = menu or (tabset[ti] and tabset[ti].menu == true)
+        local tab_menu = menu_mode or (tabset[ti] and tabset[ti].menu == true)
         for _, r in ipairs((tabset[ti] or {}).rows or {}) do
             if r.type == "bar" then
                 -- A TOP-LEVEL toolbar bar becomes its own header-band SECTOR (reached with C-j/C-k), like the
@@ -1152,17 +1156,17 @@ function M.tabs(opts)
             specs[#specs + 1] = {
                 key = a.key or (a.label or "?"):sub(1, 1):lower(),
                 name = a.label or a.name or "",
-                run = function(st)
+                run = function(st2)
                     if a.run then
                         a.run(a.value, function(confirmed, r)
-                            st.close()
+                            st2.close()
                             if confirmed ~= nil then
                                 done = true
                                 cb(confirmed == true, r or collect())
                             end
                         end)
                     else
-                        st.close()
+                        st2.close()
                     end
                 end,
             }
@@ -1230,8 +1234,8 @@ function M.tabs(opts)
                 key = "q",
                 name = "Close",
                 no_hotkey = true,
-                run = function(st)
-                    st.close()
+                run = function(st2)
+                    st2.close()
                 end,
             },
         }
@@ -1322,8 +1326,9 @@ function M.tabs(opts)
     -- A `subtitle` FUNCTION is a LIVE subtitle: re-evaluated inside `header_spec()` on every recalc / tab
     -- switch, so a caller whose subtitle tracks changing state (a git repo band that follows HEAD) sees it
     -- refresh with the content. A static subtitle is captured here once, as before.
-    if type(opts.subtitle) ~= "function" then
-        for _, b in ipairs(subtitle_bars(opts.subtitle)) do
+    local static_subtitle = opts.subtitle
+    if type(static_subtitle) ~= "function" then
+        for _, b in ipairs(subtitle_bars(static_subtitle)) do
             static_bars[#static_bars + 1] = b
         end
     end
@@ -2360,16 +2365,16 @@ function M.help(opts)
     ---@param key_col integer
     ---@return table[]
     local function rows_for(width, key_col)
-        local rows = {}
+        local built = {}
         local desc_col = math.max(6, width - key_col - 2)
         for i, r in ipairs(items) do
             local klines = help_wrap(tostring(r[1]), math.max(1, key_col - 2))
             local dlines = help_wrap(tostring(r[2]), desc_col)
             for j = 1, math.max(#klines, #dlines) do
-                rows[#rows + 1] = { k = klines[j] or "", d = dlines[j] or "", item = i }
+                built[#built + 1] = { k = klines[j] or "", d = dlines[j] or "", item = i }
             end
         end
-        return rows
+        return built
     end
 
     local pan
@@ -2395,14 +2400,14 @@ function M.help(opts)
         end,
         render = function(width)
             local _, key_col = dims()
-            local rows = rows_cached(width, key_col)
+            local built = rows_cached(width, key_col)
             local cur = (pan and pan.win and vim.api.nvim_win_is_valid(pan.win))
                     and vim.api.nvim_win_get_cursor(pan.win)[1]
                 or 1
-            local cur_item = rows[cur] and rows[cur].item
+            local cur_item = built[cur] and built[cur].item
             local lines, hls = {}, {}
             row_items = {}
-            for idx, row in ipairs(rows) do
+            for idx, row in ipairs(built) do
                 row_items[idx] = row.item
                 local s = (row.item % 2 == 1) and "Odd" or "Even"
                 -- Pad by DISPLAY WIDTH, never by byte length: a `…` is 3 bytes and one cell.
@@ -2541,9 +2546,9 @@ function M.info(content, opts)
                     if ac_ok then
                         pcall(mv_actions.clear, p.buf)
                     end
-                    local ok2, content = pcall(mv_parser.parse, p.buf, 0, -1, true)
-                    if ok2 and content then
-                        pcall(mv_renderer.render, p.buf, content)
+                    local ok2, parsed = pcall(mv_parser.parse, p.buf, 0, -1, true)
+                    if ok2 and parsed then
+                        pcall(mv_renderer.render, p.buf, parsed)
                     end
                 end
             elseif opts.filetype then

@@ -739,11 +739,12 @@ function M.new(opts)
             end
             pcall(api.nvim_buf_delete, old, { force = true })
         end
-        if not (state.docs_buf and api.nvim_buf_is_valid(state.docs_buf)) then
-            state.docs_buf = fresh_docs_buf()
+        local buf = state.docs_buf
+        if not (buf and api.nvim_buf_is_valid(buf)) then
+            buf = fresh_docs_buf()
+            state.docs_buf = buf
         end
         state.docs_ft = o.filetype
-        local buf = state.docs_buf
         vim.bo[buf].modifiable = true
         api.nvim_buf_set_lines(buf, 0, -1, false, lines)
         vim.bo[buf].modifiable = false

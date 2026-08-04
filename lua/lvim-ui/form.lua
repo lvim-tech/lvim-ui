@@ -113,8 +113,9 @@ function M.new(opts)
     ---@param fr Row[]
     local function resolve_labels(fr)
         for _, r in ipairs(fr) do
-            if type(r.label) == "function" then
-                r._label_fn = r.label
+            local label = r.label
+            if type(label) == "function" then
+                r._label_fn = label
             end
             if r._label_fn then
                 local ok, res = pcall(r._label_fn, r)
@@ -290,8 +291,12 @@ function M.new(opts)
             -- seeded text (`default`, e.g. a value shown compact in the row but edited pretty). Absent →
             -- the default single-line input.
             local e = row.edit or {}
+            -- `label` is a string by now (resolve_labels bakes the producer's result back into it), but
+            -- the field's declared type still allows the producer itself — take the string form only.
+            local label = row.label
+            local prompt_label = type(label) == "string" and label or nil
             require("lvim-ui").input({
-                prompt = row.label or row.name or "",
+                prompt = prompt_label or row.name or "",
                 default = e.default ~= nil and tostring(e.default)
                     or tostring(row.value ~= nil and row.value or row.default or ""),
                 width = e.width,

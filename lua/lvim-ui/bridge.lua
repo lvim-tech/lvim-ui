@@ -52,6 +52,9 @@ function M.ui_select()
     ---@param items any[]
     ---@param opts table
     ---@param on_choice fun(item: any|nil, index: integer|nil)
+    --- Replacing a stdlib field is the entire point of this bridge (the canonical lvim-ui picker takes
+    --- over `vim.ui.select`), so the duplicate-definition check has nothing useful to say here.
+    ---@diagnostic disable-next-line: duplicate-set-field
     vim.ui.select = function(items, opts, on_choice)
         assert(type(on_choice) == "function", "vim.ui.select: missing on_choice function")
         opts = opts or {}

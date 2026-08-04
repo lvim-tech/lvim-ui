@@ -875,11 +875,11 @@ function M.new(opts)
             render()
         end,
         --- Chassis click seam (hide-cursor modal panels): the selection was already moved to `line`.
-        ---@param _ table
-        ---@param _st table
+        --- The first two arguments (the winband item spec and its frame state) are not needed: the
+        --- click is hit-tested against the rendered row, not the chip.
         ---@param line integer
         ---@param col0 integer
-        on_click = function(_, _st, line, col0)
+        on_click = function(_, _, line, col0)
             click(line, col0)
         end,
         --- Key wiring at open: the canonical tree keys + mouse, then the consumer's own (`on_keys`).
@@ -902,7 +902,7 @@ function M.new(opts)
             -- focuses the panel, parks the cursor at column 0, and calls this handler with the clicked
             -- (line, col0, pos, COUNT) — so chevron hit-testing AND a reliable DOUBLE click both work (a
             -- buffer-local `<2-LeftMouse>` would miss the fast second click, before the deferred focus lands).
-            require("lvim-utils.mouse").register_click(pan.buf, function(line, col0, _pos, count)
+            require("lvim-utils.mouse").register_click(pan.buf, function(line, col0, _, count)
                 if vim.o.mouse == "" then
                     return
                 end

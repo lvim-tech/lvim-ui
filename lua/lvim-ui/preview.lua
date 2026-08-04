@@ -246,7 +246,7 @@ function M.new(opts)
             end
             owned_buffers = {}
         end,
-        update = function(pan, _geom)
+        update = function(pan, _)
             local it = opts.item and opts.item()
             if not (pan.win and api.nvim_win_is_valid(pan.win)) then
                 return

@@ -79,7 +79,9 @@ end
 --- band (the host's own `wincmd j` / `wincmd k`) — and `enter_key` to have the band bind the step-in
 --- key on the host buffer itself.
 ---@param win integer
----@param opts { items: table[], align?: "left"|"center"|"right", side?: "top"|"bottom", nav_through?: fun(), nav_down?: fun(), enter_key?: string, suffix?: fun(): string, on_close?: fun() }
+--- `suffix` is parenthesised: inside an inline table type an unbracketed `fun(): string` swallows
+--- the following field as a second RETURN value, so the rest of the shape never parses.
+---@param opts { items: table[], align?: "left"|"center"|"right", side?: "top"|"bottom", nav_through?: fun(), nav_down?: fun(), enter_key?: string, suffix?: (fun(): string), on_close?: fun() }
 ---@return LvimUiWinBand? handle  nil when `win` is not a valid window
 function M.attach(win, opts)
     if not (win and api.nvim_win_is_valid(win)) then
@@ -96,8 +98,8 @@ function M.attach(win, opts)
         -- PAST the band. Both are accepted so a bottom-bar consumer reads naturally either way.
         nav_through = opts and (opts.nav_through or opts.nav_down), ---@type fun()?
         side = (opts and opts.side) or "bottom", ---@type string
-        suffix = opts and opts.suffix, ---@type fun(): string|nil  right-aligned trailing text
-        on_close = opts and opts.on_close, ---@type fun()|nil
+        suffix = opts and opts.suffix, ---@type (fun(): string)?  right-aligned trailing text
+        on_close = opts and opts.on_close, ---@type fun()?
         winbar = nil, ---@type string?  the host's own winbar, restored on close (top side only)
         focused = false, -- the bar currently holds keyboard focus
         sel = 1, -- the selected chip index (into `rendered`)
@@ -300,7 +302,7 @@ function M.attach(win, opts)
             state.buf = api.nvim_create_buf(false, true)
             vim.bo[state.buf].bufhidden = "wipe"
             -- Clicks through the GLOBAL mouse layer, hit-tested against the rendered chip ranges.
-            require("lvim-utils.mouse").register_click(state.buf, function(_line, col0)
+            require("lvim-utils.mouse").register_click(state.buf, function(_, col0)
                 if vim.o.mouse == "" then
                     return
                 end
