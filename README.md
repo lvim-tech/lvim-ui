@@ -52,7 +52,7 @@ several extend to their longest common prefix and then list.
 
 `ui.tabs` can additionally host a PREVIEW panel beside the tab content: pass `preview = <provider>` (a
 surface content provider, typically built on `require("lvim-ui.preview").new({ item = … })`) and an optional
-`preview_side = "right"|"left"|"above"|"below"`. The block plugs into the chassis preview machinery — `<Tab>`
+`preview_side = "right"|"left"|"dynamic"` (`"hide"` starts it parked — see below). The block plugs into the chassis preview machinery — `<Tab>`
 / `<C-l>` move between the panels, `<C-e>` hides the preview, `<C-n>`/`<C-p>` rotate its side, and
 `<C-d>`/`<C-u>` scroll it half a screen **without leaving the list** — a preview panel hides its
 cursor, so this is the only way to read past its first screen without spending a `<Tab>`.
@@ -317,7 +317,7 @@ local tree = require("lvim-ui").tree({
     default_expanded = false, -- true = an outline (nodes start unfolded)
     connectors = false, -- ├/└ on leaf rows (the outline look)
     elide_guides = true, -- stop the │ guide below a last child (false = solid)
-    margin = 0, -- lead spaces
+    padding = { left = 1, right = 1 }, -- blank columns around the rows (`margin` = the old left-only alias)
     icons = { fold_open = "", fold_closed = "", guide = "│", branch = "├", branch_last = "└" },
     hl = { guide = "…", fold = "…", detail = "…", mark = "…", empty = "…", thumb = "…", track = "…" },
     empty = " No entries",
@@ -360,14 +360,17 @@ canon), and the `mark` row an outline uses to follow the source cursor. Groups: 
 ## Configuration
 
 `setup()` merges your options into the live config in place — every reader (`require("lvim-ui.config")`) sees
-the effective values, and it is optional (the defaults below work as-is). The full default config:
+the effective values, and it is optional (the defaults below work as-is). The full default config, kept in
+sync with `lua/lvim-ui/config.lua`:
 
 ```lua
 require("lvim-ui").setup({
     -- Container frame border: "none" (no outer ring) or an 8-element ring { tl,t,tr,r,br,b,bl,l }.
     border = "none",
-    -- Per-content-panel border drawn around each data block ("none" or an 8-element ring).
-    content_border = "none",
+    -- Per-content-panel border drawn around each data block ("none" or an 8-element ring). A blank " " ring
+    -- is a 1-cell inset on every side — geometry the frame draws, not padding baked into the rows — and the
+    -- frame derives its air rows from it (a side the ring spaces gets no extra blank row).
+    content_border = { " ", " ", " ", " ", " ", " ", " ", " " },
     -- Inter-panel divider between adjacent content panels (auto-oriented: h = side-by-side, v = stacked);
     -- false disables it, a plain string is used for both axes.
     separator = { h = "│", v = "─", hl = "LvimUiPeekBorder" },
@@ -377,27 +380,14 @@ require("lvim-ui").setup({
     separator_hl = "LvimUiPeekBorder",
     -- Overflow-chevron glyphs a bar shows at its edges when its buttons don't all fit.
     chevrons = { left = "❮", right = "❯" },
-    -- Shared surface geometry per layout. height/width = fraction 0.1–1.0; *_auto = fit-to-content up to that
-    -- fraction (cap) when true, exact fraction when false. auto_hide / keep_focus are per-layout behaviour.
-    size = {
-        float = { height = 0.85, width = 0.8, height_auto = false, width_auto = false, auto_hide = true },
-        area = { height = 0.5, height_auto = false, auto_hide = false, keep_focus = true },
-        bottom = { height = 0.4, height_auto = false, auto_hide = false, keep_focus = true },
-    },
-    -- Per-layout dim/darken veil behind an open surface. enabled = false → no veil; hl = darken colour;
-    -- blend = winblend 0–100 (how much shows through: low = strong darken, high = light haze).
-    backdrop = {
-        float = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
-        area = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
-        bottom = { enabled = true, blend = 85, hl = "LvimUiBackdrop" },
-    },
+    -- May the user ENTER the `dynamic` peek float (the position <C-n>/<C-p> rotate into)? Default false: the
+    -- float is there to be read while moving through the list; true makes it a focusable stop.
+    peek_enter = false,
+    -- Surface GEOMETRY and BACKDROP per layout (float / area / bottom) are NOT here — they live in the single
+    -- central authority `lvim-utils.config.dock.geometry` (control-center's Utils tab), read live at open time.
     -- Disable all completion sources (native / nvim-cmp / blink.cmp) for input popups.
     disable_completion = true,
     position = "editor", -- popup anchor
-    width = 0.8, -- default popup width (fraction)
-    max_width = 0.8, -- maximum popup width (fraction)
-    height = 0.8, -- default popup height (fraction)
-    max_height = 0.8, -- maximum popup height (fraction)
     max_items = 15, -- list rows shown before scrolling
     filetype = "lvim-utils-ui", -- filetype set on the popup buffer
     close_keys = { "q", "<Esc>" }, -- keys that close the popup
@@ -413,12 +403,18 @@ require("lvim-ui").setup({
     -- `require("lvim-ui.bridge").restore()` gives it back. There is no `ui_input` — a PROMPT belongs
     -- to the message zone, and lvim-hud bridges `vim.ui.input` from there.
     bridge = { ui_select = false },
+    -- File-icon provider for previews (via lvim-utils.icons): "auto" (lvim-icons → nvim-web-devicons →
+    -- mini.icons) | "lvim" | "devicons" | "mini".
+    icon_provider = "auto",
+    -- lvim-icons colour mode for the preview icon (ignored by devicons/mini): "theme" | "brand" |
+    -- "theme_brand"; nil = the lvim-icons default.
+    icon_color_mode = nil,
     -- Title placement: "row" (a top content row) | "border" (native border-title) | "statusline" (overlay).
     title_line = "row",
     -- Where a supplied count renders: "title" (right of the title) | "footer" (bottom border-footer).
     counter = "title",
     -- Title alignment: "left" | "center" | "right".
-    title_pos = "left",
+    title_pos = "center",
     -- Background tint strengths (blend toward the bg) for themed chrome cells: strong = active, body = rest.
     tint = { strong = 0.2, body = 0.05 },
     -- Popup glyphs.
@@ -426,9 +422,9 @@ require("lvim-ui").setup({
         bool_on = "󰄬",
         bool_off = "󰍴",
         select = "󰘮",
-        number = "",
-        string = "",
-        action = "",
+        number = "\u{f292}",
+        string = "\u{f031}",
+        action = "\u{eb2c}",
         spacer = "   ──────",
         multi_selected = "󰄬",
         multi_empty = "󰍴",
@@ -455,68 +451,76 @@ require("lvim-ui").setup({
         close = "q",
         sector_next = "<C-j>", -- header · center · footer (down); the preview is skipped
         sector_prev = "<C-k>", -- (up)
-        panel_toggle = "<Tab>", -- toggle the center panel (list ⇄ preview)
-        panel_next = "<C-l>", -- next center panel
-        panel_prev = "<C-h>", -- previous center panel
+        panel_toggle = "<Tab>", -- toggle the center panel (list ⇄ preview) — the only way onto the preview
+        panel_next = "<C-l>", -- next center panel (right)
+        panel_prev = "<C-h>", -- previous center panel (left)
         menu_prev = { "h", "<Left>" }, -- move within a focused button bar
         menu_next = { "l", "<Right>" },
         menu_confirm = { "<CR>", "<Space>" },
         zone_escape = { "<C-k>", "<C-w>k" }, -- leave the message zone when focused in it
+        -- The PREVIEW keys, all live from the LIST (the preview never takes the focus for these):
+        preview_next = "<C-n>", -- rotate the preview's side: right → left → dynamic → …
+        preview_prev = "<C-p>", -- rotate the other way
+        toggle_preview = "<C-e>", -- hide ↔ show the preview (no-op while it is `dynamic`)
+        preview_scroll_down = "<C-d>", -- scroll the preview half a screen down — the list keeps the cursor
+        preview_scroll_up = "<C-u>", -- …and up
         tabs = { next = "l", prev = "h" },
         select = { confirm = "<CR>", cancel = "<Esc>" },
         multiselect = { toggle = "<Space>", confirm = "<CR>", cancel = "<Esc>" },
         list = { next_option = "<Tab>", prev_option = "<BS>" },
     },
-})
-```
-
-### Chrome that used to be hardcoded
-
-Everything the UI *shows* is now config, not code — the primitives read their glyphs, colours and
-strengths from `lvim-ui.config` (and the shared scale from `lvim-utils`'s `ui` spec):
-
-```lua
-require("lvim-ui").setup({
-    -- The TREE primitive (the file tree, the LSP outline, the db drawer, the debug scopes)
+    -- The TREE primitive (the file tree, the LSP outline, the db drawer, the debug scopes).
     tree = {
+        -- Blank columns around the tree ROWS (the header band is never padded). With `scrollbar` on, ONE more
+        -- right column is reserved for the thumb only while the content overflows.
         padding = { left = 1, right = 1 },
-        scrollbar = false,
-        icons = { fold_open = "", fold_closed = "", guide = "│", branch = "├", branch_last = "└" },
+        scrollbar = false, -- right-edge thumb while the content overflows the window (opt-in)
+        icons = { fold_open = "\u{f0d7}", fold_closed = "\u{f0da}", guide = "│", branch = "├", branch_last = "└" },
         -- each role: `accent` (a palette key or "#rrggbb") + `tint` (blended toward the panel)
         colors = {
-            guide = { accent = "fg_dark", tint = 0.6 },
-            fold = { accent = "blue" },
-            detail = { accent = "comment" },
+            guide = { accent = "fg_dark", tint = 0.6 }, -- the │ indent guides + ├/└ connectors
+            fold = { accent = "blue" }, -- the open/closed chevron (fg only)
+            detail = { accent = "comment" }, -- the dim eol detail text
             mark = { accent = "blue", tint = 0.16 }, -- the "follow" row (an outline's current symbol)
-            empty = { accent = "comment" },
-            thumb = { accent = "blue", tint = 0.5 }, -- the scrollbar
-            track = { accent = "blue", tint = 0.1 },
+            empty = { accent = "comment" }, -- the "no entries" placeholder
+            thumb = { accent = "blue", tint = 0.5 }, -- the scrollbar thumb
+            track = { accent = "blue", tint = 0.1 }, -- its track
         },
     },
-    -- The MENU primitive (the completion / candidate list)
+    -- The MENU primitive (the completion / candidate list). A coloured cell is its accent tinted toward
+    -- the PANEL it sits on; the selection is bg-only, so each row keeps its own fg colours.
     menu = {
         colors = {
-            selection = { accent = "blue", tint = 0.4 }, -- bg-only, so each row keeps its own fg colours
+            selection = { accent = "blue", tint = 0.4 },
             match = { accent = "red" },
             detail = { accent = "comment" },
             thumb = { accent = "blue", tint = 0.5 },
             track = { accent = "blue", tint = 0.1 },
         },
-        separator = "│",
+        separator = "│", -- the default glyph between menu groups
     },
-    -- The 8 border characters nvim wants, clockwise from the top-left. A surface names a preset.
+    -- The 8 border characters nvim wants, clockwise from the top-left. A surface names a preset
+    -- (`border = "rounded"`) or passes its own 8-element table.
     borders = {
         rounded = { "╭", "─", "╮", "│", "╯", "─", "╰", "│" },
         single = { "┌", "─", "┐", "│", "┘", "─", "└", "│" },
         double = { "╔", "═", "╗", "║", "╝", "═", "╚", "║" },
         none = { "", "", "", "", "", "", "", "" },
     },
-    text = { ellipsis = "…" }, -- what a clipped row ends with
-    -- The form's key-hint legend: the KEYS as the user sees them + their labels
+    text = { ellipsis = "…" }, -- what a clipped row ends with (its width is reserved before clipping)
+    -- The NON-FOCUSABLE hint BAR (`ui.hint`): the full-width row a modal sub-mode pins above the statusline.
+    hint = {
+        align = "center", -- item alignment inside the row
+        default_style = "action", -- the ui.surface button KIND a record with no `style` uses
+        fill_hl = "LvimUiBarFill", -- the continuous strip under the items
+        zindex = 70, -- above the ordinary floats, below the message zone
+        filetype = "lvim-ui-hint", -- the hint buffer's filetype
+    },
+    -- The form's key-hint legend: the KEYS as the user sees them + their labels.
     form_hints = {
-        activate = "↵",
-        next = "↵/→",
-        prev = "⌫/←",
+        activate = "↵", -- <CR> on the focused row
+        next = "↵/→", -- cycle a select/segmented row forward
+        prev = "⌫/←", -- and back
         labels = {
             expand = "Expand",
             collapse = "Collapse",

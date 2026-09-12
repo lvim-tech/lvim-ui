@@ -59,7 +59,8 @@ longest common prefix and then list.
 `ui.tabs` can additionally host a PREVIEW panel beside the tab content: pass
 `preview = <provider>` (a surface content provider, typically built on
 `require("lvim-ui.preview").new({ item = … })`) and an optional
-`preview_side = "right"|"left"|"above"|"below"`. The block plugs into the
+`preview_side = "right"|"left"|"dynamic"` (`"hide"` starts it parked — see
+below). The block plugs into the
 chassis preview machinery — <Tab> / <C-l> move between the panels, <C-e>
 hides the preview, <C-n>/<C-p> rotate its side, and <C-d>/<C-u> scroll it half
 a screen WITHOUT leaving the list — a preview panel hides its cursor, so this
@@ -236,31 +237,58 @@ a deeper variant of an arbitrary group cannot be invented. >lua
         focused = true,
     })
 <
-                                                       *lvim-ui.winfooter()*
-require("lvim-ui.winfooter").attach({win}, {opts})     → handle
+                                                         *lvim-ui.winband()*
+require("lvim-ui.winband").attach({win}, {opts})       → handle
 
-The canonical button FOOTER BAR for a window the surface chassis does NOT own:
-a genuine editable buffer in a tiled window (lvim-db's query editor). Same
-band as a frame footer — a `ui.bar` of `ui.button` chips on an `LvimUiBarFill`
-row — as a 1-row NON-FOCUSABLE float riding the host's bottom row
-(`relative = "win"`), so it follows every resize / layout shift and closes with
-its host. Clicks are hit-tested against the chips through the global mouse
-layer (the float is never focused, so a buffer-local map could not fire). The
-bar DISPLAYS keys and runs actions on click — it never binds a key itself; the
-host buffer owns its keymaps. The host keeps `scrolloff >= 1`, so the cursor
-line can never sit under the bar. >lua
+The canonical button BAND for a window the surface chassis does NOT own: a
+genuine editable buffer in a tiled window (lvim-db's / lvim-rest's query
+editor), or a window Neovim itself opens and closes (the quickfix window,
+whose buffer must stay the real `buftype=quickfix` one). Same band as a frame
+footer — a `ui.bar` of `ui.button` chips on an `LvimUiBarFill` row — as a
+1-row float riding an edge of the host (`relative = "win"`), so it follows
+every resize / layout shift and closes with its host. Clicks are hit-tested
+against the chips through the global mouse layer.
+
+`side` picks the edge, and the two differ in what they cost the host:
+- "bottom" (default) rides the host's last TEXT row, so the host keeps
+  `scrolloff >= 1` and the cursor line can never sit under the bar;
+- "top" rides the host's WINBAR row — chrome, not text — so it costs the host
+  no line at all. The band claims that row (a blank winbar) and restores the
+  host's own winbar on close.
+
+Without `nav_through` the bar is a legend: it DISPLAYS keys and runs actions
+on click, and binds nothing. With `nav_through` it is a real LAYER in the
+window chain: `enter` steps from the host INTO the bar (`enter_key` binds that
+key on the host buffer, so it beats a global window-navigation mapping),
+`h`/`l`/<C-h>/<C-l> move between chips, <CR>/<Space> run one, the chord
+pointing back at the host (<C-k> for a bottom band, <C-j> for a top one)
+steps out, and the one pointing PAST the bar runs `nav_through` (the host's
+own `wincmd j` / `wincmd k`). >lua
 
     local surface = require("lvim-ui.surface")
-    local bar = require("lvim-ui.winfooter").attach(win, {
-        align = "center",
+    local bar = require("lvim-ui.winband").attach(win, {
+        side = "top",
+        align = "left",
+        enter_key = "<C-k>",
+        nav_through = function()
+            vim.cmd("wincmd k")
+        end,
+        suffix = function()
+            return " 12 items "
+        end,
         items = {
             surface.button({ name = "run", key = "⏎", style = "action", run = run }, "action"),
         },
     })
 <
-Options: `items` (ui.button element specs), `align` ("left"|"center"|"right").
+Options: `items` (ui.button element specs), `align` ("left"|"center"|"right"),
+`side` ("top"|"bottom"), `nav_through` (fun; `nav_down` is the old name),
+`enter_key`, `suffix` (fun(): string — right-aligned trailing text, re-read on
+every paint), `on_close`.
 
-Handle: `set(items, align?)`, `place()`, `close()`.
+Handle: `set(items, align?)`, `place()`, `close()`, `enter()` (returns true
+when the bar took focus). `require("lvim-ui.winband").at(win, side)` returns
+the live band's `enter` for the window-navigation layer (lvim-winnav).
 
                                                                  *lvim-ui.tree()*
 require("lvim-ui").tree({opts})                        → handle
@@ -292,15 +320,19 @@ Node contract (lazy or eager): >lua
     }
 <
 Options: `root` (nodes | one node | a FACTORY re-run per render),
-`default_expanded` (false; true = an outline), `connectors` (false; ├/└ on leaf
-rows), `elide_guides` (true; false = a solid │ per level, the file-tree style),
-`margin` (0), `icons` ({ fold_open, fold_closed, guide, branch, branch_last }),
-`hl` ({ guide, fold, detail, mark, empty, thumb, track } group overrides),
-`empty` (" No entries"), `header` (fun(width) → lines, spans — static rows
-above the tree, e.g. a root band; the cursor is kept off them), `filetype`
-(stamped on the buffer — the cursor `panel_ft` registration), `cursorline`
-(true), `hide_cursor` (false; modal usage), `scrollbar` (true — a right-edge
-thumb when the tree overflows), `size` (fun() → w, h override), `keys`
+`default_expanded` (false; true = an outline), `expanded` (initial per-id fold
+overrides — a saved fold state), `connectors` (false; ├/└ on leaf rows),
+`elide_guides` (true; false = a solid │ per level, the file-tree style),
+`padding` ({ left, right }; default `config.tree.padding` = { left = 1,
+right = 1 }; `margin` is the old left-only alias), `icons` ({ fold_open,
+fold_closed, guide, branch, branch_last }), `hl` ({ guide, fold, detail, mark,
+empty, thumb, track } group overrides), `empty` (" No entries"), `header`
+(fun(width) → lines, spans — static rows above the tree, e.g. a root band; the
+cursor is kept off them), `filetype` (stamped on the buffer — the cursor
+`panel_ft` registration), `cursorline` (true), `hide_cursor` (false; modal
+usage), `double_click` (false; true = a single click only selects, a double
+click activates), `scrollbar` (default `config.tree.scrollbar` = false; true =
+a right-edge thumb when the tree overflows), `size` (fun() → w, h override), `keys`
 ({ activate = { "l", "<CR>" }, collapse = "h" }; false = none), and the hooks
 `on_activate(node, t)`, `on_expand(node, t)`, `on_collapse(node, t)`,
 `on_move(node|nil, t)`, `on_keys(map, pan, st, t)` (the consumer's own keymaps,
