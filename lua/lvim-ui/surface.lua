@@ -1507,7 +1507,7 @@ local function render_chrome(state, L)
                 -- `W` (cells): a multibyte title used to have its tint cut off at the W-th byte — halfway
                 -- through a Cyrillic line.
                 placements[#placements + 1] =
-                    { ln - 1, math.max(0, s - 1), math.min(W, s + #band.meta + 1), band.hl, 200 }
+                    { ln - 1, math.max(0, s - 1), math.min(#lines[ln], s + #band.meta + 1), band.hl, 200 }
             end
             return
         end
@@ -4899,10 +4899,35 @@ local function open_native_split(state)
     for _, ck in ipairs(cfg.close_keys or {}) do
         map(ck, state.close)
     end
+    -- The MOVEMENT keys are never surrendered to a consumer keymap — the same rule as the float path
+    -- (`set_keys`): a native panel is navigated by the real cursor, so a consumer `k` would turn moving up
+    -- into its action. A colliding key is skipped and reported.
+    local nav_reserved = {}
+    for _, group in ipairs({ K.down, K.up, "<Down>", "<Up>" }) do
+        for _, l in ipairs(type(group) == "table" and group or { group }) do
+            nav_reserved[l] = true
+        end
+    end
     for _, km in ipairs(cfg.keymaps or {}) do
-        map(km.key, function()
-            km.run(state)
-        end)
+        local clashes = {}
+        for _, l in ipairs(type(km.key) == "table" and km.key or { km.key }) do
+            if nav_reserved[l] then
+                clashes[#clashes + 1] = l
+            end
+        end
+        if #clashes > 0 then
+            vim.notify(
+                ("lvim-ui: keymap %q shadows the navigation keys (%s) — not bound; re-key it"):format(
+                    table.concat(clashes, ", "),
+                    table.concat(vim.tbl_keys(nav_reserved), "/")
+                ),
+                vim.log.levels.WARN
+            )
+        else
+            map(km.key, function()
+                km.run(state)
+            end)
+        end
     end
     -- Opt-in keyboard footer navigation, LAYER-BY-LAYER: `<C-j>` steps from the list DOWN into the footer chip
     -- bar (the native-split mirror of a float surface's footer sector); `<C-l>`/`<C-h>` move between chips,
