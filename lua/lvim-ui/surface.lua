@@ -2715,7 +2715,13 @@ local function place_panels(state, L)
         local lp = L.panels[1]
         if lp then
             local wc = panel_win_config(state, lp)
-            wc.zindex = state.zindex or 50 -- strictly BELOW the list float (zindex + 1), which covers it
+            -- Strictly BELOW the list float, read off the list itself: a float frame's list sits at zindex + 1,
+            -- but a SPLIT frame's panels carry no zindex (the default 50) while `state.zindex` comes from
+            -- auto_float_base — above every live frame — so parking at `state.zindex` put the stale preview
+            -- OVER the list it was meant to hide behind (measured: list 50, parked preview 53).
+            local lw = state.panels[1] and state.panels[1].win
+            local lz = (lw and api.nvim_win_is_valid(lw)) and api.nvim_win_get_config(lw).zindex
+            wc.zindex = math.max(1, (lz or ((state.zindex or 50) + 1)) - 1)
             pcall(api.nvim_win_set_config, pv.win, wc)
         end
     end
