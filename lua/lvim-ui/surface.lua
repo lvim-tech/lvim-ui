@@ -229,6 +229,11 @@ end
 
 -- Default keymaps for the chassis; the consumer may override via `cfg.keys`.
 local DEFAULT_KEYS = {
+    -- The MOVEMENT keys. The global `ui.keys` config normally supplies them; they are here too because a
+    -- consumer keymap is refused only on a key in this reserved set — without them, a surface opened with no
+    -- global keys let a consumer `k` take over moving up (the lvim-git transient hazard `set_keys` guards).
+    down = "j",
+    up = "k",
     sector_next = "<C-j>", -- header · center · footer (down), from anywhere (the PREVIEW is skipped)
     sector_prev = "<C-k>", -- (up)
     panel_toggle = "<Tab>", -- toggle the center panel (list ⇄ preview) — the ONLY way onto the preview
