@@ -102,7 +102,7 @@ end)
 ---@field elide_guides? boolean         drop the ancestor guide column below a LAST child (default true);
 ---                                     false keeps a solid │ for every level (the file-tree style)
 ---@field margin? integer               DEPRECATED alias for `padding.left` (kept for existing consumers)
----@field padding? LvimUiTreePadding    breathing room around the CONTENT rows (not the header) — default { left = 1, right = 2 }
+---@field padding? LvimUiTreePadding    breathing room around the CONTENT rows (not the header) — default `config.tree.padding` ({ left = 1, right = 1 })
 ---@field icons? LvimUiTreeIcons        chrome glyph overrides
 ---@field hl? { guide?: string, fold?: string, detail?: string, mark?: string, empty?: string, thumb?: string, track?: string }
 ---@field empty? string                 placeholder row when there are no nodes (default " No entries")
@@ -944,7 +944,11 @@ function M.new(opts)
             -- while the panel is NOT current, but no content render fires on a bare focus change, so without
             -- this the mark would linger over a now-focused tree (or stay hidden after focus leaves) until the
             -- next repaint. Deferred so the current window has settled before apply_mark reads it.
+            -- GLOBAL (every window's focus change), so it lives in this handle's own augroup and `on_close`
+            -- deletes it: unlike the buffer-local CursorMoved above it does not die with the panel buffer, and
+            -- every tree open/close left one more pair behind, firing (as a no-op) on every focus change.
             api.nvim_create_autocmd({ "WinEnter", "WinLeave" }, {
+                group = api.nvim_create_augroup("LvimUiTreeFocus" .. myseq, { clear = true }),
                 callback = function()
                     vim.schedule(function()
                         if not state.destroyed and pan.buf and api.nvim_buf_is_valid(pan.buf) then
@@ -971,6 +975,7 @@ function M.new(opts)
             if scrollbar then
                 pcall(api.nvim_del_augroup_by_name, "LvimUiTreeBar" .. myseq)
             end
+            pcall(api.nvim_del_augroup_by_name, "LvimUiTreeFocus" .. myseq) -- the WinEnter/WinLeave mark repaint
             if opts.on_close then
                 pcall(opts.on_close, pan)
             end
