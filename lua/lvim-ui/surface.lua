@@ -1503,6 +1503,9 @@ local function render_chrome(state, L)
                 end
             elseif band.meta ~= "" and band.hl then
                 -- 1 space of padding on each side, so a title's bg chrome reads " LVIM LSP " not hugging.
+                -- The span is in BYTES (extmark columns), so it is clamped to the row's byte length, not to
+                -- `W` (cells): a multibyte title used to have its tint cut off at the W-th byte — halfway
+                -- through a Cyrillic line.
                 placements[#placements + 1] =
                     { ln - 1, math.max(0, s - 1), math.min(W, s + #band.meta + 1), band.hl, 200 }
             end
