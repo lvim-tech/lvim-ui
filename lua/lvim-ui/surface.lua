@@ -5108,19 +5108,33 @@ function M.open(cfg)
     -- (e.g. an installer prompt that fires while `q:` is open) would raise E11. Defer the whole open until
     -- the cmdwin closes and return a no-op stub, so the caller never crashes on the missing handle.
     if vim.fn.getcmdwintype() ~= "" then
+        -- The handle the caller keeps. Until the frame exists it answers the STATE METHODS with no-ops and
+        -- every data field (`cfg` / `keys` / `panels` / `sectors`) with nil, not a function — a caller reading
+        -- a data field off it must not get a function back (it would then be indexed/called and crash). Once
+        -- the frame opens, every key is forwarded to the live state, so the caller can still close / drive
+        -- the frame it asked for; and `close()` BEFORE that cancels the deferred open outright.
+        local handle, live, cancelled = { deferred = true }, nil, false
         vim.api.nvim_create_autocmd("CmdwinLeave", {
             once = true,
             callback = function()
                 vim.schedule(function()
-                    M.open(cfg)
+                    if not cancelled then
+                        live = M.open(cfg)
+                        handle.deferred = false
+                    end
                 end)
             end,
         })
-        -- Stub only the STATE METHODS as no-ops; every other key (data fields like `cfg` / `keys` / `panels` /
-        -- `sectors`) reads nil, not a function — a caller reading a data field off the deferred handle must not
-        -- get a function back (it would then be indexed/called as a table and crash).
-        return setmetatable({ deferred = true }, {
+        return setmetatable(handle, {
             __index = function(_, k)
+                if live then
+                    return live[k]
+                end
+                if k == "close" then
+                    return function()
+                        cancelled = true
+                    end
+                end
                 return DEFERRED_METHODS[k] and function() end or nil
             end,
         })
