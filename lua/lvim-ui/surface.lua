@@ -972,6 +972,13 @@ local function split_anchor(cfg)
 end
 
 --- Pure geometry: the container frame, the header/footer band rows, and every center-panel rect + the
+--- Rows the tabline takes at the top of the screen: 0 or 1.
+---@return integer
+local function tabline_rows()
+    local stal = vim.o.showtabline
+    return (stal == 2 or (stal == 1 and #api.nvim_list_tabpages() > 1)) and 1 or 0
+end
+
 --- divider columns. No window/buffer side effects. `place` overrides position/size for a SPLIT (docked)
 --- frame whose container window already exists: `{ row, col, H }` (screen position + the split height).
 ---@param state table
@@ -1159,9 +1166,12 @@ local function compute_geom(state, place)
         col = 0
         row = cfg.position == "bottom" and math.max(0, vim.o.lines - H - ct - cb - 1) or 0
     elseif cfg.position == "left" or cfg.position == "right" then
-        -- Dock to a side: full editor height (minus the cmdline row), fixed width (`size.width`) on that edge.
-        H = math.max(min_h, vim.o.lines - ct - cb - 1)
-        row = 0
+        -- Dock to a side: the full height between the tabline and the command line, fixed width (`size.width`)
+        -- on that edge. Both ends are measured, not assumed: a fixed `row = 0` / `- 1` drew over a visible
+        -- tabline and over every command-line row past the first (`cmdheight > 1`).
+        local top = tabline_rows()
+        H = math.max(min_h, vim.o.lines - top - vim.o.cmdheight - ct - cb)
+        row = top
         col = cfg.position == "right" and math.max(0, vim.o.columns - W - cl - cr) or 0
     elseif cfg.position == "cmdline" then
         -- The CMDHEIGHT region: full width, docked over the bottom `cmdheight` rows (grown to H in
