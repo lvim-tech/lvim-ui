@@ -73,6 +73,28 @@ preview on the Macros tab, whose rows are key sequences and have nothing to prev
 The low-level chassis is `require("lvim-ui.surface")` (framed floating/docked windows) with
 `require("lvim-ui.button")` / `require("lvim-ui.bar")` for navigable button bars.
 
+Three more presenters share the same chassis:
+
+```lua
+-- The keymap CHEATSHEET — the canonical `?` window. `items` are `{ key, description }` pairs already
+-- resolved to the plugin's live keys; rows are a key box + a description box, striped, cursor hidden.
+ui.help({ title = "lvim-x keys", items = { { "q", "close" }, { "<CR>", "open" } } })
+--   opts: title?, items, close_keys?, width?, height?, footer? (a full frame footer spec; default a `q close` bar)
+
+-- A COLLAPSIBLE SECTION HEADER row for a `tabs` form (an accordion whose children share one accent):
+-- the band is `accent` tinted onto the bg, the label reads in the accent fg; the caller owns the caret box.
+local row = ui.section({
+    name = "local", icon = "▸", box_hl = "LvimVaultMarkLocal", label = "Local", accent = "blue",
+    expanded = true, children = child_rows, count = #child_rows, -- count → "Local (3)"
+})
+
+-- An INSTANCE with per-open defaults: every option you pass is merged UNDER each call's opts (the call
+-- wins); `highlights` is applied at once as a forced group registration. Returns bound
+-- select / multiselect / input / confirm / tabs / info.
+local mine = ui.new({ width = false, highlights = { LvimUiTitle = { fg = "#ff0000" } } })
+mine.select({ title = "Pick", items = { "a", "b" }, callback = function(ok, i) end })
+```
+
 ### Mouse
 
 Every keyboard-activated element is also a **left-click** target — a click does exactly what pressing its key

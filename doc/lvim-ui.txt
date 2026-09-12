@@ -85,6 +85,32 @@ The low-level chassis is `require("lvim-ui.surface")` (framed floating / docked
 windows) with `require("lvim-ui.button")` / `require("lvim-ui.bar")` for
 navigable button bars.
 
+Three more presenters share the same chassis:
+
+                                                                 *lvim-ui.help()*
+`ui.help({opts})` — the keymap CHEATSHEET, the canonical `?` window of the set.
+`opts.items` is a list of `{ key, description }` pairs, already resolved to the
+plugin's live keys (omit unmapped rows). Each row is an aligned key box plus a
+description box; rows stripe by accent and the cursor is hidden. Options:
+`title?`, `items`, `close_keys?`, `width?`, `height?`, `footer?` (a full frame
+footer spec; default a `q close` bar).
+
+                                                              *lvim-ui.section()*
+`ui.section({opts})` — a COLLAPSIBLE SECTION HEADER row for a `tabs` form: an
+accordion whose children share one accent. The full-width band is `accent`
+tinted onto the background (brighter while hovered), the label reads in the
+accent fg; the caller owns the caret box (`icon` + `box_hl`). Fields: `name`,
+`icon`, `box_hl`, `label`, `accent` (a palette key or "#rrggbb"), `expanded`,
+`children` (the child rows), `count?` (renders as "Label (N)"). Returns the row.
+
+                                                                  *lvim-ui.new()*
+`ui.new({defaults})` — an INSTANCE whose options are merged UNDER every call's
+opts (the call wins). `defaults.highlights` is applied at once as a forced
+group registration. Returns a table of bound presenters: `select`,
+`multiselect`, `input`, `confirm`, `tabs`, `info`. Used where one consumer
+wants a different shape from the shared defaults (e.g. `width = false` for an
+auto-width list).
+
                                                                     *lvim-ui-mouse*
 Mouse ~
 
