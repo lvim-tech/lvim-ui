@@ -3471,6 +3471,7 @@ local function open_windows(state)
     --- so a just-applied filter reads as hover_active); a center focus needs nothing (the center persists).
     ---@param spec table  the new `header` spec ({ bars = { … } })
     state.set_header = function(spec)
+        state.cfg.header = spec -- kept in step with the live bands, as set_footer does for cfg.footer
         local on_bar = state.focus and state.focus.kind == "bar"
         -- What the user had SELECTED before the rebuild — its identity, not its index: a rebuilt band may hold
         -- a different button count (a nav label widens, a filter appears). Restoring the ACTIVE button instead
