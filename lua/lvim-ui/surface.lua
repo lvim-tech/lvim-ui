@@ -3211,6 +3211,7 @@ local function open_windows(state)
         local pbuf, pwin = state.panels[1].buf, state.panels[1].win
         state.cfg._cursor_row = (pwin and api.nvim_win_is_valid(pwin)) and api.nvim_win_get_cursor(pwin)[1] or 1
         local grp = api.nvim_create_augroup("LvimSurfaceCounter_" .. pbuf, { clear = true })
+        state._counter_augroup = grp -- deleted on close: the buffer autocmd dies with the buffer, the group does not
         api.nvim_create_autocmd("CursorMoved", {
             group = grp,
             buffer = pbuf,
@@ -4354,6 +4355,10 @@ local function close(state)
     end
     if state.augroup then
         pcall(api.nvim_del_augroup_by_id, state.augroup)
+    end
+    if state._counter_augroup then
+        pcall(api.nvim_del_augroup_by_id, state._counter_augroup)
+        state._counter_augroup = nil
     end
     -- The native-split footer window (owned by the surface) — drop its focus-bounce autocmd and close it
     -- before the panel windows (its reserved row returns to the panel).
