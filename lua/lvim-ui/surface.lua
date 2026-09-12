@@ -4323,6 +4323,24 @@ local function close(state)
                 end
             end
         end
+        -- The INPUT band (a finder's prompt — where a picker keeps its focus), the dynamic peek float and the
+        -- native footer are frame windows too: with focus on any of them the origin restore below must run.
+        -- It only checked the container and the panels, so closing from the prompt left focus wherever Neovim
+        -- dropped it when the float went.
+        if not held_focus then
+            for _, band in ipairs(state.header_bands or {}) do
+                if band.input and band.win == cur then
+                    held_focus = true
+                    break
+                end
+            end
+        end
+        if not held_focus and state.dyn and state.dyn.win == cur then
+            held_focus = true
+        end
+        if not held_focus and state._footer_win and state._footer_win == cur then
+            held_focus = true
+        end
     end
     if state.augroup then
         pcall(api.nvim_del_augroup_by_id, state.augroup)
