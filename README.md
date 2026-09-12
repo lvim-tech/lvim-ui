@@ -345,7 +345,7 @@ require("lvim-ui.surface").open({
 
 The handle: `set_root(nodes | node | fun(): nodes)` (a FACTORY root is re-run per render — live
 re-decoration), `render()` (sync), `refresh()` (coalesced), `selected()`, `node_at(line)`, `row_of(id)`,
-`visible()`, `focus(id)`, `expanded(id)`, `expand(id)` / `collapse(id)` / `toggle(id)`, `expand_all()` /
+`visible()`, `content_width()` (the panel width at which no row clips — for a "fit to content" key), `focus(id)`, `expanded(id)`, `expand(id)` / `collapse(id)` / `toggle(id)`, `expand_all()` /
 `collapse_all()` / `all_expanded()`, `set_expanded(map)` (bulk fold replace — accordion/auto-fold),
 `expanded_state()`, `get(id)`, `mark(id, { move_cursor })` (the follow-row tint), `expand_or_activate()` /
 `collapse_or_parent()` (the canonical `l`/`h`, exposed for consumer keymaps), `buf()`, `win()`, `valid()`.

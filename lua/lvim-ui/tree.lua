@@ -308,6 +308,10 @@ function M.new(opts)
         return util.clip(s, w)
     end
 
+    -- A width no row reaches: `content_width` builds at it so nothing is clipped. Finite on purpose — it is also
+    -- handed to the consumer's `header(width)`, which may repeat a glyph across the width.
+    local UNCLIPPED = 1000
+
     --- Build the visible rows: lines, hl spans, virt texts and the row registry. Each line is
     --- `<padding><guides><marker><icon> <label>`, CLIPPED to the content width (panel minus the right padding +
     --- scrollbar column); the marker is a fixed 2-display-column cell (a fold chevron, a ├/└ connector, or
@@ -1056,6 +1060,43 @@ function M.new(opts)
             out[i] = e.node
         end
         return out
+    end
+
+    --- The panel width at which NO tree row is clipped: the widest row's line plus its `detail` and its badge
+    --- cluster (with the 1-col gap), the right padding, and the scrollbar column while the bar is actually shown
+    --- (the same decision `render` makes). The header band is left out on purpose — it is a root path the
+    --- consumer already elides to fit, and widening a panel to a long absolute path is never what "fit" means.
+    --- `provider.size` is not this: it is the natural size for the FIRST layout, measured at 80 columns and
+    --- without the badges, so a row carrying badges would still clip. This measures at a width no row reaches.
+    ---@return integer
+    function t.content_width()
+        local reserve = scrollbar and 1 or 0
+        local lines, _, _, rows, _, header_rows = build(UNCLIPPED, reserve)
+        if reserve == 1 then
+            local win = state.pan and state.pan.win
+            local height = (win and api.nvim_win_is_valid(win)) and api.nvim_win_get_height(win) or 0
+            if height > 0 and #lines <= height - (state.footer_reserve or 0) then
+                reserve = 0 -- it all fits: no bar, so no column for it
+            end
+        end
+        local w = 0
+        for row = header_rows + 1, #lines do
+            local need = util.dw(lines[row])
+            local n = rows[row] and rows[row].node
+            if n then
+                if n.detail and n.detail ~= "" then
+                    need = need + util.dw(" " .. n.detail)
+                end
+                if n.badges and #n.badges > 0 then
+                    for _, b in ipairs(n.badges) do
+                        need = need + util.dw(b[1] or "")
+                    end
+                    need = need + 1 -- the gap between the label and the badge cluster
+                end
+            end
+            w = math.max(w, need + pad_right + reserve)
+        end
+        return w
     end
 
     --- Move the panel cursor onto the node `id` (must be visible — expand its ancestors first).

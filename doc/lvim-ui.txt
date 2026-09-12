@@ -341,7 +341,8 @@ bound AFTER the canonical ones so a config key overrides on a clash),
 
 Handle: `provider` (plug into `surface.open{ content.blocks }`),
 `set_root(nodes|node|fun)`, `render()` (sync), `refresh()` (coalesced),
-`selected()`, `node_at(line)`, `row_of(id)`, `visible()`, `focus(id)`,
+`selected()`, `node_at(line)`, `row_of(id)`, `visible()`,
+`content_width()` (the panel width at which no row clips), `focus(id)`,
 `expanded(id)`, `expand(id)`, `collapse(id)`, `toggle(id)`, `expand_all()`,
 `collapse_all()`, `all_expanded()`, `set_expanded(map)` (bulk fold replace —
 the accordion/auto-fold seam; no hooks, no render), `expanded_state()`,
