@@ -84,6 +84,109 @@ local function own_chord_prefixes(buf, bound)
     end
 end
 
+--- The GLOBAL chords a lock must never swallow — keyed by the chord's FIRST key, because a user chord is
+--- often a SEQUENCE (`<C-c>e` = quit) and nopping its PREFIX kills it just as dead as nopping the whole
+--- thing. Plain letters are NOT exempted even when globally mapped: those are the panel's own alphabet.
+---@return table<string, boolean>
+local function global_chords()
+    local out = {}
+    for _, m in ipairs(api.nvim_get_keymap("n")) do
+        -- `m.lhs` is ALREADY textual here ("<C-C>e"); running it through `keytrans` would escape its
+        -- leading `<` into `<lt>` and the match would never fire.
+        local first = m.lhs:match("^(<[^>]+>)") or m.lhs:sub(1, 1)
+        if first:match("^<[CAMSDcamsd]%-") then
+            out[first:lower()] = true
+        end
+    end
+    return out
+end
+
+-- A READ-ONLY panel WITH a visible cursor (a data grid the user scrolls but must not type into). It is a
+-- MODAL viewer: the cursor MOTIONS work (j/k/gg/G/<C-d>/search…) and so do the panel's own bound keys,
+-- but EVERYTHING else is inert. Two things leak in otherwise, both reported: builtin EDIT operators
+-- (`o`/`dd`/`p`/`s`) raise `E21: Cannot make changes` on the `nomodifiable` buffer, AND the user's GLOBAL
+-- plain-key mappings fire — a global `-` (a file explorer) opened a directory listing OVER the grid.
+-- `lock_panel` (the hide-cursor lock) would kill the motions too, so it cannot be used; this nops the
+-- whole printable + <C-letter> + arrow range EXCEPT the MOTION whitelist and the keys already bound (a
+-- chord prefix / a user chord / a panel action). Builtin motions are not mappings, so nopping mapped
+-- keys elsewhere would not stop `-`; sweeping the range and keeping only motions does. The buffer is
+-- marked `_readonly` so `map_hotkeys` restores a REMOVED footer hotkey to `<Nop>` (not a bare del) — else
+-- a key that is a footer button only in the OTHER mode (save/cancel while editing, paging while browsing)
+-- would fall back to a builtin edit the moment the footer swaps.
+--
+-- MOTIONS kept: the cursor moves and scrolls a data grid needs. `.`/`u`/`&` are deliberately NOT here
+-- (they edit); `-`/`+`/`=` are dropped (line motions j/k cover them) so a global `-` mapping cannot fire.
+local RO_KEEP = {}
+for _, k in ipairs({
+    "h",
+    "j",
+    "k",
+    "l",
+    "w",
+    "b",
+    "e",
+    "W",
+    "B",
+    "E",
+    "0",
+    "$",
+    "^",
+    "G",
+    "H",
+    "M",
+    "L",
+    "f",
+    "F",
+    "t",
+    "T",
+    ";",
+    ",",
+    "{",
+    "}",
+    "(",
+    ")",
+    "%",
+    "|",
+    "g",
+    "z",
+    "n",
+    "N",
+    "/",
+    "?",
+    "*",
+    "#",
+}) do
+    RO_KEEP[k] = true
+end
+---@param buf integer
+---@param bound table<string, boolean>  the lhs set the panel actually bound (those stay live)
+local function lock_readonly(buf, bound)
+    local u = bound or {}
+    local chords = global_chords()
+    local own_prefix = chord_prefixes(u)
+    local function nop(lhs)
+        if u[lhs] or chords[lhs:lower()] or own_prefix[lhs] or RO_KEEP[lhs] then
+            return
+        end
+        pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
+    end
+    for i = 33, 126 do
+        local ch = string.char(i)
+        if ch ~= ":" then -- keep the cmdline escape hatch
+            nop(ch)
+        end
+    end
+    -- Ctrl-letter combos, EXCEPT the scroll/paging ones a viewer needs (<C-d>/<C-u>/<C-f>/<C-b>/<C-e>/
+    -- <C-y>). The nav chords (<C-n/p> columns, <C-h/j/k/l> region nav) are already in `used`, so skipped.
+    local keep_ctrl = { d = true, u = true, f = true, b = true, e = true, y = true }
+    for i = string.byte("a"), string.byte("z") do
+        local ch = string.char(i)
+        if not keep_ctrl[ch] then
+            nop("<C-" .. ch .. ">")
+        end
+    end
+end
+
 --- PUBLIC seam — own the chord prefixes of keys a CONSUMER bound ITSELF on `buf`, outside the chassis.
 ---
 --- The chassis owns the prefixes of every key IT binds (see `own_chord_prefixes`), but a hosted buffer the
@@ -2208,20 +2311,6 @@ local function set_keys(state)
     --- The exempt set is keyed by the chord's FIRST key, not the whole lhs: a user chord is often a SEQUENCE
     --- (`<C-c>e` = quit), and nopping its PREFIX (`<C-c>`) kills it just as dead as nopping the whole thing —
     --- the sequence can never start.
-    ---@return table<string, boolean>
-    local function global_chords()
-        local out = {}
-        for _, m in ipairs(api.nvim_get_keymap("n")) do
-            -- `m.lhs` is ALREADY textual here ("<C-C>e"); running it through `keytrans` would escape its
-            -- leading `<` into `<lt>` and the match would never fire.
-            local first = m.lhs:match("^(<[^>]+>)") or m.lhs:sub(1, 1)
-            if first:match("^<[CAMSDcamsd]%-") then
-                out[first:lower()] = true
-            end
-        end
-        return out
-    end
-
     local chords = global_chords()
 
     local function lock_panel(buf)
@@ -2248,88 +2337,6 @@ local function set_keys(state)
         -- Mouse scroll/drag (the shared rule — see `nop_mouse`): a drag must never start Visual, and on a
         -- fit-to-window float the wheel must not pull the view. `<LeftMouse>` stays live (rows/bar buttons).
         nop_mouse(buf, u, true)
-    end
-    -- A READ-ONLY panel WITH a visible cursor (a data grid the user scrolls but must not type into). It is a
-    -- MODAL viewer: the cursor MOTIONS work (j/k/gg/G/<C-d>/search…) and so do the panel's own bound keys,
-    -- but EVERYTHING else is inert. Two things leak in otherwise, both reported: builtin EDIT operators
-    -- (`o`/`dd`/`p`/`s`) raise `E21: Cannot make changes` on the `nomodifiable` buffer, AND the user's GLOBAL
-    -- plain-key mappings fire — a global `-` (a file explorer) opened a directory listing OVER the grid.
-    -- `lock_panel` (the hide-cursor lock) would kill the motions too, so it cannot be used; this nops the
-    -- whole printable + <C-letter> + arrow range EXCEPT the MOTION whitelist and the keys already bound (a
-    -- chord prefix / a user chord / a panel action). Builtin motions are not mappings, so nopping mapped
-    -- keys elsewhere would not stop `-`; sweeping the range and keeping only motions does. The buffer is
-    -- marked `_readonly` so `map_hotkeys` restores a REMOVED footer hotkey to `<Nop>` (not a bare del) — else
-    -- a key that is a footer button only in the OTHER mode (save/cancel while editing, paging while browsing)
-    -- would fall back to a builtin edit the moment the footer swaps.
-    --
-    -- MOTIONS kept: the cursor moves and scrolls a data grid needs. `.`/`u`/`&` are deliberately NOT here
-    -- (they edit); `-`/`+`/`=` are dropped (line motions j/k cover them) so a global `-` mapping cannot fire.
-    local RO_KEEP = {}
-    for _, k in ipairs({
-        "h",
-        "j",
-        "k",
-        "l",
-        "w",
-        "b",
-        "e",
-        "W",
-        "B",
-        "E",
-        "0",
-        "$",
-        "^",
-        "G",
-        "H",
-        "M",
-        "L",
-        "f",
-        "F",
-        "t",
-        "T",
-        ";",
-        ",",
-        "{",
-        "}",
-        "(",
-        ")",
-        "%",
-        "|",
-        "g",
-        "z",
-        "n",
-        "N",
-        "/",
-        "?",
-        "*",
-        "#",
-    }) do
-        RO_KEEP[k] = true
-    end
-    local function lock_readonly(buf)
-        local u = used[buf] or {}
-        local own_prefix = chord_prefixes(u)
-        local function nop(lhs)
-            if u[lhs] or chords[lhs:lower()] or own_prefix[lhs] or RO_KEEP[lhs] then
-                return
-            end
-            pcall(vim.keymap.set, "n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
-        end
-        for i = 33, 126 do
-            local ch = string.char(i)
-            if ch ~= ":" then -- keep the cmdline escape hatch
-                nop(ch)
-            end
-        end
-        -- Ctrl-letter combos, EXCEPT the scroll/paging ones a viewer needs (<C-d>/<C-u>/<C-f>/<C-b>/<C-e>/
-        -- <C-y>). The nav chords (<C-n/p> columns, <C-h/j/k/l> region nav) are already in `used`, so skipped.
-        local keep_ctrl = { d = true, u = true, f = true, b = true, e = true, y = true }
-        for i = string.byte("a"), string.byte("z") do
-            local ch = string.char(i)
-            if not keep_ctrl[ch] then
-                nop("<C-" .. ch .. ">")
-            end
-        end
     end
     for _, pan in ipairs(state.panels) do
         -- Panels: vertical sector cycling (header·center·footer) AND horizontal panel nav (left/right);
@@ -2627,7 +2634,7 @@ local function set_keys(state)
                 state._locked[pan.buf] = true -- map_hotkeys restores <Nop> (not a bare del) on a stale hotkey here
             elseif not light and prov.readonly and not prov.hide_cursor then
                 -- a cursor-visible read-only grid: keep the motions, nop everything else (see lock_readonly)
-                lock_readonly(pan.buf)
+                lock_readonly(pan.buf, used[pan.buf] or {})
                 state._readonly[pan.buf] = true
             end
         end
@@ -4973,6 +4980,16 @@ local function open_native_split(state)
     -- Bound LAST, once every key is known: the panel owns the prefixes of its own chords (a `g?` help), so the
     -- chord no longer depends on how fast the user types (see `own_chord_prefixes`).
     own_chord_prefixes(pan.buf, bound)
+    -- A provider that declares `readonly` is locked HERE TOO. It is a contract about the panel, not about the
+    -- window it happens to be drawn in, and honouring it only on the float path made the same provider modal
+    -- in a float and wide open in a docked split: the builtin EDIT operators are not mappings, so nothing the
+    -- panel binds can intercept them, and on its `nomodifiable` buffer each one answers with
+    -- `E21: Cannot make changes, 'modifiable' is off` (seen in a real session's log, from lvim-db's drawer).
+    -- Motions and the panel's own keys survive — that is what `lock_readonly` keeps.
+    if pan.provider and pan.provider.readonly and not pan.provider.hide_cursor and cfg.lock_keys ~= false then
+        lock_readonly(pan.buf, bound)
+        state._readonly[pan.buf] = true
+    end
 
     -- Tear down when the window closes; re-render content on resize (the window itself resizes natively).
     state.augroup = api.nvim_create_augroup("LvimUiFrameNative_" .. pan.win, { clear = true })
