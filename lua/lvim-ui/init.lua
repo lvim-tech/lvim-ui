@@ -83,6 +83,7 @@ end
 ---@class UiOpts
 ---@field title? string|table|false  -- border-title (a plain string, or a `{ icon?, text }` box spec; false hides it for M.info)
 ---@field items? any[]               -- select / multiselect items
+---@field initial_selected? table<any, boolean> -- multiselect: items that open already selected
 ---@field current_item? any          -- select: focus this item on open (e.g. the installed version)
 ---@field at? { win: integer, row: integer, col: integer } -- input: ANCHOR the popup over this exact spot in
 ---       `win`, in that window's 0-based text coordinates (an editor over a grid cell), instead of centring it
@@ -403,7 +404,8 @@ end
 --- Pick multiple items — a 1-panel `frame` of checkbox rows + a toggle/confirm/cancel footer.
 --- `<Space>` toggles the focused row, `<CR>` confirms. callback(confirmed, selected) where `selected`
 --- maps each chosen item to true. An item table with `checked == true` opens pre-selected (edit an
---- existing set).
+--- existing set), and so does any item that `opts.initial_selected` maps to true, the only way for a
+--- list of plain strings.
 ---@param opts UiOpts
 function M.multiselect(opts)
     opts = opts or {}
@@ -421,8 +423,9 @@ function M.multiselect(opts)
     -- flow — labels / assignees / reviewers seeded from a topic's current set). Additive: an item without
     -- the field opens unchecked exactly as before.
     local selected = {}
+    local initial = opts.initial_selected or {}
     for _, it in ipairs(items) do
-        if type(it) == "table" and it.checked then
+        if (type(it) == "table" and it.checked) or initial[it] then
             selected[it] = true
         end
     end

@@ -113,3 +113,45 @@ it("falls back to the first selectable row for a name nobody has", function()
     eq(2, rows.resolve_initial_row(list, nil))
     eq(2, rows.resolve_initial_row(list, 99), "an index past the end")
 end)
+
+describe("multiselect: a list that opens with items already selected")
+
+--- Open a multiselect, hand the rows and the key to the check, and close it.
+local function with_multiselect(opts, check)
+    local ui = require("lvim-ui")
+    local result
+    ui.multiselect(vim.tbl_extend("force", opts, {
+        callback = function(confirmed, selected)
+            result = { confirmed = confirmed, selected = selected }
+        end,
+    }))
+    vim.wait(100)
+    local rows = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    check(rows)
+    vim.api.nvim_feedkeys(vim.keycode("<CR>"), "xt", false)
+    vim.wait(1000, function()
+        return result ~= nil
+    end)
+    truthy(result, "the callback ran")
+    return result
+end
+
+it("seeds plain strings from initial_selected, and confirming keeps them", function()
+    local result = with_multiselect({
+        title = "t",
+        items = { "a", "b", "c" },
+        initial_selected = { a = true, c = true },
+    }, function(rows)
+        local a = rows[1]:gsub("a.*$", "")
+        local b = rows[2]:gsub("b.*$", "")
+        truthy(a ~= b, "a selected row looks different: " .. vim.inspect(rows))
+        eq(a, (rows[3]:gsub("c.*$", "")))
+    end)
+    eq(true, result.confirmed)
+    eq({ a = true, c = true }, result.selected)
+end)
+
+it("opens with nothing selected when told nothing", function()
+    local result = with_multiselect({ title = "t", items = { "a", "b" } }, function() end)
+    eq({}, result.selected)
+end)
