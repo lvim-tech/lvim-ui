@@ -5,6 +5,12 @@
 -- pane a file winbar. The diagnostic SIGNS are hidden here (`signcolumn = "no"`) — they belong to the
 -- list panel; the preview stays a clean editable view.
 --
+-- MOVING FAST: loading a file into a buffer runs its BufRead / FileType work (filetype, treesitter, LSP
+-- attach) — far too slow to do on every row while a key is held. So a file that is NOT already loaded is
+-- first shown as a read-only SNAPSHOT (a bounded read of its lines, treesitter-highlighted, no autocmds),
+-- and the real buffer replaces it once the selection settles (`settle_ms`), or at once when the preview is
+-- entered to edit. A file already loaded is shown as its real buffer straight away.
+--
 -- Navigation out of the preview: the frame's panel/sector keys (`<C-h>`/`<C-l>` move panels, `<C-j>`/
 -- `<C-k>` move header·center·footer) are bound on the file buffer ONLY while the preview window is
 -- focused (added on WinEnter, removed on WinLeave) — a real buffer is shared, so a persistent map would
@@ -135,6 +141,7 @@ end
 ---@field item fun(): table|nil   returns the current location { filename, lnum, col, end_lnum?, end_col? }
 ---@field number? string          preview gutter: "none" | "normal" | "relative"
 ---@field empty? string           the "nothing to preview" placeholder text (default "Nothing to preview")
+---@field settle_ms? integer      how long the selection must rest before a snapshot becomes the real buffer (default 150)
 
 --- Create a preview provider.
 ---@param opts LvimUiPreviewOpts
@@ -148,6 +155,9 @@ function M.new(opts)
     local augroup_win -- the preview window the current augroup watches
     ---@type table<integer, true>
     local owned_buffers = {}
+    -- { file = <filename>, buf = <scratch> } while a snapshot is shown, else nil; and the two show functions
+    -- (defined below, used by the WinEnter autocmd too)
+    local snapshot, show_real, show_snapshot
 
     local function remove_nav()
         if nav_buf and api.nvim_buf_is_valid(nav_buf) then
@@ -191,6 +201,11 @@ function M.new(opts)
             group = augroup,
             callback = function()
                 if api.nvim_win_is_valid(pan.win) and api.nvim_get_current_win() == pan.win then
+                    -- entering to EDIT: a snapshot becomes the real buffer at once
+                    local it = snapshot and opts.item and opts.item()
+                    if it and it.filename == snapshot.file then
+                        show_real(pan, it)
+                    end
                     add_nav(api.nvim_win_get_buf(pan.win))
                 end
             end,
@@ -203,6 +218,118 @@ function M.new(opts)
                 end
             end,
         })
+    end
+
+    --- The loaded buffer holding `filename`, if any.
+    ---@param filename string
+    ---@return integer?
+    local function loaded_buf(filename)
+        local full = vim.fn.fnamemodify(filename, ":p")
+        for _, b in ipairs(api.nvim_list_bufs()) do
+            if api.nvim_buf_is_loaded(b) and api.nvim_buf_get_name(b) == full then
+                return b
+            end
+        end
+    end
+
+    local settle = vim.uv.new_timer()
+
+    --- The file winbar and the window options, the same for the snapshot and the real buffer.
+    ---@param pan table
+    ---@param filename string
+    local function style(pan, filename)
+        if cur_file ~= filename then
+            cur_file = filename
+            -- Full-width file winbar: filetype icon · name · directory.
+            local rel = vim.fn.fnamemodify(filename, ":~:.")
+            local tail = vim.fn.fnamemodify(filename, ":t")
+            local dir = vim.fn.fnamemodify(rel, ":h")
+            local wb = "%#LvimUiPeekFileIcon# " .. file_icon(filename) .. " %#LvimUiPeekFile#" .. tail .. " "
+            if dir ~= "." and dir ~= "" then
+                wb = wb .. "%#LvimUiPeekFileBar# " .. dir
+            end
+            vim.wo[pan.win].winbar = wb .. "%#LvimUiPeekFileBar#%="
+        end
+        local pn = opts.number or "normal"
+        vim.wo[pan.win].number = pn == "normal" or pn == "relative"
+        vim.wo[pan.win].relativenumber = pn == "relative"
+        vim.wo[pan.win].signcolumn = "no" -- diagnostic signs live in the list panel, not here
+        vim.wo[pan.win].foldcolumn = "0"
+        -- mark it a preview window so sticky-context plugins (treesitter-context) skip it — else the
+        -- context header floats up out of this small pane over the statusline / the buffer above.
+        vim.wo[pan.win].previewwindow = true
+        vim.wo[pan.win].cursorline = true
+        -- The preview is the RIGHT panel of the multi-panel peek → NEUTRAL cursorline (a bg line over
+        -- the real source), matching the list panel; never the popup-list yellow.
+        -- Keep FloatBorder mapped to the tinted peek-border group (set by open_panel_win): swapping the
+        -- file buffer in here re-sets winhighlight, so without this the content-border ring loses its tint
+        -- and reads as borderless next to the list panel.
+        vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,CursorLine:LvimUiCursorLine,FloatBorder:LvimUiPeekBorder"
+    end
+
+    --- Put the cursor on the location (no extmark — a highlight on the real buffer would bleed into every
+    --- other window showing this file).
+    ---@param pan table
+    ---@param it table
+    local function place(pan, it)
+        local buf = api.nvim_win_get_buf(pan.win)
+        local lnum = math.min(it.lnum or 1, math.max(1, api.nvim_buf_line_count(buf)))
+        pcall(api.nvim_win_set_cursor, pan.win, { lnum, math.max(0, (it.col or 1) - 1) })
+        api.nvim_win_call(pan.win, function()
+            vim.cmd("normal! zz")
+        end)
+    end
+
+    --- Show the REAL file buffer — editable, and bidirectionally in sync with the file (it is the buffer).
+    --- Only swap when it actually changes (navigating rows of the same file just moves the cursor).
+    --- `nvim_win_set_buf` (not `:edit`) avoids E37 on a modified buffer.
+    ---@param pan table
+    ---@param it table
+    show_real = function(pan, it)
+        settle:stop()
+        snapshot = nil
+        local pbuf = vim.fn.bufadd(it.filename)
+        local was_loaded = api.nvim_buf_is_loaded(pbuf)
+        vim.fn.bufload(pbuf)
+        if not was_loaded then
+            owned_buffers[pbuf] = true
+        end
+        if api.nvim_win_get_buf(pan.win) ~= pbuf then
+            api.nvim_win_set_buf(pan.win, pbuf)
+        end
+        style(pan, it.filename)
+        place(pan, it)
+    end
+
+    --- Show a read-only SNAPSHOT of a file that is not loaded: its first lines (enough to reach the location),
+    --- treesitter-highlighted, without loading the file into a buffer. The real buffer replaces it when the
+    --- selection rests for `settle_ms`.
+    ---@param pan table
+    ---@param it table
+    show_snapshot = function(pan, it)
+        if not (snapshot and snapshot.file == it.filename and api.nvim_win_get_buf(pan.win) == snapshot.buf) then
+            local ok, lines = pcall(vim.fn.readfile, it.filename, "", math.max(500, (it.lnum or 1) + 200))
+            local buf = api.nvim_create_buf(false, true)
+            vim.bo[buf].bufhidden = "wipe" -- gone once the real buffer (or the next snapshot) takes the window
+            pcall(api.nvim_buf_set_lines, buf, 0, -1, false, ok and lines or { "[unreadable]" })
+            vim.bo[buf].modifiable = false
+            M.set_syntax(buf, vim.filetype.match({ filename = it.filename }) or "")
+            api.nvim_win_set_buf(pan.win, buf)
+            snapshot = { file = it.filename, buf = buf }
+        end
+        style(pan, it.filename)
+        place(pan, it)
+        settle:stop()
+        settle:start(
+            opts.settle_ms or 150,
+            0,
+            vim.schedule_wrap(function()
+                local now = opts.item and opts.item()
+                if snapshot and now and now.filename == it.filename and api.nvim_win_is_valid(pan.win) then
+                    show_real(pan, now)
+                end
+            end)
+        )
     end
 
     return {
@@ -220,6 +347,8 @@ function M.new(opts)
         end,
         ---@param pan table?  the preview panel (its `win` is the frame's own preview window, closing anyway)
         on_close = function(pan)
+            settle:stop()
+            snapshot = nil
             remove_nav()
             if augroup then
                 pcall(api.nvim_del_augroup_by_id, augroup)
@@ -272,56 +401,11 @@ function M.new(opts)
             if api.nvim_get_current_win() == pan.win then
                 return
             end
-            -- Show the REAL file buffer — editable, and bidirectionally in sync with the file (it is the
-            -- buffer). Only swap when it actually changes (navigating rows of the same file just moves the
-            -- cursor). `nvim_win_set_buf` (not `:edit`) avoids E37 on a modified buffer.
-            local pbuf = vim.fn.bufadd(it.filename)
-            local was_loaded = vim.api.nvim_buf_is_loaded(pbuf)
-            vim.fn.bufload(pbuf)
-            if not was_loaded then
-                owned_buffers[pbuf] = true
+            if loaded_buf(it.filename) or vim.fn.filereadable(it.filename) == 0 then
+                show_real(pan, it) -- already in memory (cheap), or nothing on disk to snapshot
+            else
+                show_snapshot(pan, it)
             end
-            if api.nvim_win_get_buf(pan.win) ~= pbuf then
-                api.nvim_win_set_buf(pan.win, pbuf)
-            end
-
-            if cur_file ~= it.filename then
-                cur_file = it.filename
-                -- Full-width file winbar: filetype icon · name · directory.
-                local rel = vim.fn.fnamemodify(it.filename, ":~:.")
-                local tail = vim.fn.fnamemodify(it.filename, ":t")
-                local dir = vim.fn.fnamemodify(rel, ":h")
-                local wb = "%#LvimUiPeekFileIcon# " .. file_icon(it.filename) .. " %#LvimUiPeekFile#" .. tail .. " "
-                if dir ~= "." and dir ~= "" then
-                    wb = wb .. "%#LvimUiPeekFileBar# " .. dir
-                end
-                vim.wo[pan.win].winbar = wb .. "%#LvimUiPeekFileBar#%="
-            end
-
-            local pn = opts.number or "normal"
-            vim.wo[pan.win].number = pn == "normal" or pn == "relative"
-            vim.wo[pan.win].relativenumber = pn == "relative"
-            vim.wo[pan.win].signcolumn = "no" -- diagnostic signs live in the list panel, not here
-            vim.wo[pan.win].foldcolumn = "0"
-            -- mark it a preview window so sticky-context plugins (treesitter-context) skip it — else the
-            -- context header floats up out of this small pane over the statusline / the buffer above.
-            vim.wo[pan.win].previewwindow = true
-            vim.wo[pan.win].cursorline = true
-            -- The preview is the RIGHT panel of the multi-panel peek → NEUTRAL cursorline (a bg line over
-            -- the real source), matching the list panel; never the popup-list yellow.
-            -- Keep FloatBorder mapped to the tinted peek-border group (set by open_panel_win): swapping the
-            -- file buffer in here re-sets winhighlight, so without this the content-border ring loses its tint
-            -- and reads as borderless next to the list panel.
-            vim.wo[pan.win].winhighlight =
-                "Normal:LvimUiPeekNormal,CursorLine:LvimUiCursorLine,FloatBorder:LvimUiPeekBorder"
-
-            -- Place the cursor on the location (no extmark — a highlight on the real buffer would bleed
-            -- into every other window showing this file).
-            local lnum = math.min(it.lnum or 1, math.max(1, api.nvim_buf_line_count(pbuf)))
-            pcall(api.nvim_win_set_cursor, pan.win, { lnum, math.max(0, (it.col or 1) - 1) })
-            api.nvim_win_call(pan.win, function()
-                vim.cmd("normal! zz")
-            end)
         end,
     }
 end
