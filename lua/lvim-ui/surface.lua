@@ -2712,7 +2712,15 @@ local function place_panels(state, L)
     for i, pan in ipairs(state.panels) do
         local pl = L.panels[i]
         if pan.win and api.nvim_win_is_valid(pan.win) then
-            pcall(api.nvim_win_set_config, pan.win, panel_win_config(state, pl))
+            local wc = panel_win_config(state, pl)
+            -- A panel that was PARKED (the preview, hidden or `dynamic`) was pushed below the list — down to the
+            -- container's own zindex, where the container then covered it. Back among the active panels it
+            -- takes the panel layer again (container + 1, as opened), or it shows only an empty frame.
+            local z = api.nvim_win_get_config(pan.win).zindex
+            if z and state.zindex and z <= state.zindex then
+                wc.zindex = state.zindex + 1
+            end
+            pcall(api.nvim_win_set_config, pan.win, wc)
         end
     end
     -- A PARKED preview (hidden / `dynamic`) is NOT in `state.panels`, so the loop above skips it — and its
@@ -4044,6 +4052,12 @@ function dyn_geom(state)
     local MIN_PEEK = 5
     local keep_top = math.floor(vim.o.lines * 0.4) -- leave the top ~40% of the editor visible
     local cap = math.min(cfgcap, top - 2 - keep_top)
+    if cap < MIN_PEEK then
+        -- A TALL dock (a long list grows it) reaches into that kept 40%, and the peek then vanished while it
+        -- was the one thing asked for. The kept view is a preference: give the peek the room down to a 2-row
+        -- margin instead (the top of the editor stays in sight), and drop it only when even that is too little.
+        cap = math.min(cfgcap, top - 2 - 2)
+    end
     return {
         col = L.col,
         width = L.W,
