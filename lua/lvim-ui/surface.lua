@@ -4133,7 +4133,9 @@ function dyn_geom(state)
         width = L.W,
         top = top,
         cap = cap,
-        min = MIN_PEEK, -- the peek never shrinks below this, however short the file is
+        -- fitted to a short file it shrinks, but not below the winbar + 2 rows: a winbar on a 1-row window is
+        -- the `E36` above (2–3 rows were checked clean with the full config)
+        min = 3,
         gap = gap, -- rows between the float's bottom edge and the container: its rule, plus the statusline
         row = top - cap - gap, -- its bottom rule lands above the editor statusline (or on the container)
         fits = cap >= MIN_PEEK,
@@ -4206,12 +4208,15 @@ function dyn_show(state)
     -- AUTO-FIT the float to the file (a peek), capped at `g.cap`; its bottom edge lands `g.gap` rows above the
     -- container (above the editor statusline, when one is drawn), and the cap keeps the top of the editor visible.
     if d.win and api.nvim_win_is_valid(d.win) then
-        local lines = api.nvim_buf_line_count(api.nvim_win_get_buf(d.win))
+        local pbuf = api.nvim_win_get_buf(d.win)
+        local lines = api.nvim_buf_line_count(pbuf)
         local wb = vim.wo[d.win].winbar
-        -- Fit the file, but never below `g.min`: this window holds the file's REAL buffer, so a 1–2 row slit is
+        -- Fit the file, but never below `g.min`: this window holds the file's REAL buffer, so a 1-row slit is
         -- where its own autocmds (LSP, breadcrumbs, the lightbulb) throw `E36: Not enough room` on every cursor
-        -- move. A short file simply shows blank rows under it.
-        local h = math.max(g.min, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
+        -- move. The "nothing to preview" placeholder is a plain scratch row with no winbar and no such autocmds:
+        -- the float shrinks to it, one row.
+        local min = require("lvim-ui.preview").is_empty(pbuf) and 1 or g.min
+        local h = math.max(min, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
         pcall(api.nvim_win_set_config, d.win, {
             relative = "editor",
             row = g.top - h - g.gap,
@@ -4272,10 +4277,11 @@ function dyn_reposition(state)
         dyn_hide(state)
         return
     end
-    local h = math.max(g.min, math.min(api.nvim_win_get_height(d.win), g.cap))
+    local min = require("lvim-ui.preview").is_empty(api.nvim_win_get_buf(d.win)) and 1 or g.min
+    local h = math.max(min, math.min(api.nvim_win_get_height(d.win), g.cap))
     pcall(api.nvim_win_set_config, d.win, {
         relative = "editor",
-        row = g.top - h - 2,
+        row = g.top - h - g.gap,
         col = g.col,
         width = g.width,
         height = h,

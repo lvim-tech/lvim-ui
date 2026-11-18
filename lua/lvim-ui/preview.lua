@@ -53,8 +53,18 @@ function M.render_empty(buf, ns, message)
     vim.bo[buf].modifiable = true
     pcall(api.nvim_buf_set_lines, buf, 0, -1, false, { " " .. (message or "Nothing to preview") })
     vim.bo[buf].modifiable = false
+    -- the buffer shows the placeholder while its text is unchanged since (a reused buffer gets real content
+    -- later): a host sizing its window to the content can tell it from a one-line file (`M.is_empty`)
+    vim.b[buf].lvim_preview_empty = api.nvim_buf_get_changedtick(buf)
     api.nvim_buf_clear_namespace(buf, ns, 0, -1)
     pcall(api.nvim_buf_set_extmark, buf, ns, 0, 0, { end_row = 1, hl_group = "LvimUiPeekEmpty", hl_eol = true })
+end
+
+--- Whether `buf` shows the "nothing to preview" placeholder (see `render_empty`).
+---@param buf integer
+---@return boolean
+function M.is_empty(buf)
+    return api.nvim_buf_is_valid(buf) and vim.b[buf].lvim_preview_empty == api.nvim_buf_get_changedtick(buf)
 end
 
 --- Highlight a SCRATCH preview buffer WITHOUT ever setting its `filetype`. Setting the filetype would fire the
