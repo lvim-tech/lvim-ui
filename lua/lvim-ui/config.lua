@@ -99,7 +99,7 @@ return {
     -- bars, action footers, the tabs legend). ONE source, so every overflowing bar marks its hidden items with the
     -- SAME glyphs; each consumer keeps its own chevron COLOUR (its own highlight group). Consumers pair the glyphs
     -- with their colour via `surface.chevrons(hl)`. Set e.g. `{ left = "‹", right = "›" }` to restyle them all.
-    chevrons = { left = "❮", right = "❯" },
+    chevrons = { left = "\u{f0141}", right = "\u{f0142}" },
     -- The `dynamic` preview — the PEEK FLOAT above the list (the position `<C-n>`/`<C-p>` rotate into). May the
     -- user ENTER it? Default false: the float is there to be READ while you move through the list, so `<C-k>`
     -- from the top sector steps straight out to the real buffer instead of parking the cursor in a preview.
@@ -325,9 +325,9 @@ return {
     -- Each row TYPE advertises what its keys do. The glyphs are the KEYS themselves as the user sees them,
     -- so they belong to the presentation, not to the logic.
     form_hints = {
-        activate = "↵", -- <CR> on the focused row
-        next = "↵/→", -- cycle a select/segmented row forward
-        prev = "⌫/←", -- and back
+        activate = "\u{f0311}", -- <CR> on the focused row
+        next = "\u{f0311}/\u{f0054}", -- cycle a select/segmented row forward
+        prev = "\u{f030d}/\u{f004d}", -- and back
         labels = {
             expand = "Expand",
             collapse = "Collapse",

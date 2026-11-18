@@ -36,7 +36,7 @@ local function default_chevrons()
     local box = function(text)
         return { type = "separator", text = text, style = { padding = { 1, 1 }, hl = "LvimUiBarChevron" } }
     end
-    return box(g.left or "❮"), box(g.right or "❯")
+    return box(g.left or "\u{f0141}"), box(g.right or "\u{f0142}")
 end
 
 ---@param c table|nil

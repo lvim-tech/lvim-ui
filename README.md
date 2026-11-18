@@ -84,7 +84,7 @@ ui.help({ title = "lvim-x keys", items = { { "q", "close" }, { "<CR>", "open" } 
 -- A COLLAPSIBLE SECTION HEADER row for a `tabs` form (an accordion whose children share one accent):
 -- the band is `accent` tinted onto the bg, the label reads in the accent fg; the caller owns the caret box.
 local row = ui.section({
-    name = "local", icon = "▸", box_hl = "LvimVaultMarkLocal", label = "Local", accent = "blue",
+    name = "local", icon = "󰅂", box_hl = "LvimVaultMarkLocal", label = "Local", accent = "blue",
     expanded = true, children = child_rows, count = #child_rows, -- count → "Local (3)"
 })
 
@@ -318,7 +318,10 @@ local tree = require("lvim-ui").tree({
     connectors = false, -- ├/└ on leaf rows (the outline look)
     elide_guides = true, -- stop the │ guide below a last child (false = solid)
     padding = { left = 1, right = 1 }, -- blank columns around the rows (`margin` = the old left-only alias)
-    icons = { fold_open = "", fold_closed = "", guide = "│", branch = "├", branch_last = "└" },
+    fold_markers = true, -- the fold chevron before an expandable node (false = none: the icon is the cue)
+    guide_under_icon = false, -- true = the │ guide runs under the parent's ICON (no markers), and a child's
+    -- icon starts under the parent's text; with images it is an lvim-icons line image centred on the icon
+    icons = { fold_open = "󰅀", fold_closed = "󰅂", guide = "│", guide_wide = "▕", branch = "├", branch_last = "└" },
     hl = { guide = "…", fold = "…", detail = "…", mark = "…", empty = "…", thumb = "…", track = "…" },
     empty = " No entries",
     header = function(width) -- static rows ABOVE the tree (e.g. a root band);
@@ -342,6 +345,13 @@ require("lvim-ui.surface").open({
     content = { blocks = { { id = "tree", provider = tree.provider } } },
 })
 ```
+
+**Icons as images.** Where lvim-icons draws UI icons as images (`mode = "material"`), the tree, forms, bars,
+buttons and panel titles hand every glyph icon they paint to `lvim-utils.icons.ui_text`: a node's glyph icon,
+its badges, a row's icon and its type glyph, a button's lead box and a title's icon become images in their own
+colour, on the background of their box. A consumer keeps passing glyphs — nothing to change. Bar widths count
+cells (an image's diacritics are not columns), and an accordion's caret follows its fold state when it is
+toggled in place.
 
 The handle: `set_root(nodes | node | fun(): nodes)` (a FACTORY root is re-run per render — live
 re-decoration), `render()` (sync), `refresh()` (coalesced), `selected()`, `node_at(line)`, `row_of(id)`,
@@ -379,7 +389,7 @@ require("lvim-ui").setup({
     -- Highlight group for the inter-panel divider.
     separator_hl = "LvimUiPeekBorder",
     -- Overflow-chevron glyphs a bar shows at its edges when its buttons don't all fit.
-    chevrons = { left = "❮", right = "❯" },
+    chevrons = { left = "󰅁", right = "󰅂" },
     -- May the user ENTER the `dynamic` peek float (the position <C-n>/<C-p> rotate into)? Default false: the
     -- float is there to be read while moving through the list; true makes it a focusable stop.
     peek_enter = false,
@@ -518,9 +528,9 @@ require("lvim-ui").setup({
     },
     -- The form's key-hint legend: the KEYS as the user sees them + their labels.
     form_hints = {
-        activate = "↵", -- <CR> on the focused row
-        next = "↵/→", -- cycle a select/segmented row forward
-        prev = "⌫/←", -- and back
+        activate = "󰌑", -- <CR> on the focused row
+        next = "󰌑/󰁔", -- cycle a select/segmented row forward
+        prev = "󰌍/󰁍", -- and back
         labels = {
             expand = "Expand",
             collapse = "Collapse",

@@ -218,7 +218,7 @@ function M.new(opts)
         -- The key glyphs and the labels are PRESENTATION (`config.form_hints`), not logic — the user sees
         -- them, so they belong in the config with everything else the panel shows.
         local H = config.form_hints or {}
-        local K_ACT, K_NEXT, K_PREV = H.activate or "↵", H.next or "↵/→", H.prev or "⌫/←"
+        local K_ACT, K_NEXT, K_PREV = H.activate or "\u{f0311}", H.next or "\u{f0311}/\u{f0054}", H.prev or "\u{f030d}/\u{f004d}"
         local L = H.labels or {}
         if row.children then
             local label = row.expanded and (L.collapse or "Collapse") or (L.expand or "Expand")

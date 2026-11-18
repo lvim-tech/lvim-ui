@@ -37,6 +37,7 @@ local form = require("lvim-ui.form")
 local rows = require("lvim-ui.rows")
 local util = require("lvim-ui.util")
 local config = require("lvim-ui.config")
+local iconlib = require("lvim-utils.icons")
 local merge = require("lvim-utils.utils").merge
 local hl = require("lvim-utils.highlight")
 
@@ -234,10 +235,20 @@ local function subtitle_bars(subtitle)
             local group = ln.hl or (ln.type and SUBTITLE_TYPES[ln.type]) or "LvimUiSubtitle"
             -- `hls`: optional per-part inline spans `{ byte_c0, byte_c1, group }` for a MULTI-colour line (the
             -- offsets are into `text`, so such a caller builds any icon INTO `text` rather than passing `icon`).
+            -- The icon as its lvim-icons IMAGE where UI icons are images ("material"): two cells, so one blank
+            -- less after it keeps the text where it was; its own span (the image id) on the line's background.
+            local text, hls = (ln.icon and (ln.icon .. "  ") or "") .. (ln.text or ""), ln.hls
+            if ln.icon and ln.icon ~= "" then
+                local t, h, img = iconlib.ui_text(ln.icon, group)
+                if img then
+                    text = t .. " " .. (ln.text or "")
+                    hls = vim.list_extend({ { 0, #t, iconlib.on_bg({ image = true, hl = h }, group) or h } }, ln.hls or {})
+                end
+            end
             out[#out + 1] = {
-                text = (ln.icon and (ln.icon .. "  ") or "") .. (ln.text or ""),
+                text = text,
                 hl = group,
-                hls = ln.hls,
+                hls = hls,
             }
             if ln.blank_below then
                 out[#out + 1] = { text = "" } -- one empty meta band = a blank row under this line
@@ -1254,7 +1265,7 @@ function M.tabs(opts)
         -- keys of its own (e.g. a display-only detail field) the divider would dangle, so drop it.
         if #hints > 0 then
             items[#items + 1] =
-                { type = "separator", text = "●", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } }
+                { type = "separator", text = "\u{f09de}", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } }
         end
         for _, h in ipairs(hints) do
             items[#items + 1] = {
@@ -2126,7 +2137,7 @@ function M.transient(opts)
                     align = "center",
                     items = {
                         { key = "_/+", name = ("level %d/%d"):format(level, max_level), no_hotkey = true },
-                        { type = "separator", text = "●", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
+                        { type = "separator", text = "\u{f09de}", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
                         {
                             key = "C-s",
                             name = "set",
@@ -2158,7 +2169,7 @@ function M.transient(opts)
                                 rebuild(true)
                             end,
                         },
-                        { type = "separator", text = "●", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
+                        { type = "separator", text = "\u{f09de}", style = { padding = { 1, 1 }, hl = "LvimUiFooterSep" } },
                         {
                             key = "q",
                             name = "close",

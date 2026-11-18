@@ -530,10 +530,10 @@ end
 ---@param hl string  highlight group for both chevrons
 ---@return table  { left = { text, style = { hl } }, right = { text, style = { hl } } }
 function M.chevrons(hl)
-    local g = require("lvim-ui.config").chevrons or { left = "❮", right = "❯" }
+    local g = require("lvim-ui.config").chevrons or { left = "\u{f0141}", right = "\u{f0142}" }
     return {
-        left = { text = g.left or "❮", style = { hl = hl } },
-        right = { text = g.right or "❯", style = { hl = hl } },
+        left = { text = g.left or "\u{f0141}", style = { hl = hl } },
+        right = { text = g.right or "\u{f0142}", style = { hl = hl } },
     }
 end
 
@@ -554,7 +554,7 @@ end
 function M.bar(groups, registry, opts)
     opts = opts or {}
     local n = opts.mode == "n"
-    local sep = opts.separator or "●"
+    local sep = opts.separator or "\u{f09de}"
     local sep_hl = opts.separator_hl or "LvimUiFooterSep" -- consumer overridable (e.g. lvim-space's own accent)
     local sep_pad = opts.separator_padding or { 1, 1 }
     local default_style = opts.style or "action"

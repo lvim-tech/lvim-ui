@@ -60,7 +60,7 @@ function M.bar(filters, opts)
     for gi, g in ipairs(filters or {}) do
         if gi > 1 then
             -- a `●` divider BETWEEN groups (never before the first)
-            specs[#specs + 1] = { type = "separator", text = "●", style = { padding = { 3, 3 }, hl = sep_hl } }
+            specs[#specs + 1] = { type = "separator", text = "\u{f09de}", style = { padding = { 3, 3 }, hl = sep_hl } }
         end
         for _, b in ipairs(g.buttons) do
             local accent = b.hl_active or def_active
