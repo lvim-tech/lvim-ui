@@ -4070,8 +4070,43 @@ local DYN_BORDER = { "", "", "", "", "", "─", "", "" }
 
 --- The dynamic float's column/width, the container top, and the CONTENT-height cap. The float floats over the
 --- editor, so it is capped to LEAVE the top of the editor + its statusline VISIBLE (so you can still navigate to
---- the real buffer): its bottom rule sits 1 row above the statusline (`top - 2`); its height is the configured
+--- the real buffer): its bottom rule sits 1 row above the statusline (if one is drawn); its height is the configured
 --- `height_peek`, limited only by the room above the dock.
+--- 1 when a statusline is drawn on the screen row above the container (0-based `top`), else 0: a native one
+--- (`laststatus` 2/3, or 1 with more than one window) or a thin bar float lying on that row.
+---@param top integer
+---@param state table
+---@return integer
+local function status_above(top, state)
+    local ls = vim.o.laststatus
+    if ls == 2 or ls == 3 then
+        return 1
+    end
+    local wins = api.nvim_tabpage_list_wins(0)
+    if ls == 1 then
+        local tiled = 0
+        for _, w in ipairs(wins) do
+            if api.nvim_win_get_config(w).relative == "" then
+                tiled = tiled + 1
+            end
+        end
+        if tiled > 1 then
+            return 1
+        end
+    end
+    local d = state.dyn
+    for _, w in ipairs(wins) do
+        if not (d and w == d.win) and api.nvim_win_get_config(w).relative ~= "" then
+            local h = api.nvim_win_get_height(w)
+            local r = vim.fn.win_screenpos(w)[1] - 1
+            if h <= 3 and r <= top - 1 and r + h - 1 >= top - 1 then
+                return 1
+            end
+        end
+    end
+    return 0
+end
+
 ---@param state table
 ---@return table
 function dyn_geom(state)
@@ -4079,7 +4114,7 @@ function dyn_geom(state)
     local hs = state.cfg.preview_heights
     local capf = (hs and hs.vertical) or 0.5
     local cfgcap = math.max(3, capf <= 1 and math.floor(vim.o.lines * capf) or math.floor(capf))
-    local top = L.row -- the container's top screen row (the editor statusline sits at top-1)
+    local top = L.row -- the container's top screen row (an editor statusline would sit at top-1)
     -- The peek floats ABOVE the DOCK, in the editor's own space (that is the whole point: the list keeps the
     -- dock, the file gets the screen). It needs REAL room — it shows the file's own buffer, so every plugin
     -- hooked on that buffer (LSP, breadcrumbs, the lightbulb) runs in this window, and a 1–2 row slit makes them
@@ -4088,14 +4123,19 @@ function dyn_geom(state)
     -- The configured `height_peek` IS the cap: it is the user's one knob for this float. The only limit on it is
     -- the room above the dock, down to a 2-row margin (the top of the editor stays in sight). An earlier fixed
     -- "keep the top 40% visible" margin clamped every setting to the same few rows, so the knob did nothing.
-    local cap = math.min(cfgcap, top - 2 - 2)
+    -- The row above the container stays free for the editor statusline — only when one is drawn there: with
+    -- none (`laststatus=0`, as on the dashboard) a free row is a slit the buffer underneath shows through, so
+    -- the bottom rule then sits right on the container.
+    local gap = 1 + status_above(top, state)
+    local cap = math.min(cfgcap, top - gap - 2)
     return {
         col = L.col,
         width = L.W,
         top = top,
         cap = cap,
         min = MIN_PEEK, -- the peek never shrinks below this, however short the file is
-        row = top - cap - 2, -- its bottom rule lands at top-2, so the editor statusline (top-1) stays visible
+        gap = gap, -- rows between the float's bottom edge and the container: its rule, plus the statusline
+        row = top - cap - gap, -- its bottom rule lands above the editor statusline (or on the container)
         fits = cap >= MIN_PEEK,
     }
 end
@@ -4140,7 +4180,7 @@ function dyn_show(state)
         end
         d.win = api.nvim_open_win(d.buf, false, {
             relative = "editor",
-            row = g.row, -- above the container (its bottom rule at top-2), or under it when the room is there
+            row = g.row, -- above the container (its bottom rule just above the statusline, or on the container)
             col = g.col,
             width = g.width,
             height = g.cap,
@@ -4163,8 +4203,8 @@ function dyn_show(state)
         end
     end
     dyn_update(state)
-    -- AUTO-FIT the float to the file (a peek), capped at `g.cap`; the bottom rule lands at top-2 (above the
-    -- editor statusline), and the cap keeps the top of the editor visible.
+    -- AUTO-FIT the float to the file (a peek), capped at `g.cap`; its bottom edge lands `g.gap` rows above the
+    -- container (above the editor statusline, when one is drawn), and the cap keeps the top of the editor visible.
     if d.win and api.nvim_win_is_valid(d.win) then
         local lines = api.nvim_buf_line_count(api.nvim_win_get_buf(d.win))
         local wb = vim.wo[d.win].winbar
@@ -4174,7 +4214,7 @@ function dyn_show(state)
         local h = math.max(g.min, math.min(lines + ((wb and wb ~= "") and 1 or 0), g.cap))
         pcall(api.nvim_win_set_config, d.win, {
             relative = "editor",
-            row = g.top - h - 2,
+            row = g.top - h - g.gap,
             col = g.col,
             width = g.width,
             height = h,
