@@ -3075,7 +3075,10 @@ local function open_backdrop(state)
     -- workspace the veil is visible and a STACK of modals reads top-to-bottom. A DOCKED surface (a picker, an
     -- outline, a bottom dock) is worked ALONGSIDE its neighbours: it leaves the OTHER panels lit, mutes only
     -- the plain editor, and coexisting docks SHARE one veil.
-    local is_modal = state.cfg.mode == "float"
+    -- MODAL means the free-floating `float` layout only. A picker docked in the AREA / BOTTOM is ALSO a float
+    -- window (hosted in the msgarea zone), but it is a DOCK: treating it as a modal muted every frame under its
+    -- zindex — the msgarea zone itself, so the `:` completion list under the picker came up dimmed.
+    local is_modal = state.cfg.mode == "float" and backdrop_layout(state.cfg) == "float"
     local state_id = tostring(state)
     if not is_modal then
         -- DOCKS share ONE veil: a second dock skips its own (the first's already covers the editor). Letting
