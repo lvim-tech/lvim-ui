@@ -154,13 +154,27 @@ local seq = 0
 ---@return LvimUiTreeIcons
 local function default_icons()
     return {
-        fold_open = "", -- nf-fa-caret_down
-        fold_closed = "", -- nf-fa-caret_right
+        fold_open = "󰅀", -- nf-md-chevron_down
+        fold_closed = "󰅂", -- nf-md-chevron_right
         guide = "│",
         guide_wide = "\u{2595}", -- ▕ right-edge line (guide_under_icon, under a 2-cell icon)
         branch = "├",
         branch_last = "└",
     }
+end
+
+--- A node's badges with each glyph chunk as its lvim-icons IMAGE where UI icons are images ("material") — a
+--- chunk is `{ text, group }`; words and letters stay text. The original list when nothing changed.
+---@param badges { [1]: string, [2]: string? }[]
+---@return { [1]: string, [2]: string? }[]
+local function image_badges(badges)
+    local out, changed = {}, false
+    for i, b in ipairs(badges) do
+        local t, h, img = iconlib.ui_text(b[1], b[2])
+        out[i] = img and { t, b[2] and iconlib.on_bg({ image = true, hl = h }, b[2]) or h } or b
+        changed = changed or img
+    end
+    return changed and out or badges
 end
 
 --- Pad a 1-glyph marker to exactly two DISPLAY columns (glyphs are multibyte and may render 1 or 2
@@ -395,6 +409,17 @@ function M.new(opts)
                 -- An icon RESULT (lvim-utils.icons) may be virtual: then the line carries none of it and an
                 -- inline extmark draws it (glyph + its gap) at the same column.
                 local ires = type(n.icon) == "table" and n.icon or nil
+                -- a plain glyph icon becomes its lvim-icons IMAGE where UI icons are images ("material"), in the
+                -- node's own colour; it then follows the image path below (its own group, its placement)
+                if not ires and type(n.icon) == "string" and vim.fn.strchars(n.icon) == 1 then
+                    local own = n.hl or n.icon_hl
+                    local r = iconlib.ui({ glyph = n.icon, hl = own })
+                    if r.image then
+                        -- on the node colour's own background, if it has one
+                        ires = vim.tbl_extend("force", r, { hl = own and iconlib.on_bg(r, own) or r.hl })
+                    end
+                end
+                local nbadges = (n.badges and #n.badges > 0) and image_badges(n.badges) or nil
                 local ivirt = ires ~= nil and iconlib.is_virtual(ires)
                 local icon = ires and (ivirt and "" or (ires.glyph or "")) or (n.icon or "")
                 local gap = icon ~= "" and " " or ""
@@ -406,8 +431,8 @@ function M.new(opts)
                 -- runs UNDER the badges and they overlap; reserving makes the label clip so the badges (e.g. a
                 -- file's aggregate count) stay fully visible on a narrow panel.
                 local badge_w = 0
-                if n.badges and #n.badges > 0 then
-                    for _, b in ipairs(n.badges) do
+                if nbadges then
+                    for _, b in ipairs(nbadges) do
                         badge_w = badge_w + util.dw(b[1] or "")
                     end
                     badge_w = badge_w + 1 -- a gap between the label and the badge cluster
@@ -473,12 +498,12 @@ function M.new(opts)
                         end
                     end
                 end
-                if n.badges and #n.badges > 0 then
+                if nbadges then
                     -- `right_align` pins the badges to the LAST window column — exactly where the scrollbar
                     -- thumb is painted. Push them left by the effective right padding so the two never overlap.
-                    local badges = n.badges
+                    local badges = nbadges
                     if pad_right_eff > 0 then
-                        badges = vim.list_extend({}, n.badges)
+                        badges = vim.list_extend({}, nbadges)
                         badges[#badges + 1] = { string.rep(" ", pad_right_eff), groups.detail }
                     end
                     virts[#virts + 1] = { row - 1, badges, "right_align" }
@@ -1187,7 +1212,7 @@ function M.new(opts)
                     need = need + util.dw(" " .. n.detail)
                 end
                 if n.badges and #n.badges > 0 then
-                    for _, b in ipairs(n.badges) do
+                    for _, b in ipairs(image_badges(n.badges)) do
                         need = need + util.dw(b[1] or "")
                     end
                     need = need + 1 -- the gap between the label and the badge cluster

@@ -99,14 +99,16 @@ function M.render(opts)
     end
 
     -- 2. Place it into the width: aligned when it fits, else a scrolled window flanked by chevron boxes.
-    local tw = vim.fn.strchars(t)
+    -- widths count CELLS: a composing character (e.g. the diacritics of an image's placeholder cell) is part of
+    -- the cell before it, so `skipcc` (the 1) keeps it from counting as a column of its own
+    local tw = vim.fn.strchars(t, 1)
     local line, shift, lo, hi
     local chevrons, chev_spans = {}, {}
     if tw <= W then
         local pad = (align == "left" and 0) or (align == "right" and (W - tw)) or math.floor((W - tw) / 2)
         pad = math.max(0, pad)
         line = string.rep(" ", pad) .. t
-        line = line .. string.rep(" ", math.max(0, W - vim.fn.strchars(line)))
+        line = line .. string.rep(" ", math.max(0, W - vim.fn.strchars(line, 1)))
         shift, lo, hi = pad, 0, tw
     else
         local lspec, rspec = resolve_chevrons(opts.chevrons)
@@ -127,8 +129,8 @@ function M.render(opts)
             end
             local selitem = opts.sel and raw_items[opts.sel]
             if selitem then -- keep the focused item visible
-                local s0 = vim.fn.strchars(string.sub(t, 1, selitem[1]))
-                local s1 = vim.fn.strchars(string.sub(t, 1, selitem[2]))
+                local s0 = vim.fn.strchars(string.sub(t, 1, selitem[1]), 1)
+                local s1 = vim.fn.strchars(string.sub(t, 1, selitem[2]), 1)
                 if s0 < off then
                     off = s0
                 elseif s1 > off + inner then
@@ -146,8 +148,8 @@ function M.render(opts)
 
         local left_str = show_left and ltxt or ""
         local right_str = show_right and rtxt or ""
-        local vis = vim.fn.strcharpart(t, off, inner)
-        vis = vis .. string.rep(" ", math.max(0, inner - vim.fn.strchars(vis)))
+        local vis = vim.fn.strcharpart(t, off, inner, 1)
+        vis = vis .. string.rep(" ", math.max(0, inner - vim.fn.strchars(vis, 1)))
         line = left_str .. vis .. right_str
         shift, lo, hi = (show_left and lw or 0) - off, off, off + inner
 
@@ -169,8 +171,8 @@ function M.render(opts)
 
     -- 3. Map raw (byte) ranges in `t` to byte ranges in the final `line` (nil = scrolled out of view).
     local function vis_bytes(bc0, bc1)
-        local c0 = math.max(vim.fn.strchars(string.sub(t, 1, bc0)), lo)
-        local c1 = math.min(vim.fn.strchars(string.sub(t, 1, bc1)), hi)
+        local c0 = math.max(vim.fn.strchars(string.sub(t, 1, bc0), 1), lo)
+        local c1 = math.min(vim.fn.strchars(string.sub(t, 1, bc1), 1), hi)
         if c1 <= c0 then
             return nil
         end

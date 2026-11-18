@@ -9,6 +9,7 @@
 --
 ---@module "lvim-ui.form"
 
+local iconlib = require("lvim-utils.icons")
 local rows = require("lvim-ui.rows")
 local config = require("lvim-ui.config")
 local util = require("lvim-ui.util")
@@ -382,7 +383,45 @@ function M.new(opts)
                 -- `label_at` (offset of the LABEL). The per-part colouring below just adds the body lpad (`lead`)
                 -- — it never re-derives the layout (the icon↔label gap in particular: it is 1 on every shape but
                 -- the flat typed-string row, and re-deriving it from `flat` alone silently mispaints action rows).
+                -- A glyph icon becomes its lvim-icons IMAGE where UI icons are images ("material"), in the
+                -- row's icon colour: swapped in for this render only (row_display lays out the cells, the
+                -- colouring below paints them with the image's own group), put back after the row.
+                local keep_icon, keep_hl
+                -- An accordion's caret follows its state: a fold toggled in place (no rebuild by the consumer)
+                -- swaps the open / closed glyph in its icon, so the caret always shows what the row does now.
+                if r.children and type(r.icon) == "string" and r.icon ~= "" then
+                    -- the form's own carets, else the canonical pair (nf-md-chevron_down / _right)
+                    local open = (ico.expand_open or "") ~= "" and ico.expand_open or "\u{f0140}"
+                    local closed = (ico.expand_closed or "") ~= "" and ico.expand_closed or "\u{f0142}"
+                    do
+                        local from, to = r.expanded and closed or open, r.expanded and open or closed
+                        r.icon = r.icon:gsub(vim.pesc(from), to)
+                    end
+                end
+                if r.type ~= "bar" and r.icon and r.icon ~= "" then
+                    local t, h, img = iconlib.ui_text(r.icon, r.icon_hl)
+                    if img then
+                        keep_icon, keep_hl = r.icon, r.icon_hl
+                        -- on the icon box's own background (a section header's caret box keeps its tint)
+                        r.icon = t
+                        r.icon_hl = r.icon_hl and iconlib.on_bg({ image = true, hl = h }, r.icon_hl) or h
+                    end
+                end
                 local disp, icon_at, type_w, label_at = rows.row_display(r, ico)
+                -- The leading TYPE glyph (bool / select / number / string / action / caret) as its lvim-icons
+                -- IMAGE where UI icons are images ("material"). The image takes two cells, so one of the two
+                -- blanks after the glyph goes: the label keeps its column.
+                local type_img_hl
+                if type_w > 0 and not r.icon_hl and disp:sub(type_w + 1, type_w + 2) == "  " then
+                    local t, h, img = iconlib.ui_text(disp:sub(1, type_w), "LvimUiRowIconInactive")
+                    if img then
+                        local shift = #t - type_w - 1
+                        disp = t .. disp:sub(type_w + 2)
+                        icon_at = icon_at and icon_at + shift or nil
+                        label_at = label_at and label_at + shift or nil
+                        type_w, type_img_hl = #t, h
+                    end
+                end
                 if r.type == "bar" then
                     -- A toolbar row rendered through the SHARED ui.bar: centered button boxes that own their
                     -- overflow chevrons (so a wide bar scrolls instead of clipping). Three button states:
@@ -460,7 +499,7 @@ function M.new(opts)
                     -- The generic type-icon colour, UNLESS the row set its own `icon_hl` — then that group
                     -- fully owns the icon (fg + bg), so the default fg-only tint must not merge over it.
                     if type_w > 0 and not r.icon_hl then
-                        hls[#hls + 1] = { i - 1, lead, lead + type_w, "LvimUiRowIconInactive" }
+                        hls[#hls + 1] = { i - 1, lead, lead + type_w, type_img_hl or "LvimUiRowIconInactive" }
                     end
                     -- Per-part colours an action / accordion row can request: `icon_hl` on its `icon` column,
                     -- `text_hl` on the label/value, `suffix_hl` on the trailing suffix. Offsets come from
@@ -539,6 +578,9 @@ function M.new(opts)
                             hls[#hls + 1] = { i - 1, name_start, name_end, "LvimUiPathName" }
                         end
                     end
+                end
+                if keep_icon then
+                    r.icon, r.icon_hl = keep_icon, keep_hl
                 end
             end
             return lines, hls

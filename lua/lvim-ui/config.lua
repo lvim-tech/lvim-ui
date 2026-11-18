@@ -184,7 +184,7 @@ return {
         spacer = "   ──────",
         multi_selected = "󰄬",
         multi_empty = "󰍴",
-        current = "➤",
+        current = "󰅂",
     },
 
     labels = {
@@ -259,8 +259,8 @@ return {
         -- The tree's chrome glyphs (Nerd Font carets + box-drawing guides). A consumer may still override
         -- them per-tree; these are what it gets when it does not.
         icons = {
-            fold_open = "\u{f0d7}", --  nf-fa-caret_down
-            fold_closed = "\u{f0da}", --  nf-fa-caret_right
+            fold_open = "\u{f0140}", --  nf-md-chevron_down
+            fold_closed = "\u{f0142}", --  nf-md-chevron_right
             guide = "│", -- the ancestor indent column
             branch = "├", -- a leaf with siblings below it (connectors mode)
             branch_last = "└", -- the last leaf

@@ -19,6 +19,8 @@
 --
 ---@module "lvim-ui.button"
 
+local iconlib = require("lvim-utils.icons")
+
 local M = {}
 
 ---@alias LvimUiButtonState "normal"|"active"|"hover"|"hover_active"
@@ -143,7 +145,19 @@ function M.render(spec, state)
 
     local lead = spec.key_badge and spec.key or spec.icon
     if lead and lead ~= "" then
-        put(sp(lf) .. lead .. sp(lb), ihl)
+        -- an icon glyph becomes its lvim-icons IMAGE where UI icons are images ("material"), in the box's colour
+        -- and on its background (a key badge is a letter: it stays text)
+        local t, h, img
+        if not spec.key_badge and type(ihl) == "string" then
+            t, h, img = iconlib.ui_text(lead, ihl)
+        end
+        if img then
+            put(sp(lf), ihl)
+            put(t, iconlib.on_bg({ image = true, hl = h }, ihl) or h)
+            put(sp(lb), ihl)
+        else
+            put(sp(lf) .. lead .. sp(lb), ihl)
+        end
     end
 
     local txt = spec.text

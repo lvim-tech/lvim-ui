@@ -37,6 +37,7 @@
 ---@module "lvim-ui.surface"
 
 local uibar = require("lvim-ui.bar")
+local iconlib = require("lvim-utils.icons")
 local util = require("lvim-ui.util")
 local cursor = require("lvim-utils.cursor")
 local config = require("lvim-ui.config")
@@ -741,6 +742,14 @@ local function title_chunks(title)
     local st = title.style or {}
     local chunks = {}
     local ic = box(title.icon, st.icon or {}, "LvimUiPeekTitleIcon")
+    if ic then
+        -- the icon as its lvim-icons IMAGE where UI icons are images ("material"): its id kept in the foreground,
+        -- on the title box's own background
+        local t, h, img = iconlib.ui_text(ic[1], ic[2])
+        if img then
+            ic = { t, iconlib.on_bg({ image = true, hl = h }, ic[2]) or h }
+        end
+    end
     local tc = box(title.text and util.title_case(title.text) or nil, st.text or {}, "LvimUiPeekTitle")
     if ic then
         chunks[#chunks + 1] = ic

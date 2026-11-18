@@ -193,7 +193,7 @@ hint:show({
     { name = "RESIZE", icon = "󰩨", style = "tab" },
     { key = "h", name = "left" },
     { key = "l", name = "right" },
-    { type = "separator", text = "➤" },
+    { type = "separator", text = "󰅂" },
     { name = "80 x 24", style = "plain" },
 })
 hint:update(items) -- same window, re-rendered (no flicker) — call on every state change
@@ -226,7 +226,7 @@ caller places those however its own layer does (an eol extmark, a frame placemen
 
 ```lua
 local band = require("lvim-ui.bar").title_band({
-    text = "schoolexams ➤ questions",
+    text = "schoolexams 󰅂 questions",
     width = width,
     count = function()
         return "1-50/536"
@@ -428,7 +428,7 @@ require("lvim-ui").setup({
         spacer = "   ──────",
         multi_selected = "󰄬",
         multi_empty = "󰍴",
-        current = "➤",
+        current = "󰅂",
     },
     -- Footer-legend action labels.
     labels = {
@@ -475,7 +475,7 @@ require("lvim-ui").setup({
         -- right column is reserved for the thumb only while the content overflows.
         padding = { left = 1, right = 1 },
         scrollbar = false, -- right-edge thumb while the content overflows the window (opt-in)
-        icons = { fold_open = "\u{f0d7}", fold_closed = "\u{f0da}", guide = "│", branch = "├", branch_last = "└" },
+        icons = { fold_open = "\u{f0140}", fold_closed = "\u{f0142}", guide = "│", branch = "├", branch_last = "└" },
         -- each role: `accent` (a palette key or "#rrggbb") + `tint` (blended toward the panel)
         colors = {
             guide = { accent = "fg_dark", tint = 0.6 }, -- the │ indent guides + ├/└ connectors

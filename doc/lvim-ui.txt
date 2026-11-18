@@ -229,7 +229,7 @@ band naming its own `fill_hl` without a `fill_hl_focus` keeps that one tint:
 a deeper variant of an arbitrary group cannot be invented. >lua
 
     local band = require("lvim-ui.bar").title_band({
-        text = "schoolexams ➤ questions",
+        text = "schoolexams 󰅂 questions",
         width = width,
         count = function()
             return "1-50/536"

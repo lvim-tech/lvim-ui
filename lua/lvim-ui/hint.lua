@@ -11,7 +11,7 @@
 -- and the overflow chevrons come for free.
 --
 --   local h = require("lvim-ui").hint()
---   h:show({ { key = "h", name = "left" }, { type = "separator", text = "➤" }, { name = "80x24" } })
+--   h:show({ { key = "h", name = "left" }, { type = "separator", text = "󰅂" }, { name = "80x24" } })
 --   h:update(items)  -- same window, re-rendered (call after every state change)
 --   h:close()
 --
@@ -54,7 +54,7 @@ local function geometry()
 end
 
 --- Turn ONE hint record into a `ui.button` spec. A `separator` record passes through as a static box (the
---- canonical `➤` divider between the key group and a status cell); everything else goes through the shared
+--- canonical `󰅂` divider between the key group and a status cell); everything else goes through the shared
 --- `ui.surface.button` so the box model / padding / 4 states are identical to every other bar in the set.
 ---@param rec table
 ---@param default_style string?

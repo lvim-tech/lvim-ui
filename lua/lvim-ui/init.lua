@@ -894,7 +894,7 @@ function M.tabs(opts)
     -- Back-compat item-list PICKER mode: a tab with `.items` (each item = label/icon + a payload) is a simple
     -- selectable list, NOT typed rows. Convert each to a navigable MENU row carrying the item, so
     -- `on_item_change(item)` fires on cursor move (live preview), <CR> returns `{ tab, index, item }`, and
-    -- `current_item` (an item REFERENCE) focuses its row + gets a ➤ marker on open.
+    -- `current_item` (an item REFERENCE) focuses its row + gets a 󰅂 marker on open.
     local item_focus -- the row `name` to focus on open (the current item)
     --- Convert one items-tab into menu rows in place (also reused by the handle's `set_tabs`).
     ---@param ti integer  the tab's index (row-name namespace)
