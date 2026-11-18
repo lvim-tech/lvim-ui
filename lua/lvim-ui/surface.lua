@@ -2707,6 +2707,8 @@ end
 --- a host-zone reflow (`reposition`) without re-reserving (which would loop).
 ---@param state table
 ---@param L table
+-- The dynamic peek helpers are defined further down; `place_panels` needs `dyn_reposition` (forward decl).
+local dyn_reposition
 local function place_panels(state, L)
     state._geom = L
     for i, pan in ipairs(state.panels) do
@@ -2745,6 +2747,10 @@ local function place_panels(state, L)
             pcall(api.nvim_win_set_config, pv.win, wc)
         end
     end
+    -- The `dynamic` peek floats ABOVE the list, so a reflow that MOVES the surface (the msgarea growing under it
+    -- for the `:` completion list, a host-zone reposition, a resize) must carry the peek along — else it stays at
+    -- its old rect, now BEHIND the moved list, and the rows above show the muted editor instead of the file.
+    dyn_reposition(state)
     -- Re-fit the editable input bands so they follow the moved panels / header (else a resize leaves the
     -- prompt stranded). A `scope_panel` band tracks its panel's top row; a plain header band its header row.
     local _, _, _, rcl = util.insets(L.cbord)
@@ -4035,8 +4041,8 @@ local DYN_BORDER = { "", "", "", "", "", "─", "", "" }
 
 --- The dynamic float's column/width, the container top, and the CONTENT-height cap. The float floats over the
 --- editor, so it is capped to LEAVE the top of the editor + its statusline VISIBLE (so you can still navigate to
---- the real buffer): its bottom rule sits 1 row above the statusline (`top - 2`), and the top stays below a
---- `keep_top` margin.
+--- the real buffer): its bottom rule sits 1 row above the statusline (`top - 2`); its height is the configured
+--- `height_peek`, limited only by the room above the dock.
 ---@param state table
 ---@return table
 function dyn_geom(state)
@@ -4050,14 +4056,10 @@ function dyn_geom(state)
     -- hooked on that buffer (LSP, breadcrumbs, the lightbulb) runs in this window, and a 1–2 row slit makes them
     -- throw `E36: Not enough room` on each cursor move. Under MIN_PEEK rows the peek is not shown at all.
     local MIN_PEEK = 5
-    local keep_top = math.floor(vim.o.lines * 0.4) -- leave the top ~40% of the editor visible
-    local cap = math.min(cfgcap, top - 2 - keep_top)
-    if cap < MIN_PEEK then
-        -- A TALL dock (a long list grows it) reaches into that kept 40%, and the peek then vanished while it
-        -- was the one thing asked for. The kept view is a preference: give the peek the room down to a 2-row
-        -- margin instead (the top of the editor stays in sight), and drop it only when even that is too little.
-        cap = math.min(cfgcap, top - 2 - 2)
-    end
+    -- The configured `height_peek` IS the cap: it is the user's one knob for this float. The only limit on it is
+    -- the room above the dock, down to a 2-row margin (the top of the editor stays in sight). An earlier fixed
+    -- "keep the top 40% visible" margin clamped every setting to the same few rows, so the knob did nothing.
+    local cap = math.min(cfgcap, top - 2 - 2)
     return {
         col = L.col,
         width = L.W,
@@ -4185,6 +4187,31 @@ function dyn_hide(state)
     if d then
         d.win = nil
     end
+end
+
+--- Move an OPEN dynamic float to the surface's current geometry (after a reflow), keeping its height unless
+--- the new cap is smaller. Geometry only: no content update and no focus bounce, so it is safe from any
+--- reflow — including one fired while the command line is active.
+---@param state table
+function dyn_reposition(state)
+    local d = state.dyn
+    if not (d and d.win and api.nvim_win_is_valid(d.win)) or d._positioning then
+        return
+    end
+    local g = dyn_geom(state)
+    if not g.fits then
+        dyn_hide(state)
+        return
+    end
+    local h = math.max(g.min, math.min(api.nvim_win_get_height(d.win), g.cap))
+    pcall(api.nvim_win_set_config, d.win, {
+        relative = "editor",
+        row = g.top - h - 2,
+        col = g.col,
+        width = g.width,
+        height = h,
+        border = DYN_BORDER,
+    })
 end
 
 --- Turn the dynamic peek ON: a `CursorMoved` on the list follows the selection; a global `WinEnter` shows the
