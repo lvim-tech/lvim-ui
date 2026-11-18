@@ -351,7 +351,7 @@ buttons and panel titles hand every glyph icon they paint to `lvim-utils.icons.u
 its badges, a row's icon and its type glyph, a button's lead box and a title's icon become images in their own
 colour, on the background of their box. A consumer keeps passing glyphs — nothing to change. Bar widths count
 cells (an image's diacritics are not columns), and an accordion's caret follows its fold state when it is
-toggled in place.
+toggled in place. On a live mode switch (`User LvimIconsMode`) every open surface draws its panels again.
 
 The handle: `set_root(nodes | node | fun(): nodes)` (a FACTORY root is re-run per render — live
 re-decoration), `render()` (sync), `refresh()` (coalesced), `selected()`, `node_at(line)`, `row_of(id)`,

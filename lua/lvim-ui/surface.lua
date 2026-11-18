@@ -3940,6 +3940,23 @@ local function open_windows(state)
             end
         end,
     })
+    -- The lvim-icons mode changed (nerd / mix / material, live): draw every panel and the chrome again, so their
+    -- icons follow it without reopening.
+    api.nvim_create_autocmd("User", {
+        group = state.augroup,
+        pattern = "LvimIconsMode",
+        callback = function()
+            if state._closed then
+                return
+            end
+            for _, pan in ipairs(state.panels or {}) do
+                if pan.refresh then
+                    pcall(pan.refresh)
+                end
+            end
+            relayout(state)
+        end,
+    })
     -- Drop / restore the focused-bar selection highlight as focus leaves / re-enters the frame, so a
     -- header button never looks hovered while the user is back in a normal buffer.
     local function set_blur(b)
@@ -5085,6 +5102,17 @@ local function open_native_split(state)
         group = state.augroup,
         callback = function()
             if not state._closed and pan.win and api.nvim_win_is_valid(pan.win) then
+                refit_native()
+            end
+        end,
+    })
+    -- The lvim-icons mode changed (live): draw the panel again so its icons follow it.
+    api.nvim_create_autocmd("User", {
+        group = state.augroup,
+        pattern = "LvimIconsMode",
+        callback = function()
+            if not state._closed and pan.win and api.nvim_win_is_valid(pan.win) then
+                pcall(pan.refresh)
                 refit_native()
             end
         end,
