@@ -125,16 +125,18 @@ local NAV = {
     { "<C-k>", "sector", -1 },
 }
 
---- A filetype icon for `filename` from the configured icon_provider (colour discarded — the winbar
---- paints it), resolved through lvim-utils.icons; empty string when the provider yields nothing.
+--- A filetype icon for `filename` from the configured icon_provider, resolved through lvim-utils.icons, and
+--- the winbar group to paint it with: the bar's own `LvimUiPeekFileIcon` for a font glyph (colour discarded —
+--- the winbar paints it), or — for an lvim-icons IMAGE, whose foreground is its image id — the image's group
+--- on the bar's background. Empty string when the provider yields nothing.
 ---@param filename string
----@return string
+---@return string icon, string group
 local function file_icon(filename)
-    local icon = iconlib.get(filename, { provider = config.icon_provider, color_mode = config.icon_color_mode }).glyph
-    if icon and icon ~= "" then
-        return icon
+    local r = iconlib.get(filename, { provider = config.icon_provider, color_mode = config.icon_color_mode })
+    if not (r.glyph and r.glyph ~= "") then
+        return "", "LvimUiPeekFileIcon"
     end
-    return ""
+    return r.glyph, iconlib.on_bg(r, "LvimUiPeekFileIcon") or "LvimUiPeekFileIcon"
 end
 
 ---@class LvimUiPreviewOpts
@@ -244,7 +246,14 @@ function M.new(opts)
             local rel = vim.fn.fnamemodify(filename, ":~:.")
             local tail = vim.fn.fnamemodify(filename, ":t")
             local dir = vim.fn.fnamemodify(rel, ":h")
-            local wb = "%#LvimUiPeekFileIcon# " .. file_icon(filename) .. " %#LvimUiPeekFile#" .. tail .. " "
+            local icon, icon_hl = file_icon(filename)
+            local wb = "%#LvimUiPeekFileIcon# %#"
+                .. icon_hl
+                .. "#"
+                .. icon
+                .. "%#LvimUiPeekFileIcon# %#LvimUiPeekFile#"
+                .. tail
+                .. " "
             if dir ~= "." and dir ~= "" then
                 wb = wb .. "%#LvimUiPeekFileBar# " .. dir
             end

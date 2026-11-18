@@ -29,6 +29,7 @@
 local config = require("lvim-ui.config")
 local util = require("lvim-ui.util")
 local hl = require("lvim-utils.highlight")
+local iconlib = require("lvim-utils.icons")
 local mouse = require("lvim-utils.mouse")
 
 local api = vim.api
@@ -58,7 +59,10 @@ end)
 ---@class LvimUiTreeNode
 ---@field id string                     STABLE identity — fold state, focus and the mark are keyed by it
 ---@field label string                  the node text
----@field icon? string                  lead kind icon (a Nerd Font glyph)
+---@field icon? string|LvimUtilsIconResult  lead kind icon: a Nerd Font glyph, or an lvim-utils.icons result —
+---                                     then its own `placement` decides (a "virtual" icon is an inline extmark:
+---                                     not text of the line, the cursor skips it) and an IMAGE keeps its own
+---                                     group (its fg is the image id; `icon_hl`/`hl` colour only a font icon)
 ---@field icon_hl? string               highlight group for the icon
 ---@field label_hl? string              highlight group for the label
 ---@field hl? string                    ONE group for icon AND label together (source-colour mode); wins
@@ -77,6 +81,8 @@ end)
 ---@field fold_open? string             expanded-node chevron
 ---@field fold_closed? string           collapsed-node chevron
 ---@field guide? string                 ancestor guide column (│)
+---@field guide_wide? string            `guide_under_icon`: the guide under a 2-cell icon — a RIGHT-edge line (▕)
+---                                     in the cell under the icon's first half: the icon's centre
 ---@field branch? string                leaf connector with siblings below (├) — `connectors` only
 ---@field branch_last? string           last-leaf connector (└) — `connectors` only
 
@@ -99,6 +105,13 @@ end)
 ---@field default_expanded? boolean     nodes start EXPANDED (an outline) or COLLAPSED (a file tree); default false
 ---@field expanded? table<string, boolean>  initial per-id fold OVERRIDES (id → expanded?), e.g. a saved fold state restored on reopen
 ---@field connectors? boolean           ├/└ connectors on leaf rows that have a parent (default false)
+---@field fold_markers? boolean        false: no fold chevron column (the icon shows a folder's state); folding
+---                                     still works from the keys. Default true
+---@field guide_under_icon? boolean    lay levels out by the ICON: a child's icon starts exactly under its
+---                                     parent's text (a level is the icon's width + 1 cells: 2 for a 1-cell Nerd
+---                                     glyph, 3 for a 2-cell image or wide glyph), and the guide runs under the
+---                                     parent's icon centre (a 2-cell icon; an image in lvim-icons "material")
+---                                     or, with a 1-cell icon, centred under its chevron. Default false
 ---@field elide_guides? boolean         drop the ancestor guide column below a LAST child (default true);
 ---                                     false keeps a solid │ for every level (the file-tree style)
 ---@field margin? integer               DEPRECATED alias for `padding.left` (kept for existing consumers)
@@ -144,6 +157,7 @@ local function default_icons()
         fold_open = "", -- nf-fa-caret_down
         fold_closed = "", -- nf-fa-caret_right
         guide = "│",
+        guide_wide = "\u{2595}", -- ▕ right-edge line (guide_under_icon, under a 2-cell icon)
         branch = "├",
         branch_last = "└",
     }
@@ -184,6 +198,9 @@ function M.new(opts)
     local default_expanded = opts.default_expanded == true
     local connectors = opts.connectors == true
     local elide_guides = opts.elide_guides ~= false
+    local guide_under_icon = opts.guide_under_icon == true
+    -- no fold chevron column at all: a node's open / closed state shows in its icon (an open folder)
+    local fold_markers = opts.fold_markers ~= false
     -- Resolution order for every tree default: the CONSUMER's own opts win; otherwise the shared `config.tree`
     -- settings apply (so a user can retune every tree panel from one place); a literal is only the last resort.
     local tcfg = config.tree or {}
@@ -343,7 +360,10 @@ function M.new(opts)
         ---@param nodes LvimUiTreeNode[]
         ---@param guide string             accumulated ancestor guide columns ("│ " / "  " per level)
         ---@param parent LvimUiTreeNode|nil
-        local function walk(nodes, guide, parent)
+        ---@param gimg? { [1]: integer, [2]: integer, [3]: string }[]  guide IMAGES inside `guide`: byte offset,
+        ---                                                              byte length, their own group
+        local function walk(nodes, guide, parent, gimg)
+            gimg = gimg or {}
             local count = #nodes
             for i, n in ipairs(nodes) do
                 local is_last = i == count
@@ -354,16 +374,31 @@ function M.new(opts)
 
                 -- Marker: a fold chevron for a foldable node; a ├/└ connector for a leaf that has a
                 -- parent (connectors mode); two blanks otherwise.
-                local arrow = can_fold and (open and icons.fold_open or icons.fold_closed) or nil
+                local arrow = fold_markers and can_fold and (open and icons.fold_open or icons.fold_closed) or nil
                 local connector = (not arrow and connectors and parent ~= nil)
                         and (is_last and icons.branch_last or icons.branch)
                     or nil
                 local marker = arrow or connector
-                local fold_cell = marker and cell(marker) or "  "
+                local fold_cell = marker and cell(marker) or (fold_markers and "  " or "")
+                -- lvim-icons "material": the fold chevron is an IMAGE of its glyph in the fold colour — two cells,
+                -- exactly the width `cell` pads the glyph to, so the indentation does not move. (The ├/└
+                -- connectors are line drawing, not icons: they stay text.)
+                local marker_hl = arrow and groups.fold or groups.guide
+                if arrow then
+                    local r = iconlib.ui({ glyph = arrow, hl = groups.fold })
+                    if r.image then
+                        marker, fold_cell, marker_hl = r.glyph, r.glyph, r.hl
+                    end
+                end
 
                 local prefix = lead .. guide
-                local icon = n.icon or ""
+                -- An icon RESULT (lvim-utils.icons) may be virtual: then the line carries none of it and an
+                -- inline extmark draws it (glyph + its gap) at the same column.
+                local ires = type(n.icon) == "table" and n.icon or nil
+                local ivirt = ires ~= nil and iconlib.is_virtual(ires)
+                local icon = ires and (ivirt and "" or (ires.glyph or "")) or (n.icon or "")
                 local gap = icon ~= "" and " " or ""
+                local ivirt_w = ivirt and ((ires.width or 1) + 1) or 0
                 -- Cut the row to the CONTENT width (the panel minus the right padding + scrollbar column).
                 -- Without this a long label runs under the bar — the bar is painted ON the last column, so it
                 -- would sit on top of the text instead of beside it. Right-aligned badges are pinned to that
@@ -377,24 +412,42 @@ function M.new(opts)
                     end
                     badge_w = badge_w + 1 -- a gap between the label and the badge cluster
                 end
-                lines[#lines + 1] =
-                    clip(prefix .. fold_cell .. icon .. gap .. (n.label or ""), width - pad_right_eff - badge_w)
+                lines[#lines + 1] = clip(
+                    prefix .. fold_cell .. icon .. gap .. (n.label or ""),
+                    width - pad_right_eff - badge_w - ivirt_w
+                )
                 local row = #lines
 
                 if #prefix > 0 then
-                    hls[#hls + 1] = { row - 1, 0, #prefix, groups.guide }
+                    -- the guide colour, around any guide IMAGE (which is painted with its own, id-carrying group)
+                    local at = 0
+                    for _, gi in ipairs(gimg) do
+                        local s0 = #lead + gi[1]
+                        if s0 > at then
+                            hls[#hls + 1] = { row - 1, at, s0, groups.guide }
+                        end
+                        hls[#hls + 1] = { row - 1, s0, s0 + gi[2], gi[3] }
+                        at = s0 + gi[2]
+                    end
+                    if #prefix > at then
+                        hls[#hls + 1] = { row - 1, at, #prefix, groups.guide }
+                    end
                 end
                 if marker then
-                    hls[#hls + 1] = { row - 1, #prefix, #prefix + #marker, arrow and groups.fold or groups.guide }
+                    hls[#hls + 1] = { row - 1, #prefix, #prefix + #marker, marker_hl }
                 end
                 -- `hl` paints icon AND label with ONE colour (source-colour mode: the two never
                 -- diverge); else each takes its own group.
                 local ioff = #prefix + #fold_cell
-                if icon ~= "" then
-                    local g = n.hl or n.icon_hl
-                    if g then
-                        hls[#hls + 1] = { row - 1, ioff, ioff + #icon, g }
-                    end
+                -- an IMAGE icon is painted only through its own group (its fg is the image id)
+                local ig = (ires and ires.image) and ires.hl or (n.hl or n.icon_hl or (ires and ires.hl))
+                if ig == "" then
+                    ig = nil
+                end
+                if ivirt then
+                    virts[#virts + 1] = { row - 1, { { ires.glyph, ig }, { " " } }, "inline", ioff }
+                elseif icon ~= "" and ig then
+                    hls[#hls + 1] = { row - 1, ioff, ioff + #icon, ig }
                 end
                 local noff = ioff + #icon + #gap
                 local lg = n.hl or n.label_hl
@@ -412,7 +465,7 @@ function M.new(opts)
                     -- full content width flows right into them and the two collide with no separating column
                     -- (`󰓹 sec:appendix` + `appendix.tex` rendering as `sec:appendixix.tex`). It already
                     -- carries the +1 gap, so subtracting it also guarantees the blank column between them.
-                    local avail = (width - pad_right_eff - badge_w) - util.dw(lines[row])
+                    local avail = (width - pad_right_eff - badge_w) - util.dw(lines[row]) - ivirt_w
                     if avail > 1 then
                         local d = clip(" " .. n.detail, avail)
                         if d ~= "" then
@@ -443,7 +496,51 @@ function M.new(opts)
                 order[#order + 1] = entry
 
                 if can_fold and open then
-                    walk(kids(n), guide .. (elide_guides and is_last and "  " or icons.guide .. " "), n)
+                    local piece
+                    local child_gimg = vim.list_extend({}, gimg)
+                    if guide_under_icon then
+                        -- A child's icon starts EXACTLY under its parent's text: the parent row is
+                        -- `<chevron 2><icon w><gap 1><text>`, the child row `<piece><chevron 2><icon>`, so a level
+                        -- takes `w + 1` cells — the icon's width follows the lvim-icons mode:
+                        --   2 cells (an image in mix / material, or a wide glyph) → 3: the chevron's two cells,
+                        --     then one whose RIGHT-edge line falls on the parent icon's centre (the boundary of
+                        --     its two cells) — in material an image of exactly that, else ▕
+                        --   1 cell (a Nerd glyph in nerd mode) → 2: under the parent's icon is the child's own
+                        --     chevron, so the line runs under the parent's CHEVRON — a text glyph drawn in its
+                        --     first cell, so the line is centred in that cell (│)
+                        local iw = ires and (ires.width or 1) or (icon ~= "" and util.dw(icon) or 1)
+                        -- `lead` = the parent's chevron cells (none without chevrons)
+                        local lead_cells = fold_markers and "  " or ""
+                        if elide_guides and is_last then
+                            piece = string.rep(" ", #lead_cells + iw + 1)
+                        elseif not fold_markers then
+                            -- No chevrons: the cells under the parent's icon are free. Wherever the terminal
+                            -- shows images (lvim-icons, any mode) the line is a 2-cell IMAGE under the icon's
+                            -- middle, to the pixel: the boundary of a 2-cell icon image's cells, or the middle
+                            -- of a Nerd glyph's ink (the terminal draws it from the cell's left edge).
+                            -- The level is `iw + 1` cells: the image, plus a blank under a 2-cell icon's gap.
+                            -- `under`: the parent's icon — an image is centred in its cells, a Nerd glyph is
+                            -- drawn from the cell's left edge, so the line goes under the glyph's own middle
+                            local gl = iconlib.guide({ hl = groups.guide, under = ires or { glyph = icon } })
+                            if gl and gl.image then
+                                child_gimg[#child_gimg + 1] = { #guide, #gl.glyph, gl.hl }
+                                piece = gl.glyph .. string.rep(" ", iw - 1)
+                            else
+                                -- no images: the right-edge text line ▕ in the cell under the icon's first half
+                                piece = (icons.guide_wide or "\u{2595}") .. string.rep(" ", iw)
+                            end
+                        elseif iw >= 2 then
+                            -- chevrons + a 2-cell icon: the right-edge line under the icon's first half
+                            piece = lead_cells .. (icons.guide_wide or "\u{2595}") .. "  "
+                        else
+                            -- chevrons + a 1-cell icon: under the parent's icon is the child's own chevron, so
+                            -- the line runs centred under the parent's chevron (a text glyph in its first cell)
+                            piece = icons.guide .. " "
+                        end
+                    else
+                        piece = elide_guides and is_last and "  " or icons.guide .. " "
+                    end
+                    walk(kids(n), guide .. piece, n, child_gimg)
                 end
             end
         end
@@ -539,7 +636,7 @@ function M.new(opts)
             for _, c in ipairs(v[2] or {}) do
                 chunks[#chunks + 1] = (c[1] or "") .. "\2" .. tostring(c[2] or "")
             end
-            p[#p + 1] = v[1] .. "\3" .. table.concat(chunks, "\4") .. "\3" .. tostring(v[3])
+            p[#p + 1] = v[1] .. "\3" .. table.concat(chunks, "\4") .. "\3" .. tostring(v[3]) .. "\3" .. tostring(v[4])
         end
         return table.concat(p, "\1")
     end
@@ -632,10 +729,12 @@ function M.new(opts)
             end
         end
         for _, v in ipairs(virts) do
-            pcall(api.nvim_buf_set_extmark, pan.buf, ns, v[1], 0, {
+            pcall(api.nvim_buf_set_extmark, pan.buf, ns, v[1], v[4] or 0, {
                 virt_text = v[2],
                 virt_text_pos = v[3],
                 hl_mode = "combine",
+                -- an inline icon stays left of text typed at its column (insert mode puts the cursor after it)
+                right_gravity = v[3] ~= "inline" and nil or false,
             })
         end
         apply_mark(false)
