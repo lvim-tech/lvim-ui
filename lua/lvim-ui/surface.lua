@@ -4204,6 +4204,19 @@ function dyn_show(state)
             prov.reset()
         end
     end
+    -- Shrunk to the one-row "nothing to preview" placeholder, the float must grow back BEFORE a file goes in:
+    -- the provider sets the file's winbar, and a winbar on a 1-row window is `E36: Not enough room` (it showed
+    -- while typing in a grep — the results empty out for a keystroke, then come back).
+    if d.win and api.nvim_win_is_valid(d.win) and api.nvim_win_get_height(d.win) < g.min then
+        pcall(api.nvim_win_set_config, d.win, {
+            relative = "editor",
+            row = g.top - g.min - g.gap,
+            col = g.col,
+            width = g.width,
+            height = g.min,
+            border = DYN_BORDER,
+        })
+    end
     dyn_update(state)
     -- AUTO-FIT the float to the file (a peek), capped at `g.cap`; its bottom edge lands `g.gap` rows above the
     -- container (above the editor statusline, when one is drawn), and the cap keeps the top of the editor visible.

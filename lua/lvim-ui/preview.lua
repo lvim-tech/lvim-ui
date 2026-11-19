@@ -154,6 +154,9 @@ end
 ---@field number? string          preview gutter: "none" | "normal" | "relative"
 ---@field empty? string           the "nothing to preview" placeholder text (default "Nothing to preview")
 ---@field settle_ms? integer      how long the selection must rest before a snapshot becomes the real buffer (default 150)
+---@field matches? fun(): string?, boolean?  the search pattern to mark in the preview (+ whether it is a regex;
+---                                 else a fixed string), smart-case like ripgrep; the location's own match
+---                                 (`col`..`end_col`) is marked harder
 
 --- Create a preview provider.
 ---@param opts LvimUiPreviewOpts
@@ -276,7 +279,12 @@ function M.new(opts)
         vim.wo[pan.win].foldcolumn = "0"
         -- mark it a preview window so sticky-context plugins (treesitter-context) skip it — else the
         -- context header floats up out of this small pane over the statusline / the buffer above.
-        vim.wo[pan.win].previewwindow = true
+        -- Only ONE window may be the preview window (E590): with both the docked preview and the dynamic peek
+        -- float around, the second one cannot take it — and the error must not stop the styling and the match
+        -- marks after it.
+        pcall(function()
+            vim.wo[pan.win].previewwindow = true
+        end)
         vim.wo[pan.win].cursorline = true
         -- The preview is the RIGHT panel of the multi-panel peek → NEUTRAL cursorline (a bg line over
         -- the real source), matching the list panel; never the popup-list yellow.
@@ -284,6 +292,47 @@ function M.new(opts)
         -- file buffer in here re-sets winhighlight, so without this the content-border ring loses its tint
         -- and reads as borderless next to the list panel.
         vim.wo[pan.win].winhighlight = "Normal:LvimUiPeekNormal,CursorLine:LvimUiCursorLine,FloatBorder:LvimUiPeekBorder"
+    end
+
+    --- Drop this preview's match marks from `win`.
+    ---@param win integer
+    local function unmark(win)
+        for _, id in ipairs(vim.w[win].lvim_preview_matches or {}) do
+            pcall(vim.fn.matchdelete, id, win)
+        end
+        vim.w[win].lvim_preview_matches = nil
+    end
+
+    --- Mark the search matches in the preview WINDOW (`matchadd` — window-local, so unlike an extmark on the
+    --- real buffer it never shows in another window of this file): every match of `opts.matches()`, and the
+    --- location's own `col`..`end_col` harder.
+    ---@param win integer
+    ---@param it table
+    local function mark(win, it)
+        unmark(win)
+        local ids = {}
+        local pattern, regex = nil, false
+        if opts.matches then
+            pattern, regex = opts.matches()
+        end
+        if type(pattern) == "string" and pattern ~= "" then
+            local case = pattern:find("%u") and "\\C" or "\\c" -- rg --smart-case
+            local vpat = regex and (case .. pattern) or (case .. "\\V" .. vim.fn.escape(pattern, "\\"))
+            local ok, id = pcall(vim.fn.matchadd, "LvimUiMsgAreaMatch", vpat, 250, -1, { window = win })
+            if ok and id > 0 then
+                ids[#ids + 1] = id
+            end
+        end
+        local c0, c1 = it.col or 0, it.end_col or 0
+        if it.lnum and c0 > 0 and c1 > c0 and (it.end_lnum or it.lnum) == it.lnum then
+            local ok, id = pcall(vim.fn.matchaddpos, "LvimUiPeekTitle", { { it.lnum, c0, c1 - c0 } }, 260, -1, {
+                window = win,
+            })
+            if ok and id > 0 then
+                ids[#ids + 1] = id
+            end
+        end
+        vim.w[win].lvim_preview_matches = ids
     end
 
     --- Put the cursor on the location (no extmark — a highlight on the real buffer would bleed into every
@@ -297,6 +346,17 @@ function M.new(opts)
         api.nvim_win_call(pan.win, function()
             vim.cmd("normal! zz")
         end)
+        mark(pan.win, it)
+        -- the focused LINE, as the native quickfix preview marks it: a 󰅂 before its number, in a WINDOW-local
+        -- statuscolumn (a sign would go on the real buffer and show in every window of the file)
+        local pn = opts.number or "normal"
+        if pn ~= "none" then
+            local num = pn == "relative" and "%{v:relnum ? v:relnum : v:lnum}" or "%{v:lnum}"
+            local marker = it.lnum and "%{% v:relnum == 0 ? '%#LvimUiPeekMarker#󰅂' : ' ' %}" or " "
+            pcall(function()
+                vim.wo[pan.win].statuscolumn = marker .. " %#LineNr#" .. num .. " "
+            end)
+        end
     end
 
     --- Show the REAL file buffer — editable, and bidirectionally in sync with the file (it is the buffer).
@@ -408,6 +468,7 @@ function M.new(opts)
                         api.nvim_win_set_buf(pan.win, eb)
                     end
                     cur_file = nil
+                    unmark(pan.win)
                     vim.wo[pan.win].winbar = "" -- a plain styled row (no winbar → no empty body row)
                     M.render_empty(eb, NS, opts.empty)
                 end
