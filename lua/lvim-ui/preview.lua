@@ -347,12 +347,14 @@ function M.new(opts)
             vim.cmd("normal! zz")
         end)
         mark(pan.win, it)
-        -- the focused LINE, as the native quickfix preview marks it: a 󰅂 before its number, in a WINDOW-local
+        -- the location's LINE, as the native quickfix preview marks it: a 󰅂 before its number, in a WINDOW-local
         -- statuscolumn (a sign would go on the real buffer and show in every window of the file)
         local pn = opts.number or "normal"
         if pn ~= "none" then
             local num = pn == "relative" and "%{v:relnum ? v:relnum : v:lnum}" or "%{v:lnum}"
-            local marker = it.lnum and "%{% v:relnum == 0 ? '%#LvimUiPeekMarker#󰅂' : ' ' %}" or " "
+            -- on the ENTRY's line (not the cursor's): scrolling the preview (<C-d>/<C-u>) moves the cursor, and the
+            -- marker must stay on the line the location points at
+            local marker = it.lnum and ("%{% v:lnum == " .. it.lnum .. " ? '%#LvimUiPeekMarker#󰅂' : ' ' %}") or " "
             pcall(function()
                 vim.wo[pan.win].statuscolumn = marker .. " %#LineNr#" .. num .. " "
             end)
