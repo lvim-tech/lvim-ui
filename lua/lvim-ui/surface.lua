@@ -351,8 +351,8 @@ local DEFAULT_KEYS = {
     -- consumer PASSES them via `cfg.keys` (nil here → the binding below no-ops). The chassis still owns the
     -- open(mode) MECHANISM (default_open → provider `selection()` by path/lnum/col, or `cfg.on_open(mode,item)`).
     -- ROTATE the preview through five positions (right → below → left → above → dynamic → …), live:
-    preview_next = "<C-n>",
-    preview_prev = "<C-p>",
+    preview_next = "<C-n>", -- rotate: right → left → dynamic (the peek above the dock) → hidden → right
+    preview_prev = "<C-p>", -- rotate the other way
     toggle_preview = "<C-e>", -- HIDE ↔ show the preview (no-op while the preview is `dynamic`)
     -- SCROLL the preview while the LIST keeps the focus (the fzf-lua / Magit model) — see `scroll_preview`.
     preview_scroll_down = "<C-d>", -- half a screen down
@@ -3411,15 +3411,26 @@ local function open_windows(state)
         -- peek would be squeezed against its top edge (and, holding the file's real buffer, would take the file's
         -- own autocmds down with it: `E36: Not enough room`). A float rotates between the two docked sides.
         local docked_surface = state.cfg.host ~= nil or state.cfg.position ~= nil or state.cfg.mode == "split"
-        local order = docked_surface and { "right", "left", "dynamic" } or { "right", "left" }
+        -- the cycle ends in `hide` (the preview parked): right → left → [dynamic →] hide → right, either way round
+        local order = docked_surface and { "right", "left", "dynamic", "hide" } or { "right", "left", "hide" }
+        local cur = state.preview_hidden and "hide" or (state.preview_side or "right")
         local ci = 1
         for i, s in ipairs(order) do
-            if s == (state.preview_side or "right") then
+            if s == cur then
                 ci = i
             end
         end
-        state.preview_side = order[((ci - 1 + dir) % #order) + 1]
-        state.preview_hidden = false -- rotating always un-hides
+        local nxt = order[((ci - 1 + dir) % #order) + 1]
+        if nxt == "hide" then
+            state.preview_hidden = true
+            -- the side it returns to: a docked one (the peek has no docked place to come back to)
+            if state.preview_side == "dynamic" then
+                state.preview_side = "right"
+            end
+        else
+            state.preview_hidden = false
+            state.preview_side = nxt
+        end
         apply_preview_side(state)
         refocus_list(state)
     end
